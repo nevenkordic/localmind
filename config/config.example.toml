@@ -1,0 +1,90 @@
+# localmind configuration — copy to config/local.toml and edit.
+# All values can be overridden by env vars prefixed with LOCALMIND_.
+
+[ollama]
+# URL of your local Ollama server.
+host = "http://127.0.0.1:11434"
+# Primary model — strong at code, networking, security, admin.
+chat_model = "qwen2.5-coder:32b"
+# Secondary/fallback model — smaller, faster, vision-capable.
+vision_model = "gemma3:27b"
+# Embedding model for memory search.
+embed_model = "nomic-embed-text"
+# Request timeout in seconds (large models on cold start can be slow).
+timeout_secs = 600
+# Token budget for each reply.
+num_ctx = 32768
+
+[memory]
+# Path to the SQLite memory database. %DATA% expands to the OS data dir.
+db_path = "%DATA%/memory.db"
+# Max memories to return from a hybrid search.
+top_k = 12
+# Weight given to BM25 vs vector score during fusion (0.0 - 1.0).
+bm25_weight = 0.4
+vector_weight = 0.6
+# How aggressively older memories decay in ranking (half-life in days).
+temporal_half_life_days = 30.0
+# Auto-summarise and persist conversation turns as memories.
+auto_persist = true
+# Query expansion — ask the LLM for N paraphrasings before searching.
+# Each variant costs one extra Ollama round-trip; default 0 keeps recall fast.
+expansion_variants = 0
+# When true, hybrid search asks Ollama for an embedding and runs vector ANN.
+# Set to false for pure-BM25 recall (~10× faster on slow Ollama, less semantic).
+vector_search = true
+
+[tools]
+# Root directory the agent is allowed to read/write under.
+# Leave empty to allow the entire filesystem (not recommended).
+workspace_root = ""
+# Hard-deny list — paths matching these globs are never touched.
+deny_globs = ["**/.ssh/**", "**/.gnupg/**", "**/.aws/**", "**/*.key", "**/*.pem", "**/id_rsa*"]
+# Shell command allow-list regex. Empty = prompt user for each command.
+shell_allow_regex = ""
+
+# Default session permission mode. One of:
+#   read-only       — no writes, no shell mutations, no web
+#   workspace-write — default; writes confined to workspace_root
+#   unrestricted    — everything still prompts, but no extra guard-rails
+# Override per-session with `--mode <...>` or `/mode <...>` in the REPL.
+mode = "workspace-write"
+
+# Permission rules. Syntax: `tool(matcher)` or a bare `tool` for any invocation.
+# Matchers support `*` for prefix / suffix / contains.
+#
+# Examples:
+#   allow_rules = ["read_file(src/**)", "shell(git status)", "shell(ls*)"]
+#   deny_rules  = ["shell(git push*)", "shell(*rm -rf*)", "write_file(/etc/*)"]
+#   ask_rules   = ["web_fetch", "web_search", "shell(curl*)"]
+#
+# Allow rules auto-approve without a prompt.
+# Deny rules refuse outright with no prompt.
+# Ask rules ALWAYS prompt — even if an allow rule matched or the user picked
+# "always this session". Use for sensitive ops.
+allow_rules = []
+deny_rules  = []
+ask_rules   = []
+
+[web]
+# Brave Search API. Get a key at https://api.search.brave.com/
+# Free tier is 2000 queries/month, which is plenty for one user.
+brave_api_key = ""
+# Endpoint (usually no need to change).
+brave_endpoint = "https://api.search.brave.com/res/v1/web/search"
+# Max results to return per search.
+max_results = 8
+# Refuse outbound HTTP/WHOIS to private (RFC1918), loopback, link-local
+# (incl. cloud-metadata 169.254.169.254), and multicast addresses. Keeps
+# prompt-injected fetches from exfiltrating cloud credentials or hitting
+# internal services. Set to false ONLY on networks where you legitimately
+# need internal HTTP access from the agent.
+block_private_addrs = true
+
+[repl]
+# Show tool calls as they happen.
+show_tool_calls = true
+# Ask before running any shell command or file write.
+confirm_writes = true
+# Colour output.
+color = true

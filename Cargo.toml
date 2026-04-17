@@ -1,0 +1,80 @@
+[package]
+name = "localmind"
+version = "0.1.0"
+edition = "2021"
+description = "Run any local LLM with persistent memory and context. CLI agent over Ollama with SQLite-backed hybrid recall. No cloud."
+license = "MIT"
+authors = ["Neven Kordic"]
+repository = "https://github.com/nevenkordic/localmind"
+readme = "README.md"
+keywords = ["ai", "ollama", "local-llm", "agent", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "llm"
+path = "src/main.rs"
+
+[dependencies]
+# async
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# cli + repl
+clap = { version = "4.5", features = ["derive"] }
+rustyline = "14"
+
+# http + serialization
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# toml_edit preserves comments and formatting when we rewrite config files
+# (e.g. `llm models --chat <name>` updates a single line without nuking the
+# surrounding inline docs).
+toml_edit = "0.22"
+
+# errors + logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# storage
+rusqlite = { version = "0.31", features = ["bundled", "blob", "functions"] }
+# sqlite-vec: approximate-nearest-neighbour vector index inside SQLite.
+# Statically registered via sqlite3_auto_extension — no runtime extension
+# loading, so the `load_extension` rusqlite feature is not enabled.
+sqlite-vec = "0.1"
+
+# utility
+directories = "5"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+base64 = "0.22"
+bytemuck = "1"
+once_cell = "1"
+regex = "1"
+dotenvy = "0.15"
+
+# document parsing
+pdf-extract = "0.7"
+calamine = "0.26"   # xlsx
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+
+# networking tools
+# listening_ports uses OS socket-table APIs (iphlpapi on Windows,
+# libproc on macOS, /proc/net on Linux). Wrapped by netstat2.
+netstat2 = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
