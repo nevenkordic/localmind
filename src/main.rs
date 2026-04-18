@@ -12,6 +12,7 @@ mod net_safety;
 mod repl;
 mod tools;
 mod ui;
+mod update;
 mod util;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,13 @@ enum Command {
     Init,
     /// Print a one-shot health report (DB stats, embedder outbox, Ollama).
     Health,
+    /// Check for a newer release and re-run the installer if one is available.
+    /// Shells out to the same curl-pipe-sh one-liner you used to install.
+    Update {
+        /// Upgrade even if the remote version isn't newer than the current one.
+        #[arg(long)]
+        force: bool,
+    },
     /// Pick which Ollama models to use (interactive picker, or set via flags).
     Models {
         /// Just list installed models and current selections, then exit.
@@ -159,6 +167,15 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load(cli.config.as_deref()).context("loading configuration")?;
     tracing::debug!("loaded config: {:?}", cfg.summary());
 
+    // Non-blocking: prints a banner if a previously-cached release is newer,
+    // and spawns a 3-second background refresh if the cache is older than
+    // `updates.check_interval_hours`. Skipped for `llm update` since that
+    // command does its own synchronous check.
+    let skip_update_banner = matches!(cli.command, Some(Command::Update { .. }));
+    if !skip_update_banner {
+        update::maybe_check_and_print(&cfg);
+    }
+
     // Register sqlite-vec before any connection is opened.
     memory::register_vec_extension();
 
@@ -208,6 +225,26 @@ async fn main() -> Result<()> {
                 },
             )
             .await
+        }
+        Command::Update { force } => {
+            println!("current version: v{}", update::current_version());
+            match update::fetch_and_cache().await {
+                Ok(c) => {
+                    println!("latest release: {}", c.latest_tag);
+                    if !force && !update::is_newer(update::current_version(), &c.latest_tag) {
+                        println!("already on the latest version. Pass --force to reinstall.");
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // Network is down or GitHub API is rate-limiting. Don't
+                    // refuse the upgrade — the user explicitly asked for it.
+                    // They'll see the installer's own error if the release
+                    // fetch also fails.
+                    eprintln!("warning: could not check GitHub releases ({e:#}). Running installer anyway.");
+                }
+            }
+            update::run_installer()
         }
         Command::Init => {
             println!("memory db:   {}", cfg.memory.db_path_resolved().display());

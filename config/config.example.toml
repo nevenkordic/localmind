@@ -90,3 +90,13 @@ show_tool_calls = true
 confirm_writes = true
 # Colour output.
 color = true
+
+[updates]
+# Check GitHub releases for a newer binary. Results are cached in
+# <data_dir>/update-check.json and the HTTP call runs on a background
+# task — it never delays startup. Set to false, or export
+# LOCALMIND_NO_UPDATE_CHECK=1, to disable entirely.
+check = true
+# How often to refresh the cache, in hours. The first run after this
+# interval elapses spawns a single GitHub API call.
+check_interval_hours = 24

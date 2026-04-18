@@ -11,6 +11,8 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub web: WebConfig,
     pub repl: ReplConfig,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +140,28 @@ pub struct ReplConfig {
 }
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesConfig {
+    /// Periodically check GitHub releases for a newer binary. Results are
+    /// cached in <data_dir>/update-check.json for `check_interval_hours`;
+    /// the HTTP call is fire-and-forget and never blocks startup.
+    #[serde(default = "default_true")]
+    pub check: bool,
+    #[serde(default = "default_update_interval")]
+    pub check_interval_hours: u64,
+}
+fn default_update_interval() -> u64 {
+    24
+}
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            check_interval_hours: 24,
+        }
+    }
 }
 
 impl Config {

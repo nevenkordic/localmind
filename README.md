@@ -72,6 +72,26 @@ llm models                  # interactive picker
 llm models --chat qwen2.5-coder:32b --vision gemma3:27b
 ```
 
+## Update
+
+`localmind` checks GitHub for a newer release once every 24 hours (cached in
+`<data_dir>/update-check.json`, background task, non-blocking). When one is
+available, a single line prints at startup:
+
+```
+↑ v0.2.0 available (you have 0.1.0) — run 'llm update' to upgrade
+```
+
+Then:
+
+```bash
+llm update            # re-runs install.sh — pulls new binary, removes older ones
+llm update --force    # reinstall even when already on latest
+```
+
+Turn off the check with `[updates] check = false` in `local.toml`, or with
+`LOCALMIND_NO_UPDATE_CHECK=1` in the environment.
+
 ## Uninstall
 
 One-liner — removes the `llm` binary and strips the PATH line the installer

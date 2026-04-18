@@ -129,6 +129,32 @@ if ! install_to "$INSTALL_DIR"; then
   fi
 fi
 
+# ---- remove older binaries at other locations ------------------------------
+# If an older `llm` is still sitting in another PATH dir (e.g. the user
+# originally installed to /usr/local/bin with sudo, and we just wrote a newer
+# one to ~/.local/bin), remove the stale copy so `which llm` resolves to the
+# version we just installed regardless of PATH order.
+new_bin="$INSTALL_DIR/llm"
+old_IFS=$IFS
+IFS=:
+# shellcheck disable=SC2086  # word-splitting on PATH is intentional here
+for p in $PATH; do
+  [ -n "$p" ] || continue
+  candidate="$p/llm"
+  # Skip the newly-installed binary.
+  case "$candidate" in
+    "$new_bin") continue ;;
+  esac
+  [ -f "$candidate" ] || continue
+  info "Removing older llm at ${candidate}"
+  if [ -w "$p" ]; then
+    rm -f "$candidate" || warn "could not remove ${candidate}"
+  else
+    sudo rm -f "$candidate" || warn "could not remove ${candidate}"
+  fi
+done
+IFS=$old_IFS
+
 # ---- PATH check + shell rc wiring ------------------------------------------
 # If INSTALL_DIR isn't already on PATH, append an export line to the user's
 # shell rc so new shells find the binary. We touch at most one rc file and
