@@ -7,10 +7,10 @@
 //! switch writes back to the same config file `llm models --chat <name>`
 //! uses, so the change persists across runs.
 
-use crate::config::{Config, EMBEDDED_DEFAULT_CONFIG};
+use crate::config::Config;
 use crate::llm::ollama::OllamaClient;
 use crate::models::write_models;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -164,22 +164,7 @@ fn apply_chat_model(
     explicit_config: Option<&Path>,
     value: &str,
 ) -> Result<PathBuf> {
-    let path = match Config::source_path(explicit_config) {
-        Some(p) if p.exists() => p,
-        _ => {
-            let dir = directories::ProjectDirs::from("com", "calligoit", "localmind")
-                .map(|p| p.config_dir().to_path_buf())
-                .context("no platform config dir")?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
-            let p = dir.join("config.toml");
-            if !p.exists() {
-                std::fs::write(&p, EMBEDDED_DEFAULT_CONFIG)
-                    .with_context(|| format!("seeding {}", p.display()))?;
-            }
-            p
-        }
-    };
+    let path = Config::ensure_writable_path(explicit_config)?;
     write_models(&path, Some(value), None, None)?;
     cfg.ollama.chat_model = value.to_string();
     Ok(path)
@@ -274,8 +259,9 @@ mod tests {
     fn apply_chat_model_writes_to_explicit_config() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("local.toml");
-        std::fs::write(&path, EMBEDDED_DEFAULT_CONFIG).unwrap();
-        let mut cfg: Config = toml::from_str(EMBEDDED_DEFAULT_CONFIG).unwrap();
+        std::fs::write(&path, crate::config::EMBEDDED_DEFAULT_CONFIG).unwrap();
+        let mut cfg: Config =
+            toml::from_str(crate::config::EMBEDDED_DEFAULT_CONFIG).unwrap();
         let written = apply_chat_model(&mut cfg, Some(&path), "llama3:8b").unwrap();
         assert_eq!(written, path);
         assert_eq!(cfg.ollama.chat_model, "llama3:8b");

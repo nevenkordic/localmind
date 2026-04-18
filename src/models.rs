@@ -48,10 +48,11 @@ pub struct CliArgs {
 }
 
 pub async fn run(cfg: &Config, config_path: Option<&Path>, args: CliArgs) -> Result<()> {
-    let path = config_path
-        .map(|p| p.to_path_buf())
-        .or_else(|| Config::source_path(None))
-        .ok_or_else(|| anyhow!("no config file resolved — pass --config <path>"))?;
+    // Unlike `Config::source_path`, this always returns Some — seeding a
+    // user-scope config at $XDG_CONFIG_HOME/localmind/config.toml when
+    // nothing exists on disk. A fresh curl-installed user whose cwd is
+    // home should still be able to pick a model.
+    let path = Config::ensure_writable_path(config_path)?;
 
     // Non-interactive set: any of --chat/--vision/--embed bypasses the picker.
     if args.chat.is_some() || args.vision.is_some() || args.embed.is_some() {

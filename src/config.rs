@@ -202,6 +202,30 @@ impl Config {
         None
     }
 
+    /// Return a config-file path we can read AND write to. Preferred order
+    /// matches `source_path`; if nothing exists, creates a user-scope
+    /// config at the platform config dir seeded from the embedded default
+    /// template. Used by `llm models` (which needs somewhere to persist
+    /// changes) and by the preflight switch prompt.
+    pub fn ensure_writable_path(explicit: Option<&Path>) -> Result<PathBuf> {
+        if let Some(p) = Self::source_path(explicit) {
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        let dir = directories::ProjectDirs::from("com", "calligoit", "localmind")
+            .map(|p| p.config_dir().to_path_buf())
+            .context("no platform config dir available")?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let p = dir.join("config.toml");
+        if !p.exists() {
+            std::fs::write(&p, EMBEDDED_DEFAULT_CONFIG)
+                .with_context(|| format!("seeding {}", p.display()))?;
+        }
+        Ok(p)
+    }
+
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let path = Self::source_path(explicit);
         let raw = match path {
