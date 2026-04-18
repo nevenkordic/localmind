@@ -71,8 +71,8 @@ pub async fn report(cfg: &Config, store: &Store) -> String {
                 "  reachable:         yes ({} models)\n",
                 models.len()
             ));
-            let chat_present = models.iter().any(|m| m == &cfg.ollama.chat_model);
-            let embed_present = models.iter().any(|m| m == &cfg.ollama.embed_model);
+            let chat_present = model_is_installed(&models, &cfg.ollama.chat_model);
+            let embed_present = model_is_installed(&models, &cfg.ollama.embed_model);
             out.push_str(&format!(
                 "  chat_model loaded: {}\n",
                 if chat_present {
@@ -114,4 +114,51 @@ fn pct(num: i64, denom: i64) -> f64 {
         return 0.0;
     }
     (num as f64) * 100.0 / (denom as f64)
+}
+
+/// True if `needle` names an installed model. Handles the `:latest` tag
+/// normalisation: a config entry like `nomic-embed-text` must match an
+/// installed `nomic-embed-text:latest` (which is how Ollama actually stores
+/// the default tag). Without this, health reported "embed loaded: NO" even
+/// though the model was right there.
+fn model_is_installed(models: &[String], needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if models.iter().any(|m| m == needle) {
+        return true;
+    }
+    if !needle.contains(':') {
+        let with_latest = format!("{needle}:latest");
+        return models.iter().any(|m| m == &with_latest);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_name_matches_latest_tag() {
+        let installed = vec!["nomic-embed-text:latest".to_string()];
+        assert!(model_is_installed(&installed, "nomic-embed-text"));
+    }
+
+    #[test]
+    fn exact_tag_match() {
+        let installed = vec!["qwen2.5-coder:7b".to_string()];
+        assert!(model_is_installed(&installed, "qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn missing_returns_false() {
+        let installed = vec!["other:1b".to_string()];
+        assert!(!model_is_installed(&installed, "qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn empty_needle_is_installed() {
+        assert!(model_is_installed(&[], ""));
+    }
 }
