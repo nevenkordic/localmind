@@ -72,6 +72,25 @@ llm models                  # interactive picker
 llm models --chat qwen2.5-coder:32b --vision gemma3:27b
 ```
 
+## Uninstall
+
+One-liner — removes the `llm` binary and strips the PATH line the installer
+added to your shell rc. Your memory database and audit log are **kept** so you
+can reinstall later without losing context:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nevenkordic/localmind/main/uninstall.sh | sh
+```
+
+Flags:
+
+| var                          | what it does                                          |
+|------------------------------|-------------------------------------------------------|
+| `LOCALMIND_PURGE_DATA=1`     | also wipe the memory DB, audit log, REPL history      |
+| `LOCALMIND_PURGE_MODELS=1`   | also `ollama rm` the default chat + embed models      |
+
+Ollama itself is never removed (you may use it for other tools).
+
 ## Use
 
 ```bash
