@@ -4,10 +4,12 @@
 [ollama]
 # URL of your local Ollama server.
 host = "http://127.0.0.1:11434"
-# Primary model — strong at code, networking, security, admin.
-chat_model = "qwen2.5-coder:32b"
+# Primary model — the 7B variant fits on most laptops and is what the installer
+# pulls by default. Swap in qwen2.5-coder:32b / gemma3:27b / etc. via `llm models`
+# once you've pulled them (ollama pull <name>).
+chat_model = "qwen2.5-coder:7b"
 # Secondary/fallback model — smaller, faster, vision-capable.
-vision_model = "gemma3:27b"
+vision_model = "gemma3:4b"
 # Embedding model for memory search.
 embed_model = "nomic-embed-text"
 # Request timeout in seconds (large models on cold start can be slow).

@@ -31,17 +31,29 @@ no dependencies beyond Ollama.
 
 ## Install
 
-**One-line install** (macOS / Linux, x86_64 or arm64) — downloads the latest
-release binary, verifies its SHA256, installs to `/usr/local/bin/llm`:
+**One-line install** (macOS arm64, Linux x86_64/arm64) — downloads the latest
+release binary, verifies its SHA256, installs to `~/.local/bin/llm`, installs
+[Ollama](https://ollama.com) if missing, starts its server, and pulls the
+default chat + embed models (~5 GB). After it finishes, `llm` works from any
+shell:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nevenkordic/localmind/main/install.sh | sh
 ```
 
-Pin a version with `LOCALMIND_VERSION=v0.1.0`, or change the install path with
-`LOCALMIND_INSTALL_DIR=$HOME/.local/bin`.
+Environment overrides:
 
-**Build from source:**
+| var                         | default                 | what it does                                    |
+|-----------------------------|-------------------------|-------------------------------------------------|
+| `LOCALMIND_INSTALL_DIR`     | `$HOME/.local/bin`      | install target (auto-added to PATH if missing)  |
+| `LOCALMIND_VERSION`         | `latest`                | pin a release tag, e.g. `v0.1.0`                |
+| `LOCALMIND_CHAT_MODEL`      | `qwen2.5-coder:7b`      | chat model the installer pulls                  |
+| `LOCALMIND_EMBED_MODEL`     | `nomic-embed-text`      | embed model the installer pulls                 |
+| `LOCALMIND_SKIP_OLLAMA=1`   | —                       | don't install or start Ollama                   |
+| `LOCALMIND_SKIP_MODELS=1`   | —                       | don't pull models (saves ~5 GB on metered nets) |
+
+**Build from source** (Intel Mac and Windows have to go this route; Intel Mac
+release binaries are not published):
 
 ```bash
 git clone https://github.com/nevenkordic/localmind
@@ -50,18 +62,14 @@ cd localmind
 .\scripts\install.ps1       # Windows
 ```
 
-You also need [Ollama](https://ollama.com/download) and at least one model:
+Want more capability and have the RAM? Swap in bigger models any time — they're
+not installed by default because the 32B download is 20 GB and most laptops
+can't run it:
 
 ```bash
-ollama pull qwen2.5-coder:7b
-ollama pull nomic-embed-text
-```
-
-Hardware too modest for the default 32B? Pick smaller models any time:
-
-```bash
+ollama pull qwen2.5-coder:32b
 llm models                  # interactive picker
-llm models --chat qwen2.5-coder:7b --vision gemma3:12b
+llm models --chat qwen2.5-coder:32b --vision gemma3:27b
 ```
 
 ## Use
