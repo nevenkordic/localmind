@@ -12,6 +12,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// First-response watchdog. Bounds how long a `/api/chat` call can sit with
+/// no reply before we treat it as a hung / corrupt model and surface an
+/// actionable error. Kept as a constant rather than a config knob because
+/// the failure it catches (0 bytes after 120s on a local loopback call) is
+/// never what anyone wants — users who need longer total generation time
+/// should raise `[ollama] timeout_secs` instead, which bounds the reqwest
+/// client itself.
+const CHAT_WATCHDOG: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct OllamaClient {
     http: reqwest::Client,
@@ -146,19 +155,40 @@ impl OllamaClient {
                 temperature: 0.2,
             },
         };
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("POST /api/chat")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ollama /api/chat {}: {}", status, text));
-        }
-        let parsed: Resp = resp.json().await.context("parsing chat response")?;
+        // Watchdog. If Ollama goes unresponsive (corrupt model, hung worker),
+        // the non-streaming request would otherwise sit on the reqwest
+        // timeout (600s by default) — long enough to look like a lockup in
+        // the REPL. A 120s bound catches real hangs while still leaving
+        // plenty of room for legitimate cold-load + first response on 7B
+        // and even 30B-class models on modern hardware.
+        let call = async {
+            let resp = self
+                .http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .context("POST /api/chat")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("ollama /api/chat {}: {}", status, text));
+            }
+            let parsed: Resp = resp.json().await.context("parsing chat response")?;
+            Ok::<Resp, anyhow::Error>(parsed)
+        };
+        let parsed = match tokio::time::timeout(CHAT_WATCHDOG, call).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "no response from Ollama after {}s — model '{model}' may be hung or corrupt.\n  \
+                     Try:\n    ollama ps                       # is a worker stuck?\n    \
+                     ollama rm {model} && ollama pull {model}\n  \
+                     (Or raise [ollama] timeout_secs if you expect legitimately slow generations.)",
+                    CHAT_WATCHDOG.as_secs()
+                ));
+            }
+        };
         Ok(recover_text_tool_calls(parsed.message))
     }
 

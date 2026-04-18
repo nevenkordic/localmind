@@ -1,6 +1,6 @@
 [package]
 name = "localmind"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Run any local LLM with persistent memory and context. CLI agent over Ollama with SQLite-backed hybrid recall. No cloud."
 license = "MIT"
