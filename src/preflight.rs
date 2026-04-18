@@ -1,21 +1,25 @@
 //! Startup preflight — verifies Ollama is reachable and the configured chat
 //! and embed models are actually pulled before the REPL starts taking input.
 //!
-//! A user whose config points at `qwen2.5-coder:32b` but hasn't pulled it
-//! used to get a bare `ollama /api/chat 404: model not found` on their first
-//! turn. Preflight catches that at startup and prints an actionable remedy
-//! so they never see the 404.
-//!
-//! Prints warnings but never fails — the user might have pulled a model in
-//! another terminal mid-session, or Ollama might come up shortly after.
+//! When the chat model is missing and stdin is a TTY, offer to switch the
+//! config to an installed model *right now* so the user doesn't hit the
+//! `ollama /api/chat 404: model not found` error on their first turn. The
+//! switch writes back to the same config file `llm models --chat <name>`
+//! uses, so the change persists across runs.
 
-use crate::config::Config;
+use crate::config::{Config, EMBEDDED_DEFAULT_CONFIG};
 use crate::llm::ollama::OllamaClient;
+use crate::models::write_models;
+use anyhow::{Context, Result};
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
-/// Run the preflight check and print any warnings to stderr. Returns `true`
-/// if everything looks good, `false` if the user should see a warning
-/// (caller decides whether to continue — right now everyone continues).
-pub async fn check(cfg: &Config) -> bool {
+/// Run the preflight check and (if appropriate) interactively prompt the
+/// user to switch models. Mutates `cfg` in place when the user accepts the
+/// switch — so the REPL banner and first turn both see the new value
+/// without a second parse. Returns `true` if everything looks good after
+/// the check, `false` if the user should continue at their own risk.
+pub async fn check(cfg: &mut Config, explicit_config: Option<&Path>) -> bool {
     let client = OllamaClient::new(&cfg.ollama);
     let models = match client.health().await {
         Ok(m) => m,
@@ -69,6 +73,44 @@ pub async fn check(cfg: &Config) -> bool {
         eprintln!("  Installed: {}{}", preview.join(", "), more);
     }
 
+    // Offer interactive switch when a TTY is attached. In non-TTY use
+    // (pipes, `llm ask` inside scripts, CI), fall back to the informational
+    // remedies so the process stays deterministic.
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let fallback = if chat_missing {
+        pick_chat_fallback(&models)
+    } else {
+        None
+    };
+
+    if interactive && chat_missing {
+        if let Some(fb) = &fallback {
+            match prompt_switch(&cfg.ollama.chat_model, fb) {
+                Prompt::Yes => match apply_chat_model(cfg, explicit_config, fb) {
+                    Ok(written_to) => {
+                        eprintln!(
+                            "\x1b[1;32m✓\x1b[0m chat model set to \x1b[1m{fb}\x1b[0m (saved to {})",
+                            written_to.display()
+                        );
+                        eprintln!();
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[1;31merror:\x1b[0m could not update config: {e:#}");
+                        eprintln!(
+                            "  Run manually: \x1b[1mllm models --chat {fb}\x1b[0m"
+                        );
+                    }
+                },
+                Prompt::No | Prompt::Unreadable => {
+                    // fall through to the passive remedy list.
+                }
+            }
+        }
+    }
+
+    // Passive remedies — shown when no interactive switch happened, or when
+    // the user declined, or when no fallback is installable.
     eprintln!("  Fix one of:");
     if chat_missing {
         eprintln!("    ollama pull {}", cfg.ollama.chat_model);
@@ -76,10 +118,9 @@ pub async fn check(cfg: &Config) -> bool {
     if embed_missing {
         eprintln!("    ollama pull {}", cfg.ollama.embed_model);
     }
-    if let Some(fb) = chat_missing.then(|| pick_chat_fallback(&models)).flatten() {
+    if let Some(fb) = &fallback {
         eprintln!(
-            "    llm models --chat {}   # use this installed model instead",
-            fb
+            "    llm models --chat {fb}   # use this installed model instead"
         );
     }
     eprintln!("    llm models                              # interactive picker");
@@ -87,30 +128,77 @@ pub async fn check(cfg: &Config) -> bool {
     false
 }
 
+enum Prompt {
+    Yes,
+    No,
+    Unreadable,
+}
+
+fn prompt_switch(current: &str, fallback: &str) -> Prompt {
+    eprint!(
+        "Switch chat model from \x1b[1m{current}\x1b[0m to \x1b[1m{fallback}\x1b[0m now? [Y/n] "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => Prompt::Unreadable, // EOF — not really interactive
+        Ok(_) => {
+            let ans = line.trim().to_lowercase();
+            if ans.is_empty() || ans == "y" || ans == "yes" {
+                Prompt::Yes
+            } else {
+                Prompt::No
+            }
+        }
+        Err(_) => Prompt::Unreadable,
+    }
+}
+
+/// Write the selected chat model back to disk and mutate `cfg` in place.
+/// Target file: whatever `Config::source_path` would read from next time.
+/// If nothing exists yet (fresh curl install with no cwd config), seed a
+/// user-scope config at the platform config dir from the embedded default
+/// template so the choice persists across runs.
+fn apply_chat_model(
+    cfg: &mut Config,
+    explicit_config: Option<&Path>,
+    value: &str,
+) -> Result<PathBuf> {
+    let path = match Config::source_path(explicit_config) {
+        Some(p) if p.exists() => p,
+        _ => {
+            let dir = directories::ProjectDirs::from("com", "calligoit", "localmind")
+                .map(|p| p.config_dir().to_path_buf())
+                .context("no platform config dir")?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            let p = dir.join("config.toml");
+            if !p.exists() {
+                std::fs::write(&p, EMBEDDED_DEFAULT_CONFIG)
+                    .with_context(|| format!("seeding {}", p.display()))?;
+            }
+            p
+        }
+    };
+    write_models(&path, Some(value), None, None)?;
+    cfg.ollama.chat_model = value.to_string();
+    Ok(path)
+}
+
 fn is_installed(models: &[String], needle: &str) -> bool {
     if needle.is_empty() {
-        return true; // user explicitly cleared — their problem, don't nag
+        return true;
     }
-    // Ollama tags are case-sensitive and include the `:tag` suffix. Match
-    // exactly on the full name first, then tolerate the `latest` alias
-    // (ollama treats `qwen:7b` and `qwen:7b-latest` as the same, but the
-    // default install never yields the suffixed form anyway).
     if models.iter().any(|m| m == needle) {
         return true;
     }
     if !needle.contains(':') {
-        // User wrote `qwen2.5-coder` without a tag — ollama normalises to
-        // `:latest`. Match anything with that bare base.
         let with_latest = format!("{needle}:latest");
         return models.iter().any(|m| m == &with_latest);
     }
     false
 }
 
-/// Pick a sensible chat fallback from what's actually installed so the user
-/// gets a concrete `llm models --chat <name>` suggestion. Preference order:
-/// exact family matches (qwen2.5-coder sizes), then any qwen-coder, then any
-/// model whose name doesn't contain "embed".
 fn pick_chat_fallback(models: &[String]) -> Option<String> {
     let preferred = [
         "qwen2.5-coder:7b",
@@ -148,7 +236,6 @@ mod tests {
 
     #[test]
     fn empty_needle_treated_as_installed() {
-        // Edge case — user blanked out chat_model. Don't warn.
         assert!(is_installed(&[], ""));
     }
 
@@ -178,5 +265,26 @@ mod tests {
     fn fallback_none_when_only_embed_models() {
         let m = vec!["nomic-embed-text".into(), "mxbai-embed-large".into()];
         assert!(pick_chat_fallback(&m).is_none());
+    }
+
+    // apply_chat_model is exercised via an integration-ish test that
+    // writes to a temp file. It drives the same code path as the
+    // interactive "Y" answer so we catch toml_edit regressions.
+    #[test]
+    fn apply_chat_model_writes_to_explicit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.toml");
+        std::fs::write(&path, EMBEDDED_DEFAULT_CONFIG).unwrap();
+        let mut cfg: Config = toml::from_str(EMBEDDED_DEFAULT_CONFIG).unwrap();
+        let written = apply_chat_model(&mut cfg, Some(&path), "llama3:8b").unwrap();
+        assert_eq!(written, path);
+        assert_eq!(cfg.ollama.chat_model, "llama3:8b");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("chat_model = \"llama3:8b\""));
+        // The [ollama] section header and at least one other comment must
+        // survive the rewrite — a naive serde round-trip would blow them
+        // all away, and the point of using toml_edit is exactly this.
+        assert!(on_disk.contains("[ollama]"));
+        assert!(on_disk.contains("# URL of your local Ollama server."));
     }
 }

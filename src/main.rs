@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
-    let cfg = config::Config::load(cli.config.as_deref()).context("loading configuration")?;
+    let mut cfg = config::Config::load(cli.config.as_deref()).context("loading configuration")?;
     tracing::debug!("loaded config: {:?}", cfg.summary());
 
     // Non-blocking: prints a banner if a previously-cached release is newer,
@@ -194,12 +194,13 @@ async fn main() -> Result<()> {
     });
 
     // Preflight: check Ollama reachability + configured models are pulled
-    // before we open the REPL or handle a one-shot ask. Prints a guided
-    // warning and then proceeds — a model might be pulled mid-session, and
-    // failing hard would be unhelpful for `llm ask` inside scripts that
-    // catch the chat failure themselves.
+    // before we open the REPL or handle a one-shot ask. When stdin is a
+    // TTY, prompts to switch chat model to an installed alternative and
+    // writes the choice back to the config file — so the REPL banner and
+    // first turn both see the new value. Never fails hard; an `llm ask`
+    // inside a script still runs and surfaces the 404 itself.
     if matches!(command, Command::Chat { .. } | Command::Ask { .. }) {
-        preflight::check(&cfg).await;
+        preflight::check(&mut cfg, cli.config.as_deref()).await;
     }
 
     let result = match command {

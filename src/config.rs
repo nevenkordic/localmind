@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 
 /// Baked-in default config. Used when no local.toml / XDG config /
 /// ./config/config.example.toml exists on disk — keeps `llm` running for
-/// fresh curl-installed users whose cwd is unrelated to the repo.
-const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../config/config.example.toml");
+/// fresh curl-installed users whose cwd is unrelated to the repo. Also
+/// seeded into the user-scope config file when the preflight prompt
+/// converts a "no config at all" state into a persisted choice.
+pub(crate) const EMBEDDED_DEFAULT_CONFIG: &str =
+    include_str!("../config/config.example.toml");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
