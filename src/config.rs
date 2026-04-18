@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Baked-in default config. Used when no local.toml / XDG config /
+/// ./config/config.example.toml exists on disk — keeps `llm` running for
+/// fresh curl-installed users whose cwd is unrelated to the repo.
+const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../config/config.example.toml");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub ollama: OllamaConfig,
@@ -200,9 +205,11 @@ impl Config {
             Some(p) => {
                 std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
             }
-            None => anyhow::bail!(
-                "no config found. Copy config/config.example.toml to config/local.toml"
-            ),
+            // No config file anywhere on disk — fall back to the example
+            // config baked into the binary. Fresh curl-installed users don't
+            // have a repo checkout handy, so this makes `llm` work out of
+            // the box. Any explicit config file still takes precedence.
+            None => EMBEDDED_DEFAULT_CONFIG.to_string(),
         };
 
         let mut cfg: Config = toml::from_str(&raw).context("parsing TOML")?;

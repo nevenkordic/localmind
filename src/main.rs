@@ -9,6 +9,7 @@ mod llm;
 mod memory;
 mod models;
 mod net_safety;
+mod preflight;
 mod repl;
 mod tools;
 mod ui;
@@ -187,10 +188,21 @@ async fn main() -> Result<()> {
     // Start the background embedding worker.
     let embedder_handle = memory::embedder::spawn(store.clone(), cfg.clone());
 
-    let result = match cli.command.unwrap_or(Command::Chat {
+    let command = cli.command.unwrap_or(Command::Chat {
         session: None,
         mode: None,
-    }) {
+    });
+
+    // Preflight: check Ollama reachability + configured models are pulled
+    // before we open the REPL or handle a one-shot ask. Prints a guided
+    // warning and then proceeds — a model might be pulled mid-session, and
+    // failing hard would be unhelpful for `llm ask` inside scripts that
+    // catch the chat failure themselves.
+    if matches!(command, Command::Chat { .. } | Command::Ask { .. }) {
+        preflight::check(&cfg).await;
+    }
+
+    let result = match command {
         Command::Chat { session, mode } => {
             let m = parse_mode_flag(mode.as_deref())?;
             repl::run(cfg.clone(), store.clone(), session, m).await
