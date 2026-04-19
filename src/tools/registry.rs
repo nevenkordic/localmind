@@ -113,6 +113,19 @@ impl Registry {
         if needs_permission {
             match ctx.permissions.ask(name, &scope, validator_note) {
                 Decision::Allow | Decision::AllowSession => {}
+                Decision::AllowPersistent(rule) => {
+                    // Save to the user's config so future sessions also skip
+                    // this prompt, then activate in-process so the rest of
+                    // this session benefits too.
+                    if let Err(e) = persist_allow_rule(&rule) {
+                        eprintln!(
+                            "  (could not save permanent grant to config: {e:#} — granting for this session only)"
+                        );
+                    } else {
+                        eprintln!("  \x1b[1;32m✓\x1b[0m saved: allow_rules += {rule}");
+                    }
+                    ctx.permissions.add_allow_rule(&rule);
+                }
                 Decision::Deny => {
                     ctx.audit.record(name, args, "deny", "user denied");
                     return Err(anyhow!("user denied tool call: {name}"));
@@ -276,6 +289,115 @@ fn describe_scope(name: &str, args: &Value) -> String {
             args.get("dest_dir").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         _ => serde_json::to_string(args).unwrap_or_default(),
+    }
+}
+
+/// Append a new entry to `[tools].allow_rules` in the user's config file.
+/// Uses `Config::ensure_writable_path` + toml_edit so comments and other
+/// unrelated settings are preserved. If the config has no [tools] section
+/// or no allow_rules array yet, both are created with sensible defaults.
+fn persist_allow_rule(rule: &str) -> Result<()> {
+    let path = Config::ensure_writable_path(None)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| anyhow!("parsing TOML in {}: {e}", path.display()))?;
+
+    // Ensure [tools] exists.
+    if !doc.contains_key("tools") {
+        doc["tools"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let tools = doc["tools"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("[tools] is not a table"))?;
+
+    // Ensure allow_rules exists as an array.
+    if !tools.contains_key("allow_rules") {
+        tools["allow_rules"] = toml_edit::value(toml_edit::Array::new());
+    }
+    let arr = tools["allow_rules"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("[tools].allow_rules is not an array"))?;
+
+    // Idempotent: don't duplicate an existing entry.
+    let already_present = arr
+        .iter()
+        .any(|v| v.as_str().map(|s| s == rule).unwrap_or(false));
+    if !already_present {
+        arr.push(rule);
+    }
+
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| anyhow!("writing {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    // The real persist_allow_rule uses Config::ensure_writable_path, which
+    // would clobber the user's actual config dir during a test. We inline a
+    // copy that takes an explicit path so the behaviour (toml_edit preserves
+    // comments + appends to allow_rules idempotently) is still covered.
+    fn persist_to(path: &std::path::Path, rule: &str) -> Result<()> {
+        let raw = std::fs::read_to_string(path)?;
+        let mut doc: toml_edit::DocumentMut = raw.parse()?;
+        if !doc.contains_key("tools") {
+            doc["tools"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let tools = doc["tools"].as_table_mut().unwrap();
+        if !tools.contains_key("allow_rules") {
+            tools["allow_rules"] = toml_edit::value(toml_edit::Array::new());
+        }
+        let arr = tools["allow_rules"].as_array_mut().unwrap();
+        let dup = arr.iter().any(|v| v.as_str() == Some(rule));
+        if !dup {
+            arr.push(rule);
+        }
+        std::fs::write(path, doc.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn appends_to_existing_allow_rules_and_preserves_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.toml");
+        std::fs::write(
+            &path,
+            "# top-of-file comment\n[tools]\n# explaining comment\nallow_rules = [\"shell(git status)\"]\n",
+        )
+        .unwrap();
+        persist_to(&path, "write_file(write to: /tmp/x*)").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# top-of-file comment"));
+        assert!(raw.contains("# explaining comment"));
+        assert!(raw.contains("shell(git status)"));
+        assert!(raw.contains("write_file(write to: /tmp/x*)"));
+    }
+
+    #[test]
+    fn creates_missing_tools_section_and_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.toml");
+        std::fs::write(&path, "[ollama]\nhost = \"http://127.0.0.1:11434\"\n").unwrap();
+        persist_to(&path, "shell(ls*)").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[tools]"));
+        assert!(raw.contains("shell(ls*)"));
+    }
+
+    #[test]
+    fn deduplicates_repeated_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local.toml");
+        std::fs::write(&path, "[tools]\nallow_rules = []\n").unwrap();
+        persist_to(&path, "shell(ls*)").unwrap();
+        persist_to(&path, "shell(ls*)").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Count occurrences; should be exactly one.
+        assert_eq!(raw.matches("shell(ls*)").count(), 1);
     }
 }
 

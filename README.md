@@ -55,6 +55,12 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
 - **Safe-by-default tools.** Workspace-confined writes, SSRF guard on
   `web_fetch` and `whois`, destructive-pattern detection on `shell`,
   credential deny-list that's always on.
+- **Interactive permission grants.** When the model wants to write / run
+  something it isn't pre-approved for, you get a prompt:
+  `[y]es  [a]lways this session  [f]orever  [n]o  [e]dit(reason)`. Pick
+  `forever` and the grant is saved to your config (comment-preserving
+  toml_edit — other settings untouched) so the next session starts
+  already pre-approved. No manual config editing required.
 - **Streaming responses.** Tokens appear in real time.
 - **Fast repeat turns.** `keep_alive: 30m` stops Ollama from unloading the
   model between turns; no cold-load per message.

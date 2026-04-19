@@ -154,6 +154,10 @@ impl Matcher {
 pub enum Decision {
     Allow,
     AllowSession,
+    /// Save the generated rule string to the user's config and activate it
+    /// in-process so this session benefits immediately. Caller is responsible
+    /// for the persistence — PermissionManager doesn't know about file paths.
+    AllowPersistent(String),
     Deny,
     Edit(String),
 }
@@ -179,7 +183,10 @@ pub enum ValidatorNote {
 pub struct PermissionManager {
     mode: Mutex<PermissionMode>,
     session_allow: Mutex<HashSet<String>>,
-    allow_rules: Vec<Rule>,
+    // Wrapped in Mutex so `/remember forever` from the prompt can install a
+    // fresh allow-rule for the rest of this process without waiting for a
+    // reload from disk.
+    allow_rules: Mutex<Vec<Rule>>,
     deny_rules: Vec<Rule>,
     ask_rules: Vec<Rule>,
     non_interactive: bool,
@@ -196,10 +203,18 @@ impl PermissionManager {
         Self {
             mode: Mutex::new(mode),
             session_allow: Mutex::new(HashSet::new()),
-            allow_rules: allow.iter().filter_map(|r| Rule::parse(r)).collect(),
+            allow_rules: Mutex::new(allow.iter().filter_map(|r| Rule::parse(r)).collect()),
             deny_rules: deny.iter().filter_map(|r| Rule::parse(r)).collect(),
             ask_rules: ask.iter().filter_map(|r| Rule::parse(r)).collect(),
             non_interactive,
+        }
+    }
+
+    /// Install a fresh allow-rule at runtime (used after a persistent grant
+    /// so the rest of the session doesn't keep re-prompting).
+    pub fn add_allow_rule(&self, rule_str: &str) {
+        if let Some(rule) = Rule::parse(rule_str) {
+            self.allow_rules.lock().unwrap().push(rule);
         }
     }
 
@@ -232,7 +247,14 @@ impl PermissionManager {
         let forced_ask = self.ask_rules.iter().any(|r| r.matches(tool, scope));
 
         // Allow rules auto-approve (unless ask-rule forces a prompt).
-        if !forced_ask && self.allow_rules.iter().any(|r| r.matches(tool, scope)) {
+        if !forced_ask
+            && self
+                .allow_rules
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.matches(tool, scope))
+        {
             return Decision::Allow;
         }
 
@@ -266,7 +288,7 @@ impl PermissionManager {
         let hint = if forced_ask {
             "[y]es  [n]o  [e]dit(reason)"
         } else {
-            "[y]es  [a]lways this session  [n]o  [e]dit(reason)"
+            "[y]es  [a]lways this session  [f]orever  [n]o  [e]dit(reason)"
         };
         eprint!("  allow?  {hint}: ");
         let _ = io::stderr().flush();
@@ -284,6 +306,19 @@ impl PermissionManager {
             }
             "a" | "always" => {
                 eprintln!("  (ask-rule in effect — 'always' is disabled)");
+                Decision::Allow
+            }
+            "f" | "forever" | "p" | "permanent" if !forced_ask => {
+                // Build a prefix-match rule from the first line of the scope
+                // (scope can be multi-line, e.g. "write to: /path\nsize: 123").
+                // Prefix `*` at the end means future scopes starting the same
+                // way still match even when trailing detail differs.
+                let first_line = scope.lines().next().unwrap_or(scope).trim();
+                let rule = format!("{tool}({first_line}*)");
+                Decision::AllowPersistent(rule)
+            }
+            "f" | "forever" | "p" | "permanent" => {
+                eprintln!("  (ask-rule in effect — 'forever' is disabled)");
                 Decision::Allow
             }
             "n" | "no" => Decision::Deny,
