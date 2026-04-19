@@ -227,14 +227,32 @@ fn mode_guard(
 
 fn describe_scope(name: &str, args: &Value) -> String {
     match name {
-        "write_file" => format!(
-            "write to: {}\nsize: {} chars",
-            args.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
-            args.get("content")
+        "write_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let new_content = args
+                .get("content")
                 .and_then(|v| v.as_str())
-                .map(|s| s.len())
-                .unwrap_or(0)
-        ),
+                .unwrap_or("");
+            let old_content = std::fs::read_to_string(path).unwrap_or_default();
+            let mut out = format!("write to: {path}\n");
+            if old_content.is_empty() {
+                out.push_str(&format!(
+                    "new file, {} lines, {} chars\n",
+                    new_content.lines().count(),
+                    new_content.len()
+                ));
+            } else {
+                let (plus, minus) = count_changes(&old_content, new_content);
+                out.push_str(&format!(
+                    "edit: +{plus} / -{minus} lines ({} → {} total)\n",
+                    old_content.lines().count(),
+                    new_content.lines().count()
+                ));
+            }
+            out.push_str("---- diff ----\n");
+            out.push_str(&render_diff(&old_content, new_content, 60));
+            out
+        }
         "shell" => format!(
             "command: {}",
             crate::util::truncate(
@@ -290,6 +308,91 @@ fn describe_scope(name: &str, args: &Value) -> String {
         ),
         _ => serde_json::to_string(args).unwrap_or_default(),
     }
+}
+
+/// Unified-diff-ish summary of `old` vs `new`, truncated to `max_lines`,
+/// colorised with ANSI escapes and prefixed with line numbers for the
+/// side that owns each line (original line number on delete, new line
+/// number on insert). Designed to land inside the permission-prompt box
+/// so the user sees exactly what's being written before approving.
+///
+///   237 | + let mut out = format!(...);
+///   238 | + if old_content.is_empty() {
+///    42 | -   old line being removed
+///
+/// Green '+' for additions, red '-' for removals, dim for unchanged
+/// context. The line-number gutter width adapts to the larger of the
+/// two files so the `|` column stays straight on large diffs.
+pub(crate) fn render_diff(old: &str, new: &str, max_lines: usize) -> String {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(old, new);
+
+    // Gutter width from whichever side has more lines, +1 for safety on
+    // the exclusive upper bound similar reports.
+    let max_line_no = old.lines().count().max(new.lines().count()).max(1);
+    let width = max_line_no.to_string().len();
+
+    let mut out = String::new();
+    let mut rendered = 0usize;
+    let mut skipped = 0usize;
+    for change in diff.iter_all_changes() {
+        if rendered >= max_lines {
+            skipped += 1;
+            continue;
+        }
+        // Pick the relevant line number for this side of the diff.
+        let lineno = match change.tag() {
+            ChangeTag::Delete => change.old_index(),
+            ChangeTag::Insert => change.new_index(),
+            ChangeTag::Equal => change.new_index(),
+        };
+        let lineno = lineno.map(|n| n + 1).unwrap_or(0);
+        let lineno_str = format!("{:>width$}", lineno, width = width);
+
+        // Colour palette — bright green for inserts, bright red for
+        // deletes, dim for context. The gutter itself (line number + pipe)
+        // stays dim so the eye goes straight to the change.
+        let (sign, line_ansi, gutter_ansi) = match change.tag() {
+            ChangeTag::Delete => ("-", "\x1b[31m", "\x1b[2;31m"),
+            ChangeTag::Insert => ("+", "\x1b[32m", "\x1b[2;32m"),
+            ChangeTag::Equal => (" ", "\x1b[2;37m", "\x1b[2;37m"),
+        };
+
+        let raw = change.to_string();
+        let body = raw.strip_suffix('\n').unwrap_or(&raw);
+        out.push_str(&format!(
+            "{gutter_ansi}{lineno_str} \u{2502}\x1b[0m {line_ansi}{sign} {body}\x1b[0m\n"
+        ));
+        rendered += 1;
+    }
+    if skipped > 0 {
+        out.push_str(&format!(
+            "\x1b[2m… ({} more lines not shown — full diff in audit log)\x1b[0m\n",
+            skipped
+        ));
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Count added / removed lines between `old` and `new`. Cheap — the full
+/// diff iterator already computes this; we just tally counts for the
+/// header line in the scope string.
+fn count_changes(old: &str, new: &str) -> (usize, usize) {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(old, new);
+    let mut plus = 0;
+    let mut minus = 0;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => plus += 1,
+            ChangeTag::Delete => minus += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    (plus, minus)
 }
 
 /// Append a new entry to `[tools].allow_rules` in the user's config file.

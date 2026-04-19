@@ -671,16 +671,74 @@ mod tests {
 
     #[test]
     fn filter_emits_prose_that_starts_with_a_literal_brace() {
-        // Edge case: prose that genuinely starts with `{`. The filter
-        // should only commit to dropping when it sees a `"name"` key.
-        let out = run_filter(&[
-            "{this is just prose with a leading brace — no quoted keys — like a set}.",
-        ]);
-        // "{…}" > 128 chars without a `"name"` → flush and emit.
+        // Edge case: prose genuinely starting with `{`. Commit to dropping
+        // only when we see a `"name"` key within the first 256 chars.
+        let long_brace_prose: String =
+            "{".to_owned() + &"this is just prose with a leading brace and no quoted keys so the filter must eventually give up and emit. ".repeat(4) + "}";
+        let out = run_filter(&[&long_brace_prose]);
         assert!(
             out.starts_with("{this is just prose"),
             "prose with leading brace must not be dropped, got {out:?}"
         );
+    }
+
+    #[test]
+    fn filter_drops_multiple_sequential_tool_calls() {
+        // The exact failure mode from the user's screenshot: three
+        // write_file calls back-to-back, no prose in between.
+        let out = run_filter(&[
+            r#"{"name":"write_file","arguments":{"path":"/a","content":"x"}}"#,
+            r#"{"name":"write_file","arguments":{"path":"/b","content":"y"}}"#,
+            r#"{"name":"write_file","arguments":{"path":"/c","content":"z"}}"#,
+        ]);
+        assert_eq!(out, "", "consecutive tool-call JSON must all be dropped, got {out:?}");
+    }
+
+    #[test]
+    fn filter_drops_interleaved_template_tokens() {
+        let out = run_filter(&[
+            r#"{"name":"write_file","arguments":{"path":"/a","content":"x"}}"#,
+            "<|im_start|>",
+            r#"{"name":"write_file","arguments":{"path":"/b","content":"y"}}"#,
+            "<|im_start|>",
+            r#"{"name":"write_file","arguments":{"path":"/c","content":"z"}}"#,
+        ]);
+        assert_eq!(out, "", "template tokens + JSON must all be dropped, got {out:?}");
+    }
+
+    #[test]
+    fn filter_keeps_prose_between_tool_calls() {
+        let out = run_filter(&[
+            "Now let's save these files.\n",
+            r#"{"name":"write_file","arguments":{"path":"/a","content":"x"}}"#,
+            "\nFirst file done.\n",
+            r#"{"name":"write_file","arguments":{"path":"/b","content":"y"}}"#,
+            "\nAll done.",
+        ]);
+        // Must keep the prose and only drop the JSON blocks.
+        assert!(out.contains("Now let's save these files."));
+        assert!(out.contains("First file done."));
+        assert!(out.contains("All done."));
+        assert!(!out.contains("write_file"), "got leaked JSON: {out:?}");
+    }
+
+    #[test]
+    fn filter_strips_template_tokens_in_prose() {
+        let out = run_filter(&[
+            "Hello there.<|im_end|>\n",
+            "<|im_start|>",
+            "World.",
+        ]);
+        assert!(out.contains("Hello there."));
+        assert!(out.contains("World."));
+        assert!(!out.contains("<|im_"), "template tokens must not leak: {out:?}");
+    }
+
+    #[test]
+    fn filter_handles_template_token_split_across_chunks() {
+        // Real stream could split the token mid-way; filter must stitch.
+        let out = run_filter(&["<|im_st", "art|>hello"]);
+        assert_eq!(out, "hello");
     }
 
     #[test]
@@ -715,21 +773,25 @@ mod tests {
     }
 }
 
-/// Streaming filter that drops model-emitted tool-call JSON from the output
-/// before it reaches the user. Some models (notably qwen2.5-coder) emit a
-/// tool call BOTH as a structured `tool_calls` field AND as a serialized
-/// `{"name":"...","arguments":{...}}` block inside `content`. Without this
-/// filter, the serialised copy leaks to stdout during streaming while the
-/// structured call runs normally — producing ugly artefacts like:
+/// Streaming filter that drops model-emitted tool-call JSON AND chat-template
+/// tokens from the output before they reach the user. Some models (notably
+/// qwen2.5-coder) emit a tool call BOTH as a structured `tool_calls` field
+/// AND as a serialised `{"name":"...","arguments":{...}}` block inside
+/// `content`, often several back-to-back. Others leak internal chat-template
+/// markers like `<|im_start|>` / `<|im_end|>` when Ollama's template handling
+/// hiccups. Without this filter, streaming dumps all of it straight to stdout:
 ///
-///     {"name":"read_pdf","arguments":{"path":"/…/foo.pdf"}}
-///       · read_pdf
-///     Here is the summary…
+///     Now let's save these files.
+///     {"name":"write_file","arguments":{"content":"<!DOCTYPE…","path":"…"}}
+///     <|im_start|>
+///     {"name":"write_file","arguments":{"content":"…","path":"…"}}
+///     <|im_start|>
+///     …
 ///
-/// The filter buffers the early bytes of an iteration. If they look like
-/// JSON that would parse as a tool call, it drops everything through the
-/// closing brace. Otherwise it flushes the buffer and streams the rest
-/// straight through.
+/// The filter maintains a small state machine and reruns the decision loop
+/// whenever it finishes suppressing one block — so consecutive JSON objects
+/// and consecutive template tokens are ALL stripped, not just the first.
+/// Prose in between (when present) passes through unchanged.
 pub(crate) struct StreamingToolCallFilter {
     buf: String,
     state: FilterState,
@@ -738,15 +800,20 @@ pub(crate) struct StreamingToolCallFilter {
     escape: bool,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 enum FilterState {
-    /// Still accumulating the first chars; haven't decided.
+    /// Still accumulating; haven't decided what the next bytes are.
     Pending,
-    /// Committed to prose; pass everything through.
+    /// Committed to prose; emit as bytes arrive, but scan for the start of
+    /// a fresh JSON/template block so we can flip back to Pending.
     Emitting,
-    /// Committed to tool-call JSON; drop until the matching `}` closes.
-    Dropping,
+    /// Inside a JSON object we're dropping. Counts braces to find the close.
+    DroppingJson,
+    /// Inside a `<|...|>` template token. Drops until `|>`.
+    DroppingTemplate,
 }
+
+const TEMPLATE_PREFIXES: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
 
 impl StreamingToolCallFilter {
     pub fn new() -> Self {
@@ -762,82 +829,138 @@ impl StreamingToolCallFilter {
     /// Feed a streamed chunk. Returns the portion (if any) that should
     /// reach the user's sink right now.
     pub fn feed(&mut self, chunk: &str) -> Option<String> {
-        match self.state {
-            FilterState::Emitting => Some(chunk.to_string()),
-            FilterState::Dropping => {
-                // Track braces so we know when the JSON object closes, then
-                // flip back to Emitting for any trailing prose in THIS chunk.
-                let tail = self.track_braces_until_close(chunk);
-                tail.map(|s| s.to_string())
-            }
-            FilterState::Pending => {
-                self.buf.push_str(chunk);
-                self.decide();
-                match self.state {
-                    FilterState::Emitting => {
-                        let out = std::mem::take(&mut self.buf);
-                        Some(out)
+        self.buf.push_str(chunk);
+        let mut out = String::new();
+        // Process the buffer through as many state transitions as possible.
+        // Each iteration either consumes bytes (produces output or drops
+        // them) or breaks out when more input is needed.
+        loop {
+            match self.state {
+                FilterState::Pending => {
+                    if !self.try_decide() {
+                        break; // need more bytes
                     }
-                    FilterState::Dropping => {
-                        // Dropping mode: scan accumulated buffer for the
-                        // object close. Anything after the close is prose
-                        // that should still be emitted.
-                        let accumulated = std::mem::take(&mut self.buf);
-                        self.reset_brace_tracker();
-                        self.track_braces_until_close(&accumulated).map(|s| s.to_string())
+                }
+                FilterState::DroppingJson => {
+                    if !self.consume_json() {
+                        break;
                     }
-                    FilterState::Pending => None,
+                    // Closed — next bytes might be another JSON or template
+                    // or prose. Go back to Pending and re-decide.
+                    self.state = FilterState::Pending;
+                }
+                FilterState::DroppingTemplate => {
+                    if !self.consume_template() {
+                        break;
+                    }
+                    self.state = FilterState::Pending;
+                }
+                FilterState::Emitting => {
+                    // Emit up to the start of the next JSON/template block,
+                    // if any. Otherwise drain everything.
+                    let restart = self.find_restart_point();
+                    match restart {
+                        Some(idx) if idx > 0 => {
+                            out.push_str(&self.buf[..idx]);
+                            self.buf.drain(..idx);
+                            self.state = FilterState::Pending;
+                        }
+                        Some(_) => {
+                            // Restart is at 0 — go straight to decision.
+                            self.state = FilterState::Pending;
+                        }
+                        None => {
+                            out.push_str(&self.buf);
+                            self.buf.clear();
+                            break;
+                        }
+                    }
                 }
             }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
         }
     }
 
     pub fn flush(&mut self) -> Option<String> {
-        if matches!(self.state, FilterState::Pending) && !self.buf.is_empty() {
-            // Stream ended before we made a decision. Emit what we have —
-            // probably fragmentary prose that never reached a newline or
-            // the decision threshold.
-            Some(std::mem::take(&mut self.buf))
-        } else {
+        // Stream ended. If we were emitting or pending prose, flush the
+        // remainder. If we were mid-drop, drop it — an unterminated JSON
+        // or template token is still noise.
+        let out = match self.state {
+            FilterState::Emitting => std::mem::take(&mut self.buf),
+            FilterState::Pending => {
+                let trimmed = self.buf.trim_start();
+                if trimmed.is_empty()
+                    || trimmed.starts_with('{')
+                    || trimmed.starts_with('[')
+                    || TEMPLATE_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+                {
+                    // Looks like unfinished JSON / template / empty — drop.
+                    self.buf.clear();
+                    String::new()
+                } else {
+                    std::mem::take(&mut self.buf)
+                }
+            }
+            _ => {
+                self.buf.clear();
+                String::new()
+            }
+        };
+        if out.is_empty() {
             None
+        } else {
+            Some(out)
         }
     }
 
-    fn decide(&mut self) {
+    /// Look at self.buf and decide whether it starts a JSON tool-call, a
+    /// template token, or prose. Returns true if a decision was made (state
+    /// changed away from Pending), false if we need more bytes.
+    fn try_decide(&mut self) -> bool {
+        // Skip leading whitespace we can safely emit later.
         let trimmed = self.buf.trim_start();
-        // Not JSON-looking? Prose — flush and commit to emitting.
-        if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-            self.state = FilterState::Emitting;
-            return;
+        if trimmed.is_empty() {
+            return false;
         }
-        // JSON-looking prefix. Wait for enough context before committing.
-        // Decide only once we've seen a `"name"` key (clear signal) OR
-        // reached ~128 chars without one (probably not a tool call, emit).
-        let has_name_key =
-            trimmed.contains("\"name\"") || trimmed.contains("\"name\" ");
-        if has_name_key {
-            self.state = FilterState::Dropping;
-            self.reset_brace_tracker();
-        } else if self.buf.len() > 128 {
-            // 128 bytes of JSON-looking prose without a `"name"` — not a
-            // tool call. Flush.
-            self.state = FilterState::Emitting;
+        // Template token at current position?
+        for prefix in TEMPLATE_PREFIXES {
+            if trimmed.starts_with(prefix) {
+                self.state = FilterState::DroppingTemplate;
+                return true;
+            }
+            // Partial prefix — need more bytes before we know.
+            if prefix.starts_with(trimmed) && trimmed.len() < prefix.len() {
+                return false;
+            }
         }
-        // else: keep buffering.
+        // JSON tool-call shape?
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let has_name_key = trimmed.contains("\"name\"");
+            if has_name_key {
+                self.state = FilterState::DroppingJson;
+                self.reset_brace_tracker();
+                return true;
+            }
+            if trimmed.len() > 256 {
+                // Long JSON-looking prose without a "name" key — emit.
+                self.state = FilterState::Emitting;
+                return true;
+            }
+            return false; // wait for more
+        }
+        // Everything else is prose.
+        self.state = FilterState::Emitting;
+        true
     }
 
-    fn reset_brace_tracker(&mut self) {
-        self.brace_depth = 0;
-        self.in_string = false;
-        self.escape = false;
-    }
-
-    /// Walk `chunk` byte-by-byte tracking JSON brace depth. When the
-    /// outermost `{...}` closes, flip state to Emitting and return the
-    /// remainder of the chunk (which belongs to prose). Returns None if
-    /// the JSON hasn't closed yet.
-    fn track_braces_until_close<'a>(&mut self, chunk: &'a str) -> Option<&'a str> {
-        let bytes = chunk.as_bytes();
+    fn consume_json(&mut self) -> bool {
+        // Walk buf tracking brace depth. Drop up through the closing brace.
+        let bytes = self.buf.as_bytes();
+        let mut close_at: Option<usize> = None;
         for (i, &b) in bytes.iter().enumerate() {
             if self.in_string {
                 if self.escape {
@@ -855,16 +978,66 @@ impl StreamingToolCallFilter {
                 b'}' | b']' => {
                     self.brace_depth -= 1;
                     if self.brace_depth <= 0 {
-                        // Object closed. Flip to Emitting and return the
-                        // rest of the chunk (after this byte).
-                        self.state = FilterState::Emitting;
-                        return Some(&chunk[i + 1..]);
+                        close_at = Some(i + 1);
+                        break;
                     }
                 }
                 _ => {}
             }
         }
-        None
+        match close_at {
+            Some(n) => {
+                self.buf.drain(..n);
+                true
+            }
+            None => {
+                // Whole buffer consumed inside the JSON. Clear and wait for
+                // more input.
+                self.buf.clear();
+                false
+            }
+        }
+    }
+
+    fn consume_template(&mut self) -> bool {
+        // Templates end with `|>`. Find it and drop through.
+        if let Some(idx) = self.buf.find("|>") {
+            self.buf.drain(..idx + 2);
+            true
+        } else {
+            // Haven't seen the close yet. Keep the last byte in case `|` is
+            // split across chunks; drop everything before.
+            let keep_from = self.buf.len().saturating_sub(1);
+            self.buf.drain(..keep_from);
+            false
+        }
+    }
+
+    /// In Emitting mode, scan buf for the start of the next suppressible
+    /// block so we know where to stop emitting. Returns Some(index) if
+    /// found, None if the buffer is all prose.
+    fn find_restart_point(&self) -> Option<usize> {
+        let mut earliest: Option<usize> = None;
+        // JSON tool-call boundary — `{"name"` is our signature.
+        if let Some(idx) = self.buf.find("{\"name\"") {
+            earliest = Some(idx);
+        }
+        // Template tokens.
+        for prefix in TEMPLATE_PREFIXES {
+            if let Some(idx) = self.buf.find(prefix) {
+                earliest = Some(match earliest {
+                    Some(e) => e.min(idx),
+                    None => idx,
+                });
+            }
+        }
+        earliest
+    }
+
+    fn reset_brace_tracker(&mut self) {
+        self.brace_depth = 0;
+        self.in_string = false;
+        self.escape = false;
     }
 }
 
