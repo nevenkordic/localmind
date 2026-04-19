@@ -45,6 +45,10 @@ pub async fn run(
         let _ = rl.load_history(p);
     }
 
+    // Remember the last user turn so `/retry-big` can re-run it on the
+    // capable model after the router routed it to the fast one.
+    let mut last_user_turn: Option<String> = None;
+
     loop {
         let line = rl.readline("localmind> ");
         match line {
@@ -56,27 +60,19 @@ pub async fn run(
                 let _ = rl.add_history_entry(l);
 
                 if l.starts_with('/') {
-                    if !handle_slash(l, &cfg, &mut agent).await {
-                        break;
+                    match handle_slash(l, &cfg, &mut agent, last_user_turn.as_deref()).await {
+                        SlashAction::Continue => {}
+                        SlashAction::Quit => break,
+                        SlashAction::RunTurn(input) => {
+                            last_user_turn = Some(input.clone());
+                            run_turn(&mut agent, &input).await;
+                        }
                     }
                     continue;
                 }
 
-                println!();
-                match agent.turn(l).await {
-                    Ok(reply) => {
-                        // With the token sink installed, tokens were
-                        // already written to stdout as they arrived;
-                        // skip the trailing re-print so we don't echo
-                        // the reply twice. Keep the spacing either way.
-                        if !agent.is_streaming() {
-                            println!("{reply}");
-                        }
-                        println!();
-                        println!();
-                    }
-                    Err(e) => eprintln!("! {e}"),
-                }
+                last_user_turn = Some(l.to_string());
+                run_turn(&mut agent, l).await;
             }
             Err(ReadlineError::Interrupted) => {
                 eprintln!("(^C — type /quit to exit)");
@@ -107,11 +103,65 @@ fn chmod_user_only(p: &std::path::Path) {
 #[cfg(not(unix))]
 fn chmod_user_only(_p: &std::path::Path) {}
 
-async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
+enum SlashAction {
+    /// Slash command handled; keep the REPL running.
+    Continue,
+    /// User asked to quit.
+    Quit,
+    /// Slash command resolved into a full turn the REPL should run (e.g.
+    /// `/retry-big` replays the last input on the capable model).
+    RunTurn(String),
+}
+
+async fn run_turn(agent: &mut AgentRun, input: &str) {
+    println!();
+    match agent.turn(input).await {
+        Ok(reply) => {
+            if !agent.is_streaming() {
+                println!("{reply}");
+            }
+            println!();
+            println!();
+        }
+        Err(e) => eprintln!("! {e}"),
+    }
+}
+
+async fn handle_slash(
+    line: &str,
+    cfg: &Config,
+    agent: &mut AgentRun,
+    last_user_turn: Option<&str>,
+) -> SlashAction {
     let mut parts = line[1..].split_whitespace();
     let cmd = parts.next().unwrap_or("");
     match cmd {
-        "quit" | "exit" | "q" => false,
+        "quit" | "exit" | "q" => SlashAction::Quit,
+        "retry-big" | "big" | "escalate" => {
+            let Some(last) = last_user_turn else {
+                eprintln!("(no previous turn to retry)");
+                return SlashAction::Continue;
+            };
+            let chat = cfg.ollama.chat_model.clone();
+            eprintln!("\x1b[2m(retrying on {chat})\x1b[0m");
+            agent.force_next_model(chat);
+            return SlashAction::RunTurn(last.to_string());
+        }
+        "fast" => {
+            // `/fast <message>` forces the fast_model for this one turn.
+            let fast = cfg.ollama.fast_model.trim();
+            if fast.is_empty() {
+                eprintln!("(no [ollama].fast_model configured — edit config/local.toml)");
+                return SlashAction::Continue;
+            }
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            if rest.is_empty() {
+                eprintln!("usage: /fast <message>");
+                return SlashAction::Continue;
+            }
+            agent.force_next_model(fast.to_string());
+            return SlashAction::RunTurn(rest);
+        }
         "help" | "?" => {
             println!("Slash commands:");
             println!("  /help                - this message");
@@ -140,13 +190,15 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
             println!("  /tools               - list advertised tools");
             println!("  /mode                - show the current permission mode");
             println!("  /mode <ro|ww|full>   - change the permission mode");
-            true
+            println!("  /fast <message>      - force this turn on [ollama].fast_model");
+            println!("  /retry-big           - re-run the last turn on [ollama].chat_model");
+            SlashAction::Continue
         }
         "init" => {
             if let Err(e) = run_init(agent).await {
                 eprintln!("! /init failed: {e}");
             }
-            true
+            SlashAction::Continue
         }
         "mode" => {
             match parts.next() {
@@ -163,7 +215,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     ),
                 },
             }
-            true
+            SlashAction::Continue
         }
         "stats" => {
             match agent.ctx.store.stats().await {
@@ -178,11 +230,11 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                 ),
                 Err(e) => eprintln!("{e}"),
             }
-            true
+            SlashAction::Continue
         }
         "health" => {
             print!("{}", crate::health::report(cfg, &agent.ctx.store).await);
-            true
+            SlashAction::Continue
         }
         "model" | "models" => {
             println!("current models:");
@@ -192,7 +244,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
             println!();
             println!("To change: exit, then run `llm models` (interactive picker)");
             println!("           or `llm models --chat <name>` to set non-interactively.");
-            true
+            SlashAction::Continue
         }
         "skills" => {
             match agent.ctx.store.list_by_kind("skill", 100).await {
@@ -210,7 +262,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                 }
                 Err(e) => eprintln!("{e}"),
             }
-            true
+            SlashAction::Continue
         }
         "recall" => {
             let query: String = parts.collect::<Vec<_>>().join(" ");
@@ -249,7 +301,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     Err(e) => eprintln!("{e}"),
                 }
             }
-            true
+            SlashAction::Continue
         }
         "context" => {
             let total: usize = agent.messages.iter().map(|m| m.content.len()).sum();
@@ -276,7 +328,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     start
                 );
             }
-            true
+            SlashAction::Continue
         }
         "remember" => {
             let text: String = parts.collect::<Vec<_>>().join(" ");
@@ -300,7 +352,7 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     Err(e) => eprintln!("{e}"),
                 }
             }
-            true
+            SlashAction::Continue
         }
         "forget" => {
             match parts.next() {
@@ -330,17 +382,17 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     Err(e) => eprintln!("{e}"),
                 },
             }
-            true
+            SlashAction::Continue
         }
         "audit" => {
             println!("{}", agent.ctx.audit.path().display());
-            true
+            SlashAction::Continue
         }
         "config" => {
             if let Ok(s) = cfg.pretty() {
                 println!("{s}");
             }
-            true
+            SlashAction::Continue
         }
         "tools" => {
             for t in crate::tools::Registry::specs(&agent.ctx) {
@@ -350,11 +402,11 @@ async fn handle_slash(line: &str, cfg: &Config, agent: &mut AgentRun) -> bool {
                     crate::util::truncate(&t.function.description, 80)
                 );
             }
-            true
+            SlashAction::Continue
         }
         other => {
             eprintln!("unknown command: /{other}");
-            true
+            SlashAction::Continue
         }
     }
 }

@@ -29,6 +29,14 @@ pub struct OllamaConfig {
     pub chat_model: String,
     pub vision_model: String,
     pub embed_model: String,
+    /// Optional fast-path model. When set, the agent routes trivial / short /
+    /// conversational turns here and only escalates to `chat_model` for code,
+    /// long prompts, or explicit tool-implicit requests. Empty string means
+    /// "no cascading — always use chat_model" (keeps existing behaviour for
+    /// users who don't care). Users can also force either direction with
+    /// `/fast <msg>` / `/big <msg>` / `/retry-big` in the REPL.
+    #[serde(default)]
+    pub fast_model: String,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     #[serde(default = "default_ctx")]

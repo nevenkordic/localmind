@@ -35,6 +35,10 @@ pub struct AgentRun {
     /// NOT re-print the return value of `turn()` — the content has already
     /// been rendered progressively.
     token_sink: Option<TokenSink>,
+    /// When set, this turn is forced to use the named model regardless of
+    /// what the router would have picked. Cleared after the turn. Set via
+    /// REPL slash commands like `/retry-big` and `/fast <msg>`.
+    force_model: Option<String>,
 }
 
 impl AgentRun {
@@ -85,7 +89,15 @@ impl AgentRun {
             last_primer: None,
             last_memory_primer: None,
             token_sink: None,
+            force_model: None,
         })
+    }
+
+    /// Force the next turn to use a specific model, overriding the cascade
+    /// router. Cleared automatically after the turn runs. Used by the REPL's
+    /// `/retry-big` / `/fast` / `/big` slash commands.
+    pub fn force_next_model(&mut self, model: impl Into<String>) {
+        self.force_model = Some(model.into());
     }
 
     /// Enable progressive token streaming. Each content chunk from the
@@ -99,6 +111,28 @@ impl AgentRun {
 
     pub fn is_streaming(&self) -> bool {
         self.token_sink.is_some()
+    }
+
+    /// Decide which model this turn should use. Precedence:
+    ///   1. An explicit `force_model` set by the REPL (slash commands).
+    ///   2. No routing if `fast_model` is empty / equals `chat_model` — the
+    ///      user hasn't opted into cascading.
+    ///   3. Heuristic: trivial / short / conversational → fast_model;
+    ///      code / long / tool-implicit → chat_model.
+    fn route_turn(&self, input: &str) -> String {
+        if let Some(m) = &self.force_model {
+            return m.clone();
+        }
+        let fast = self.ctx.cfg.ollama.fast_model.trim();
+        let main = &self.ctx.cfg.ollama.chat_model;
+        if fast.is_empty() || fast == main {
+            return main.clone();
+        }
+        if should_use_fast(input) {
+            fast.to_string()
+        } else {
+            main.clone()
+        }
     }
 
     /// Send a user turn and iterate through any tool calls the model requests.
@@ -145,7 +179,10 @@ impl AgentRun {
 
         self.messages
             .push(ChatMessage::user(user_input.to_string()));
-        self.loop_tools().await
+        let model = self.route_turn(user_input);
+        // Consume any force_model so the next turn re-routes normally.
+        self.force_model = None;
+        self.loop_tools(&model).await
     }
 
     /// Build skill + memory primers from a single recall query. Honours
@@ -230,7 +267,7 @@ impl AgentRun {
         (skill_primer, memory_primer)
     }
 
-    async fn loop_tools(&mut self) -> Result<String> {
+    async fn loop_tools(&mut self, model: &str) -> Result<String> {
         let specs = Registry::specs(&self.ctx);
         let color = crate::ui::color_enabled(self.ctx.cfg.repl.color);
         for _ in 0..self.max_tool_iterations {
@@ -264,7 +301,7 @@ impl AgentRun {
                 };
                 let r = self
                     .client
-                    .chat_stream(&self.messages, Some(&specs), false, cb)
+                    .chat_stream_on(&self.messages, Some(&specs), false, Some(model), cb)
                     .await;
                 // If the stream ended without ever calling the callback
                 // (error before the first token) the spinner is still
@@ -274,7 +311,10 @@ impl AgentRun {
                 }
                 r
             } else {
-                let r = self.client.chat(&self.messages, Some(&specs), false).await;
+                let r = self
+                    .client
+                    .chat_on(&self.messages, Some(&specs), false, Some(model))
+                    .await;
                 spinner.stop().await;
                 r
             };
@@ -365,7 +405,7 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_facts, is_trivial_turn};
+    use super::{extract_facts, is_trivial_turn, should_use_fast};
 
     fn first(input: &str) -> Option<(String, String, String)> {
         extract_facts(input).into_iter().next()
@@ -447,6 +487,42 @@ mod tests {
     }
 
     #[test]
+    fn router_fast_for_short_chatty_turns() {
+        for w in &[
+            "hi",
+            "what time is it?",
+            "who am I",
+            "tell me a joke",
+            "is it raining",
+            "hello there friend",
+        ] {
+            assert!(should_use_fast(w), "expected fast path for: {w}");
+        }
+    }
+
+    #[test]
+    fn router_big_for_code_and_tool_work() {
+        for w in &[
+            "fix the failing test in src/agent/mod.rs",
+            "```rust\nfn main() { }\n```",
+            "refactor this function to use iterators",
+            "debug why the embedder is failing",
+            "please implement a retry loop",
+            "run the integration test suite",
+            "fetch https://example.com/data.json",
+            "look at ./config/local.toml and tell me what's wrong",
+        ] {
+            assert!(!should_use_fast(w), "expected big model for: {w}");
+        }
+    }
+
+    #[test]
+    fn router_big_for_long_prompts() {
+        let long = "a ".repeat(200); // 400 chars
+        assert!(!should_use_fast(&long));
+    }
+
+    #[test]
     fn extracts_name_and_remember_together() {
         // Single input may carry multiple facts (one per line).
         let facts = extract_facts("My name is Cory.\nremember I prefer 4-space indent");
@@ -457,6 +533,51 @@ mod tests {
             .iter()
             .any(|(_, c, k)| k == "note" && c.contains("4-space")));
     }
+}
+
+/// Cascade router heuristic: true if this turn should run on `fast_model`.
+/// Intentionally loose — the goal is to route the easy 80% to the small
+/// model. Wrong calls are recoverable via `/retry-big`.
+///
+/// Fast path when ALL of:
+///   - Trimmed input is ≤ 300 chars (longer prompts almost always want
+///     the capable model).
+///   - No code-ish tokens (triple backticks, file extensions, path
+///     separators, the `::` / `=>` / `->` / `()` sigils).
+///   - No tool-implicit verbs ("fix", "refactor", "debug", "fetch",
+///     "run", "implement", "build", "search web", etc.).
+/// Trivial turns ("hi", "ok", "thanks") trivially qualify.
+pub(crate) fn should_use_fast(input: &str) -> bool {
+    let t = input.trim();
+    if is_trivial_turn(t) {
+        return true;
+    }
+    if t.chars().count() > 300 {
+        return false;
+    }
+    const CODE_MARKERS: &[&str] = &[
+        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java",
+        ".rb", ".cpp", ".c ", "::", "=>", "->", "()", "{}", "[]", "&&", "||",
+    ];
+    if CODE_MARKERS.iter().any(|m| t.contains(m)) {
+        return false;
+    }
+    // Slash / path-like — likely file reference.
+    if t.contains('/') && t.split_whitespace().any(|w| w.contains('/') && w.len() > 3) {
+        return false;
+    }
+    const TOOL_VERBS: &[&str] = &[
+        "fix ", "refactor", "debug", "implement", "build",
+        "read file", "open file", "run ", "execute", "shell ",
+        "fetch ", "download", "scrape", "curl ", "http",
+        "search web", "look up online", "google", "wget",
+        "deploy", "commit", "git ",
+    ];
+    let lower = t.to_lowercase();
+    if TOOL_VERBS.iter().any(|w| lower.contains(w)) {
+        return false;
+    }
+    true
 }
 
 /// Skip memory recall for interjection-only turns. Recall against "hi" or

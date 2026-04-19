@@ -4,10 +4,19 @@
 [ollama]
 # URL of your local Ollama server.
 host = "http://127.0.0.1:11434"
-# Primary model — the 7B variant fits on most laptops and is what the installer
-# pulls by default. Swap in qwen2.5-coder:32b / gemma3:27b / etc. via `llm models`
-# once you've pulled them (ollama pull <name>).
-chat_model = "qwen2.5-coder:7b"
+# Primary model — the 3B variant runs at 40-60 tok/s on Apple Silicon, fits
+# on any modern laptop, and handles localmind's tool-calling protocol. The
+# installer pulls this by default. If you want better reasoning at the cost
+# of speed, `ollama pull qwen2.5-coder:7b` (or :14b, :32b) then swap via
+# `llm models --chat <name>`.
+chat_model = "qwen2.5-coder:3b"
+# Optional fast-path model for the cascade router. When set AND different
+# from chat_model, the agent routes trivial / short / chatty turns here and
+# only escalates to chat_model for code changes, long prompts, or
+# explicit-tool requests. Leave blank to disable cascading — every turn
+# will go to chat_model, same as before.
+# Typical setup: fast_model = "qwen2.5-coder:3b", chat_model = "qwen2.5-coder:7b"
+fast_model = ""
 # Secondary/fallback model — smaller, faster, vision-capable.
 vision_model = "gemma3:4b"
 # Embedding model for memory search.

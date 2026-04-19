@@ -58,6 +58,10 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
 - **Streaming responses.** Tokens appear in real time.
 - **Fast repeat turns.** `keep_alive: 30m` stops Ollama from unloading the
   model between turns; no cold-load per message.
+- **Cascade router.** Optional two-model setup: short / chatty turns run on
+  a small `fast_model` (e.g. `qwen2.5-coder:3b`, ~50 tok/s), code-heavy or
+  long turns route to the configured `chat_model`. `/retry-big` manually
+  escalates the last turn when the router picked wrong.
 - **Self-updating.** Daily background check for a newer release; `llm update`
   re-runs the installer in place.
 - **Model picker.** `llm models` lists installed Ollama models and lets you
@@ -85,7 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/nevenkordic/localmind/main/install.
 |-----------------------------|-------------------------|-----------------------------------------------|
 | `LOCALMIND_INSTALL_DIR`     | `$HOME/.local/bin`      | install target (auto-added to PATH)           |
 | `LOCALMIND_VERSION`         | `latest`                | pin a release tag                             |
-| `LOCALMIND_CHAT_MODEL`      | `qwen2.5-coder:7b`      | chat model the installer pulls                |
+| `LOCALMIND_CHAT_MODEL`      | `qwen2.5-coder:3b`      | chat model the installer pulls (1.9 GB, fast)  |
 | `LOCALMIND_EMBED_MODEL`     | `nomic-embed-text`      | embed model the installer pulls               |
 | `LOCALMIND_OLLAMA_GUI=1`    | —                       | install the full Ollama.app (macOS cask)      |
 | `LOCALMIND_SKIP_OLLAMA=1`   | —                       | don't install or start Ollama                 |
@@ -134,7 +138,8 @@ Common knobs in `config/local.toml`:
 
 | `[ollama]`           |                                                      |
 |----------------------|------------------------------------------------------|
-| `chat_model`         | primary model (use `llm models` to pick)             |
+| `chat_model`         | capable model — used for code / tools / long prompts |
+| `fast_model`         | optional small model for short/chatty turns (cascade)|
 | `embed_model`        | for the memory index                                 |
 | `num_ctx`            | per-reply token budget (default 8192)                |
 | `keep_alive`         | how long Ollama holds the model in RAM (default 30m) |

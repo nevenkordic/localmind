@@ -113,12 +113,28 @@ impl OllamaClient {
         Ok(tags.models.into_iter().map(|m| m.name).collect())
     }
 
-    /// Non-streaming chat call. Returns the assistant message.
+    /// Non-streaming chat call. Returns the assistant message. Uses the
+    /// configured chat / vision model; callers that need per-turn model
+    /// routing (cascade fast→capable) should use `chat_on` instead.
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolSpec]>,
         use_vision: bool,
+    ) -> Result<ChatMessage> {
+        self.chat_on(messages, tools, use_vision, None).await
+    }
+
+    /// Non-streaming chat call with an explicit model override. `None` falls
+    /// back to `use_vision ? vision_model : chat_model` — same behaviour
+    /// as `chat`. Pass `Some(name)` to route this single call to a
+    /// different model (e.g. a 3B fast path).
+    pub async fn chat_on(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        use_vision: bool,
+        model_override: Option<&str>,
     ) -> Result<ChatMessage> {
         #[derive(Serialize)]
         struct Req<'a> {
@@ -144,10 +160,10 @@ impl OllamaClient {
             #[allow(dead_code)]
             done: bool,
         }
-        let model = if use_vision {
-            &self.vision_model
-        } else {
-            &self.chat_model
+        let model: &str = match model_override {
+            Some(m) if !m.is_empty() => m,
+            _ if use_vision => &self.vision_model,
+            _ => &self.chat_model,
         };
         let url = format!("{}/api/chat", self.host);
         let body = Req {
@@ -208,11 +224,30 @@ impl OllamaClient {
     /// generated token in practice. Tool calls, if any, arrive in the final
     /// chunk and are returned via the `ChatMessage.tool_calls` field — the
     /// callback sees only user-visible content.
+    #[allow(dead_code)]
     pub async fn chat_stream<F>(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolSpec]>,
         use_vision: bool,
+        on_token: F,
+    ) -> Result<ChatMessage>
+    where
+        F: FnMut(&str),
+    {
+        self.chat_stream_on(messages, tools, use_vision, None, on_token)
+            .await
+    }
+
+    /// Streaming chat with an explicit model override. Same semantics as
+    /// `chat_stream`, but the caller picks the model (e.g. the cascade
+    /// router routing a short turn to `fast_model`).
+    pub async fn chat_stream_on<F>(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        use_vision: bool,
+        model_override: Option<&str>,
         mut on_token: F,
     ) -> Result<ChatMessage>
     where
@@ -241,10 +276,10 @@ impl OllamaClient {
             #[serde(default)]
             done: bool,
         }
-        let model = if use_vision {
-            &self.vision_model
-        } else {
-            &self.chat_model
+        let model: &str = match model_override {
+            Some(m) if !m.is_empty() => m,
+            _ if use_vision => &self.vision_model,
+            _ => &self.chat_model,
         };
         let url = format!("{}/api/chat", self.host);
         let body = Req {

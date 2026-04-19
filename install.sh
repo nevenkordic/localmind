@@ -19,7 +19,7 @@ set -eu
 
 REPO="nevenkordic/localmind"
 VERSION="${LOCALMIND_VERSION:-latest}"
-CHAT_MODEL="${LOCALMIND_CHAT_MODEL:-qwen2.5-coder:7b}"
+CHAT_MODEL="${LOCALMIND_CHAT_MODEL:-qwen2.5-coder:3b}"
 EMBED_MODEL="${LOCALMIND_EMBED_MODEL:-nomic-embed-text}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
