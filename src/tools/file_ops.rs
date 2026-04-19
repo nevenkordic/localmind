@@ -65,6 +65,24 @@ pub async fn write_file(ctx: &ToolContext, args: &Value) -> Result<String> {
     Ok(format!("wrote {}", resolved.display()))
 }
 
+pub async fn create_dir(ctx: &ToolContext, args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing path"))?;
+    let resolved = resolve_path(ctx, path);
+    let path_clone = resolved.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // create_dir_all is idempotent — succeeds if the directory already
+        // exists. That's the behaviour users expect from `mkdir -p`, and
+        // it means repeat scaffolding calls don't fail mid-run.
+        std::fs::create_dir_all(&path_clone)?;
+        Ok(())
+    })
+    .await??;
+    Ok(format!("created directory: {}", resolved.display()))
+}
+
 pub async fn list_dir(ctx: &ToolContext, args: &Value) -> Result<String> {
     let path = args
         .get("path")

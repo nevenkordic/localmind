@@ -130,7 +130,7 @@ OPERATING RULES
    On macOS this means `/Users/<name>/Desktop`, NEVER `/home/<name>/Desktop`.
 
 TOOLS AVAILABLE (names only — schemas are provided separately):
-  read_file, write_file, list_dir,
+  read_file, write_file, list_dir, create_dir,
   read_pdf, read_docx, read_xlsx, read_image,
   search_memory, store_memory, kg_link,
   web_search, web_fetch,

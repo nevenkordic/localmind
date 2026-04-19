@@ -31,6 +31,7 @@ impl Registry {
             read_file_spec(),
             write_file_spec(),
             list_dir_spec(),
+            create_dir_spec(),
             read_pdf_spec(),
             read_docx_spec(),
             read_xlsx_spec(),
@@ -107,8 +108,10 @@ impl Registry {
         let needs_permission = matches!(
             name,
             "shell" | "web_search" | "web_fetch" | "http_fetch" | "port_check" | "whois"
-        ) || ((matches!(name, "write_file" | "zip_create" | "zip_extract"))
-            && ctx.confirm_writes);
+        ) || ((matches!(
+            name,
+            "write_file" | "zip_create" | "zip_extract" | "create_dir"
+        )) && ctx.confirm_writes);
 
         if needs_permission {
             match ctx.permissions.ask(name, &scope, validator_note) {
@@ -141,6 +144,7 @@ impl Registry {
             "read_file" => crate::tools::file_ops::read_file(ctx, args).await,
             "write_file" => crate::tools::file_ops::write_file(ctx, args).await,
             "list_dir" => crate::tools::file_ops::list_dir(ctx, args).await,
+            "create_dir" => crate::tools::file_ops::create_dir(ctx, args).await,
             "read_pdf" => crate::tools::pdf::read_pdf(ctx, args).await,
             "read_docx" => crate::tools::docs::read_docx(ctx, args).await,
             "read_xlsx" => crate::tools::docs::read_xlsx(ctx, args).await,
@@ -195,7 +199,9 @@ fn mode_guard(
             "http_fetch" | "port_check" | "whois" => {
                 Some(format!("{name} disabled in read-only mode"))
             }
-            "zip_create" | "zip_extract" => Some(format!("{name} disabled in read-only mode")),
+            "zip_create" | "zip_extract" | "create_dir" => {
+                Some(format!("{name} disabled in read-only mode"))
+            }
             "store_memory" | "kg_link" => Some(format!("{name} disabled in read-only mode")),
             _ => None,
         },
@@ -216,6 +222,7 @@ fn mode_guard(
             };
             match name {
                 "write_file" => outside("path"),
+                "create_dir" => outside("path"),
                 "zip_create" => outside("archive_path"),
                 "zip_extract" => outside("dest_dir"),
                 _ => None,
@@ -253,6 +260,10 @@ fn describe_scope(name: &str, args: &Value) -> String {
             out.push_str(&render_diff(&old_content, new_content, 60));
             out
         }
+        "create_dir" => format!(
+            "create directory: {}",
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
         "shell" => format!(
             "command: {}",
             crate::util::truncate(
@@ -553,6 +564,21 @@ fn list_dir_spec() -> ToolSpec {
                 "path": {"type": "string"},
                 "recursive": {"type": "boolean"},
                 "max_entries": {"type": "integer"}
+            },
+            "required": ["path"]
+        }),
+    )
+}
+fn create_dir_spec() -> ToolSpec {
+    spec(
+        "create_dir",
+        "Create a directory (and any missing parents, like `mkdir -p`). \
+         Idempotent — succeeds if the directory already exists. Subject to \
+         workspace_root and the same permission prompt as write_file.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or workspace-relative directory path"}
             },
             "required": ["path"]
         }),

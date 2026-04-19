@@ -115,15 +115,37 @@ enum SlashAction {
 
 async fn run_turn(agent: &mut AgentRun, input: &str) {
     println!();
-    match agent.turn(input).await {
-        Ok(reply) => {
-            if !agent.is_streaming() {
-                println!("{reply}");
+    // Snapshot is_streaming BEFORE the turn borrow — we can't read it while
+    // turn_fut holds `&mut agent` across the await.
+    let streaming = agent.is_streaming();
+    // Race the turn against Ctrl-C. Dropping the turn future cancels the
+    // in-flight reqwest call to Ollama — the server sees the dropped
+    // connection and stops generating. Partial messages already pushed to
+    // `agent.messages` stay in history so context isn't lost; the user
+    // just didn't get a final reply this round.
+    let turn_fut = agent.turn(input);
+    tokio::pin!(turn_fut);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    tokio::select! {
+        r = &mut turn_fut => {
+            match r {
+                Ok(reply) => {
+                    if !streaming {
+                        println!("{reply}");
+                    }
+                    println!();
+                    println!();
+                }
+                Err(e) => eprintln!("! {e}"),
             }
-            println!();
-            println!();
         }
-        Err(e) => eprintln!("! {e}"),
+        _ = &mut ctrl_c => {
+            // Newline so "(interrupted)" lands on a fresh row even if a
+            // streamed token was mid-print.
+            eprintln!();
+            eprintln!("\x1b[1;33m(interrupted — press enter for a new prompt)\x1b[0m");
+        }
     }
 }
 
