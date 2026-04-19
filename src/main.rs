@@ -376,16 +376,17 @@ async fn restore_cmd(
     let _ = store;
 
     if dest.exists() {
+        // Timestamp the bak so consecutive restores keep independent rollback
+        // points — without this, restoring twice would silently erase your
+        // original pre-restore state, which is exactly the data someone might
+        // want to get back if they regret the restore.
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let bak = dest.with_file_name(format!(
-            "{}.bak-before-restore",
+            "{}.bak-{ts}",
             dest.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("memory.db")
         ));
-        // Remove any stale bak so consecutive restores don't fail.
-        if bak.exists() {
-            std::fs::remove_file(&bak).ok();
-        }
         std::fs::rename(&dest, &bak)
             .with_context(|| format!("moving current DB aside to {}", bak.display()))?;
         println!("kept previous DB at {}", bak.display());

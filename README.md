@@ -88,9 +88,10 @@ llm restore ...  --yes              # skip the prompt (required in non-TTY)
 
 `backup` uses SQLite's `VACUUM INTO` — safe to run while localmind is in use
 and produces a self-contained file (no need for WAL/shm sidecars). `restore`
-keeps your previous DB at `memory.db.bak-before-restore` so you can roll back
-if something looks wrong. Quit any other running `llm` processes before
-restoring so nothing races the file swap.
+keeps your previous DB at `memory.db.bak-YYYYMMDD-HHMMSS` (timestamped so
+repeated restores never clobber each other's rollback points) so you can
+fall back manually if a restore looks wrong. Quit any other running `llm`
+processes before restoring so nothing races the file swap.
 
 ## Update
 
