@@ -14,8 +14,15 @@ vision_model = "gemma3:4b"
 embed_model = "nomic-embed-text"
 # Request timeout in seconds (large models on cold start can be slow).
 timeout_secs = 600
-# Token budget for each reply.
-num_ctx = 32768
+# Token budget for each reply. 8k covers 95% of interactive turns and keeps
+# prompt-processing time low. Raise to 16384 / 32768 if you paste large
+# documents into the REPL and want them all in-context at once.
+num_ctx = 8192
+# How long Ollama keeps the model loaded in GPU/unified memory after the
+# last request. Default "5m" means the *next* turn after a coffee break
+# pays a full cold-load. "30m" keeps the model resident across typical
+# pauses. Set to "0" to unload immediately, "-1" to keep resident forever.
+keep_alive = "30m"
 
 [memory]
 # Path to the SQLite memory database. %DATA% expands to the OS data dir.

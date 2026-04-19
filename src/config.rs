@@ -33,12 +33,21 @@ pub struct OllamaConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_ctx")]
     pub num_ctx: u32,
+    /// How long Ollama holds the model in memory after the last request.
+    /// Passed straight through on `/api/chat` and `/api/embed` so the model
+    /// stays resident between turns — the default "5m" on Ollama pays a
+    /// cold-load penalty on any idle gap longer than that.
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: String,
 }
 fn default_timeout() -> u64 {
     600
 }
 fn default_ctx() -> u32 {
-    32768
+    8192
+}
+fn default_keep_alive() -> String {
+    "30m".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

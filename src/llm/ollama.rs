@@ -29,6 +29,7 @@ pub struct OllamaClient {
     embed_model: String,
     vision_model: String,
     num_ctx: u32,
+    keep_alive: String,
     /// Embedding cache. Sized for ~768KB at the default 256-entry cap with
     /// 768-dim float vectors. Shared across clones of the client so the
     /// agent loop and CLI commands hit the same warm cache when run in the
@@ -88,6 +89,7 @@ impl OllamaClient {
             embed_model: cfg.embed_model.clone(),
             vision_model: cfg.vision_model.clone(),
             num_ctx: cfg.num_ctx,
+            keep_alive: cfg.keep_alive.clone(),
             embed_cache: Arc::new(Mutex::new(EmbedCache::new(256))),
         }
     }
@@ -126,6 +128,9 @@ impl OllamaClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             tools: Option<&'a [ToolSpec]>,
             options: Options,
+            /// Overrides Ollama's default 5-minute model unload window —
+            /// see OllamaConfig::keep_alive.
+            keep_alive: &'a str,
         }
         #[derive(Serialize)]
         struct Options {
@@ -154,6 +159,7 @@ impl OllamaClient {
                 num_ctx: self.num_ctx,
                 temperature: 0.2,
             },
+            keep_alive: &self.keep_alive,
         };
         // Watchdog. If Ollama goes unresponsive (corrupt model, hung worker),
         // the non-streaming request would otherwise sit on the reqwest
@@ -204,6 +210,7 @@ impl OllamaClient {
         struct Req<'a> {
             model: &'a str,
             input: &'a str,
+            keep_alive: &'a str,
         }
         #[derive(Deserialize)]
         struct Resp {
@@ -213,6 +220,7 @@ impl OllamaClient {
         let body = Req {
             model: &self.embed_model,
             input: text,
+            keep_alive: &self.keep_alive,
         };
         let resp = self
             .http

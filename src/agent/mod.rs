@@ -132,7 +132,10 @@ impl AgentRun {
         const MAX_SKILLS: usize = 2;
         const MAX_MEMORIES: usize = 3;
         const CONTENT_CAP: usize = 500;
-        if user_input.trim().len() < 3 {
+        if is_trivial_turn(user_input) {
+            // No BM25 or vector round-trip — the user said "hi" or similar
+            // and the result of a recall against that is always useless
+            // noise. Big savings on short acknowledgement turns.
             return (None, None);
         }
 
@@ -296,7 +299,7 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_facts;
+    use super::{extract_facts, is_trivial_turn};
 
     fn first(input: &str) -> Option<(String, String, String)> {
         extract_facts(input).into_iter().next()
@@ -356,6 +359,28 @@ mod tests {
     }
 
     #[test]
+    fn trivial_turns_skip_recall() {
+        for w in &[
+            "hi", "Hi", "Hi.", "HELLO", "yes", "ok!", "thanks", "cya", "y", "okay",
+        ] {
+            assert!(is_trivial_turn(w), "expected '{w}' to be trivial");
+        }
+    }
+
+    #[test]
+    fn substantive_turns_do_recall() {
+        for w in &[
+            "hi what was my deploy command",
+            "remember the port number",
+            "fix the failing test",
+            "why",   // 3 chars but not a known interjection — let recall decide
+            "what",
+        ] {
+            assert!(!is_trivial_turn(w), "expected '{w}' to run recall");
+        }
+    }
+
+    #[test]
     fn extracts_name_and_remember_together() {
         // Single input may carry multiple facts (one per line).
         let facts = extract_facts("My name is Cory.\nremember I prefer 4-space indent");
@@ -366,6 +391,34 @@ mod tests {
             .iter()
             .any(|(_, c, k)| k == "note" && c.contains("4-space")));
     }
+}
+
+/// Skip memory recall for interjection-only turns. Recall against "hi" or
+/// "ok" almost always surfaces irrelevant past mentions of the same tokens
+/// and costs an Ollama embed round-trip. For substantive messages we always
+/// recall.
+pub(crate) fn is_trivial_turn(input: &str) -> bool {
+    let t = input.trim().trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';'));
+    if t.len() < 3 {
+        return true;
+    }
+    // Only bare interjections — if the user wrote anything more than the
+    // greeting word, run recall (e.g. "hi, what was my deploy command" is
+    // NOT trivial).
+    if t.contains(char::is_whitespace) {
+        return false;
+    }
+    const TRIVIAL: &[&str] = &[
+        "hi", "hey", "hello", "yo", "sup",
+        "ok", "okay", "kk", "k",
+        "yes", "yep", "yeah", "yup", "sure",
+        "no", "nope", "nah",
+        "thanks", "thx", "ty",
+        "bye", "goodbye", "cya",
+        "cool", "nice", "neat",
+    ];
+    let lower = t.to_lowercase();
+    TRIVIAL.iter().any(|w| *w == lower)
 }
 
 /// Convenience for `localmind ask "<prompt>"` — single turn, non-interactive.

@@ -42,26 +42,39 @@ pub async fn hybrid_search(
     let half_life = cfg.memory.temporal_half_life_days.max(1.0);
 
     for v in &variants {
-        // BM25 — always runs; cheap, sub-millisecond.
-        if let Ok(rows) = store.bm25_search(v, fetch).await {
+        // BM25 + vector run concurrently — previously sequential, costing an
+        // extra ~embed_round_trip on every turn. tokio::join! polls both
+        // futures to completion; the SQLite BM25 lookup is near-instant so
+        // the effective recall latency is just the embed + vec_search path
+        // (previously bm25_search.await *then* embed.await).
+        let bm25_fut = async {
+            let rows = store.bm25_search(v, fetch).await.unwrap_or_default();
             let (min, max) = bm25_range(&rows);
-            for (mem, raw) in rows {
-                let norm = normalise_bm25(raw, min, max);
-                merge(&mut by_id, mem, None, Some(norm), cfg, now, half_life);
+            rows.into_iter()
+                .map(|(mem, raw)| (mem, normalise_bm25(raw, min, max)))
+                .collect::<Vec<_>>()
+        };
+        let vec_fut = async {
+            if !cfg.memory.vector_search {
+                return Vec::new();
             }
+            let Ok(emb) = ollama.embed(v).await else {
+                return Vec::new();
+            };
+            store
+                .vector_search(&emb, fetch)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(mem, dist)| (mem, 1.0 / (1.0 + dist.max(0.0))))
+                .collect::<Vec<_>>()
+        };
+        let (bm25_hits, vec_hits) = tokio::join!(bm25_fut, vec_fut);
+        for (mem, norm) in bm25_hits {
+            merge(&mut by_id, mem, None, Some(norm), cfg, now, half_life);
         }
-        // Vector — gated by [memory].vector_search so users on slow Ollama
-        // hardware can opt out and get pure-BM25 recall.
-        if cfg.memory.vector_search {
-            if let Ok(emb) = ollama.embed(v).await {
-                if let Ok(rows) = store.vector_search(&emb, fetch).await {
-                    for (mem, dist) in rows {
-                        // sqlite-vec returns L2 distance; convert to a similarity in [0,1].
-                        let sim = 1.0 / (1.0 + dist.max(0.0));
-                        merge(&mut by_id, mem, Some(sim), None, cfg, now, half_life);
-                    }
-                }
-            }
+        for (mem, sim) in vec_hits {
+            merge(&mut by_id, mem, Some(sim), None, cfg, now, half_life);
         }
     }
 
