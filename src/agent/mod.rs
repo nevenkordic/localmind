@@ -290,19 +290,37 @@ impl AgentRun {
             // sink is set.
             let reply_res = if let Some(sink) = self.token_sink.clone() {
                 // Hand the spinner to the callback via a Mutex<Option<>> so
-                // the first token tick can consume and drop it.
+                // the first token tick can consume and drop it. Wrap the
+                // sink with a tool-call-JSON filter so accidental textual
+                // tool-call emissions (some models emit BOTH a structured
+                // tool_call AND a serialized JSON copy in content) don't
+                // leak to the user.
                 let spinner_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(spinner)));
                 let slot_clone = spinner_slot.clone();
+                let filter = std::sync::Arc::new(std::sync::Mutex::new(
+                    StreamingToolCallFilter::new(),
+                ));
+                let filter_clone = filter.clone();
+                let sink_clone = sink.clone();
                 let cb = move |chunk: &str| {
                     if let Some(sp) = slot_clone.lock().unwrap().take() {
                         sp.stop_sync();
                     }
-                    sink(chunk);
+                    let mut f = filter_clone.lock().unwrap();
+                    if let Some(emit) = f.feed(chunk) {
+                        sink_clone(&emit);
+                    }
                 };
                 let r = self
                     .client
                     .chat_stream_on(&self.messages, Some(&specs), false, Some(model), cb)
                     .await;
+                // Flush any remainder of the filter's buffer if the stream
+                // ended while we were still deciding whether the content
+                // was JSON or prose.
+                if let Some(tail) = filter.lock().unwrap().flush() {
+                    sink(&tail);
+                }
                 // If the stream ended without ever calling the callback
                 // (error before the first token) the spinner is still
                 // ticking — drop it now.
@@ -417,7 +435,10 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_facts, is_trivial_turn, scrub_hallucinated_tool_output, should_use_fast};
+    use super::{
+        extract_facts, is_trivial_turn, scrub_hallucinated_tool_output, should_use_fast,
+        StreamingToolCallFilter,
+    };
 
     fn first(input: &str) -> Option<(String, String, String)> {
         extract_facts(input).into_iter().next()
@@ -582,6 +603,86 @@ mod tests {
         assert!(scrub_hallucinated_tool_output(real).is_none());
     }
 
+    // ----- StreamingToolCallFilter tests --------------------------------
+
+    fn run_filter(chunks: &[&str]) -> String {
+        let mut f = StreamingToolCallFilter::new();
+        let mut out = String::new();
+        for c in chunks {
+            if let Some(emit) = f.feed(c) {
+                out.push_str(&emit);
+            }
+        }
+        if let Some(tail) = f.flush() {
+            out.push_str(&tail);
+        }
+        out
+    }
+
+    #[test]
+    fn filter_drops_tool_call_json_at_start() {
+        // The exact failure the user hit: qwen emits `{"name":"read_pdf",...}`
+        // as text before the structured tool_call runs.
+        let out = run_filter(&[
+            r#"{"name":"read_pdf","arguments":{"path":"/tmp/x.pdf"}}"#,
+        ]);
+        assert_eq!(out, "", "tool-call JSON must not leak: got {out:?}");
+    }
+
+    #[test]
+    fn filter_drops_tool_call_and_keeps_trailing_prose() {
+        // Rare but possible: JSON then continuation prose on the same stream.
+        let out = run_filter(&[
+            r#"{"name":"read_pdf","arguments":{"path":"/tmp/x.pdf"}}"#,
+            " This is the first page of the document.",
+        ]);
+        assert_eq!(out, " This is the first page of the document.");
+    }
+
+    #[test]
+    fn filter_passes_through_plain_prose() {
+        let out = run_filter(&[
+            "The PDF says Knosys Limited is based in Melbourne, ",
+            "with the CTO being Nicolas Passmore.",
+        ]);
+        assert_eq!(
+            out,
+            "The PDF says Knosys Limited is based in Melbourne, with the CTO being Nicolas Passmore."
+        );
+    }
+
+    #[test]
+    fn filter_handles_chunked_json() {
+        // Real streams arrive byte-by-byte.
+        let out = run_filter(&[
+            r#"{"n"#,
+            r#"ame":"read_pdf","arg"#,
+            r#"uments":{"path":"/tmp/x.pdf"}}"#,
+        ]);
+        assert_eq!(out, "", "chunked JSON must still be filtered, got {out:?}");
+    }
+
+    #[test]
+    fn filter_handles_json_strings_with_embedded_braces() {
+        // JSON value containing braces shouldn't confuse the depth counter.
+        let out = run_filter(&[r#"{"name":"x","arguments":{"raw":"}oops{"}}"#]);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn filter_emits_prose_that_starts_with_a_literal_brace() {
+        // Edge case: prose that genuinely starts with `{`. The filter
+        // should only commit to dropping when it sees a `"name"` key.
+        let out = run_filter(&[
+            "{this is just prose with a leading brace — no quoted keys — like a set}.",
+        ]);
+        // "{…}" > 128 chars without a `"name"` → flush and emit.
+        assert!(
+            out.starts_with("{this is just prose"),
+            "prose with leading brace must not be dropped, got {out:?}"
+        );
+    }
+
     #[test]
     fn leaves_literal_bracket_mentions_alone() {
         // Messages that HAPPEN to contain square brackets but aren't fake-
@@ -611,6 +712,159 @@ mod tests {
         assert!(facts
             .iter()
             .any(|(_, c, k)| k == "note" && c.contains("4-space")));
+    }
+}
+
+/// Streaming filter that drops model-emitted tool-call JSON from the output
+/// before it reaches the user. Some models (notably qwen2.5-coder) emit a
+/// tool call BOTH as a structured `tool_calls` field AND as a serialized
+/// `{"name":"...","arguments":{...}}` block inside `content`. Without this
+/// filter, the serialised copy leaks to stdout during streaming while the
+/// structured call runs normally — producing ugly artefacts like:
+///
+///     {"name":"read_pdf","arguments":{"path":"/…/foo.pdf"}}
+///       · read_pdf
+///     Here is the summary…
+///
+/// The filter buffers the early bytes of an iteration. If they look like
+/// JSON that would parse as a tool call, it drops everything through the
+/// closing brace. Otherwise it flushes the buffer and streams the rest
+/// straight through.
+pub(crate) struct StreamingToolCallFilter {
+    buf: String,
+    state: FilterState,
+    brace_depth: i32,
+    in_string: bool,
+    escape: bool,
+}
+
+#[derive(PartialEq, Eq, Copy, Clone)]
+enum FilterState {
+    /// Still accumulating the first chars; haven't decided.
+    Pending,
+    /// Committed to prose; pass everything through.
+    Emitting,
+    /// Committed to tool-call JSON; drop until the matching `}` closes.
+    Dropping,
+}
+
+impl StreamingToolCallFilter {
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            state: FilterState::Pending,
+            brace_depth: 0,
+            in_string: false,
+            escape: false,
+        }
+    }
+
+    /// Feed a streamed chunk. Returns the portion (if any) that should
+    /// reach the user's sink right now.
+    pub fn feed(&mut self, chunk: &str) -> Option<String> {
+        match self.state {
+            FilterState::Emitting => Some(chunk.to_string()),
+            FilterState::Dropping => {
+                // Track braces so we know when the JSON object closes, then
+                // flip back to Emitting for any trailing prose in THIS chunk.
+                let tail = self.track_braces_until_close(chunk);
+                tail.map(|s| s.to_string())
+            }
+            FilterState::Pending => {
+                self.buf.push_str(chunk);
+                self.decide();
+                match self.state {
+                    FilterState::Emitting => {
+                        let out = std::mem::take(&mut self.buf);
+                        Some(out)
+                    }
+                    FilterState::Dropping => {
+                        // Dropping mode: scan accumulated buffer for the
+                        // object close. Anything after the close is prose
+                        // that should still be emitted.
+                        let accumulated = std::mem::take(&mut self.buf);
+                        self.reset_brace_tracker();
+                        self.track_braces_until_close(&accumulated).map(|s| s.to_string())
+                    }
+                    FilterState::Pending => None,
+                }
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<String> {
+        if matches!(self.state, FilterState::Pending) && !self.buf.is_empty() {
+            // Stream ended before we made a decision. Emit what we have —
+            // probably fragmentary prose that never reached a newline or
+            // the decision threshold.
+            Some(std::mem::take(&mut self.buf))
+        } else {
+            None
+        }
+    }
+
+    fn decide(&mut self) {
+        let trimmed = self.buf.trim_start();
+        // Not JSON-looking? Prose — flush and commit to emitting.
+        if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+            self.state = FilterState::Emitting;
+            return;
+        }
+        // JSON-looking prefix. Wait for enough context before committing.
+        // Decide only once we've seen a `"name"` key (clear signal) OR
+        // reached ~128 chars without one (probably not a tool call, emit).
+        let has_name_key =
+            trimmed.contains("\"name\"") || trimmed.contains("\"name\" ");
+        if has_name_key {
+            self.state = FilterState::Dropping;
+            self.reset_brace_tracker();
+        } else if self.buf.len() > 128 {
+            // 128 bytes of JSON-looking prose without a `"name"` — not a
+            // tool call. Flush.
+            self.state = FilterState::Emitting;
+        }
+        // else: keep buffering.
+    }
+
+    fn reset_brace_tracker(&mut self) {
+        self.brace_depth = 0;
+        self.in_string = false;
+        self.escape = false;
+    }
+
+    /// Walk `chunk` byte-by-byte tracking JSON brace depth. When the
+    /// outermost `{...}` closes, flip state to Emitting and return the
+    /// remainder of the chunk (which belongs to prose). Returns None if
+    /// the JSON hasn't closed yet.
+    fn track_braces_until_close<'a>(&mut self, chunk: &'a str) -> Option<&'a str> {
+        let bytes = chunk.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if self.in_string {
+                if self.escape {
+                    self.escape = false;
+                } else if b == b'\\' {
+                    self.escape = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.brace_depth += 1,
+                b'}' | b']' => {
+                    self.brace_depth -= 1;
+                    if self.brace_depth <= 0 {
+                        // Object closed. Flip to Emitting and return the
+                        // rest of the chunk (after this byte).
+                        self.state = FilterState::Emitting;
+                        return Some(&chunk[i + 1..]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }
 
