@@ -271,26 +271,71 @@ impl PermissionManager {
             return Decision::Allow;
         }
 
+        // Color palette. The box drawing chars get a dim cyan to form a
+        // soft container; the header is bold yellow so the eye lands on
+        // "permission request" first; field labels stay dim while values
+        // are bright white. Choice letters are colored by outcome: green
+        // for grants (y/a/f), red for deny (n), yellow for edit (e) —
+        // mirroring conventional traffic-light semantics.
+        let box_c = "\x1b[2;36m"; // dim cyan for borders
+        let hdr_c = "\x1b[1;33m"; // bold yellow for the header
+        let lbl_c = "\x1b[2m";    // dim for labels (tool:, mode:, …)
+        let val_c = "\x1b[1;97m"; // bright white for values
+        let rst = "\x1b[0m";
+
         eprintln!();
-        eprintln!("  ┏━ permission request ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        eprintln!("  ┃ tool:  {tool}");
+        eprintln!(
+            "  {box_c}┏━ {hdr_c}permission request{box_c} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{rst}"
+        );
+        eprintln!("  {box_c}┃{rst} {lbl_c}tool:{rst}  {val_c}{tool}{rst}");
         for line in scope.lines() {
-            eprintln!("  ┃        {line}");
+            eprintln!("  {box_c}┃{rst}        {line}");
         }
-        eprintln!("  ┃ mode:  {}", self.mode().as_str());
+        eprintln!(
+            "  {box_c}┃{rst} {lbl_c}mode:{rst}  {val_c}{}{rst}",
+            self.mode().as_str()
+        );
         if let Some(ValidatorNote::Warn(w)) = &note {
-            eprintln!("  ┃ warn:  {w}");
+            eprintln!("  {box_c}┃{rst} \x1b[1;33mwarn:{rst}  \x1b[33m{w}{rst}");
         }
         if forced_ask {
-            eprintln!("  ┃ note:  matched ask-rule; will always prompt");
+            eprintln!(
+                "  {box_c}┃{rst} {lbl_c}note:{rst}  matched ask-rule; will always prompt"
+            );
         }
-        eprintln!("  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        let hint = if forced_ask {
-            "[y]es  [n]o  [e]dit(reason)"
-        } else {
-            "[y]es  [a]lways this session  [f]orever  [n]o  [e]dit(reason)"
+        eprintln!(
+            "  {box_c}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{rst}"
+        );
+
+        // Color-coded choices. Green for grants (progressively brighter from
+        // once→session→forever), red for no, yellow for edit. The key
+        // letter inside brackets is emphasised so `y`, `a`, `f`, `n`, `e`
+        // pop out at a glance.
+        let k = |color: &str, letter: &str, label: &str| -> String {
+            format!(
+                "{color}[\x1b[1m{letter}\x1b[22m{color}]{rst}{color}{label}{rst}",
+                color = color,
+                rst = rst
+            )
         };
-        eprint!("  allow?  {hint}: ");
+        let hint = if forced_ask {
+            format!(
+                "{}  {}  {}",
+                k("\x1b[32m", "y", "es"),
+                k("\x1b[31m", "n", "o"),
+                k("\x1b[33m", "e", "dit(reason)"),
+            )
+        } else {
+            format!(
+                "{}  {}  {}  {}  {}",
+                k("\x1b[32m", "y", "es"),
+                k("\x1b[32m", "a", "lways this session"),
+                k("\x1b[1;32m", "f", "orever"),
+                k("\x1b[31m", "n", "o"),
+                k("\x1b[33m", "e", "dit(reason)"),
+            )
+        };
+        eprint!("  \x1b[1mallow?{rst}  {hint}: ");
         let _ = io::stderr().flush();
 
         let mut line = String::new();

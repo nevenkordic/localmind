@@ -815,6 +815,19 @@ enum FilterState {
 
 const TEMPLATE_PREFIXES: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
 
+/// Walk backwards from `at` until we find a UTF-8 char boundary. Used by
+/// the streaming filter to slice `buf` at safe byte positions — without
+/// this, a multi-byte char straddling the split point would cause a panic
+/// on the slice. `str::is_char_boundary` is fast; the loop terminates
+/// within 4 iterations since UTF-8 code points are at most 4 bytes.
+fn prev_char_boundary(s: &str, at: usize) -> usize {
+    let mut cut = at.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
 impl StreamingToolCallFilter {
     pub fn new() -> Self {
         Self {
@@ -857,12 +870,18 @@ impl StreamingToolCallFilter {
                 }
                 FilterState::Emitting => {
                     // Emit up to the start of the next JSON/template block,
-                    // if any. Otherwise drain everything.
+                    // if any. Otherwise drain everything except a small
+                    // holdback tail — a chunk boundary might land mid-way
+                    // through a restart pattern (buf ends with `{` while
+                    // the next chunk starts with `"name":...`); holding the
+                    // last bytes back until we see the next chunk keeps
+                    // those patterns from leaking.
                     let restart = self.find_restart_point();
                     match restart {
                         Some(idx) if idx > 0 => {
-                            out.push_str(&self.buf[..idx]);
-                            self.buf.drain(..idx);
+                            let cut = prev_char_boundary(&self.buf, idx);
+                            out.push_str(&self.buf[..cut]);
+                            self.buf.drain(..cut);
                             self.state = FilterState::Pending;
                         }
                         Some(_) => {
@@ -870,8 +889,18 @@ impl StreamingToolCallFilter {
                             self.state = FilterState::Pending;
                         }
                         None => {
-                            out.push_str(&self.buf);
-                            self.buf.clear();
+                            // Holdback = longest possible partial prefix of
+                            // any restart pattern. Templates are ≤13 chars;
+                            // `{"name"` is 7. 16 covers both with headroom.
+                            const HOLDBACK: usize = 16;
+                            if self.buf.len() > HOLDBACK {
+                                let cut = prev_char_boundary(
+                                    &self.buf,
+                                    self.buf.len() - HOLDBACK,
+                                );
+                                out.push_str(&self.buf[..cut]);
+                                self.buf.drain(..cut);
+                            }
                             break;
                         }
                     }
@@ -887,8 +916,9 @@ impl StreamingToolCallFilter {
 
     pub fn flush(&mut self) -> Option<String> {
         // Stream ended. If we were emitting or pending prose, flush the
-        // remainder. If we were mid-drop, drop it — an unterminated JSON
-        // or template token is still noise.
+        // remainder INCLUDING the holdback tail — no more chunks will
+        // arrive, so nothing to recognise. If we were mid-drop, drop it:
+        // an unterminated JSON or template token is still noise.
         let out = match self.state {
             FilterState::Emitting => std::mem::take(&mut self.buf),
             FilterState::Pending => {

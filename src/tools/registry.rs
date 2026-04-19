@@ -114,10 +114,10 @@ impl Registry {
         )) && ctx.confirm_writes);
 
         if needs_permission {
-            // For destructive tools, print a Claude-Code-style preamble
-            // (full-width diff, file header, +N/-M summary) BEFORE the
-            // permission prompt. Keeps the prompt box short and lets the
-            // diff breathe across the terminal width.
+            // For destructive tools, print a rich preamble (full-width
+            // diff, file header, +N/-M summary) BEFORE the permission
+            // prompt. Keeps the prompt box short and lets the diff
+            // breathe across the terminal width.
             print_preamble(name, args);
             match ctx.permissions.ask(name, &scope, validator_note) {
                 Decision::Allow | Decision::AllowSession => {}
