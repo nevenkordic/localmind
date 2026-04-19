@@ -436,119 +436,206 @@ async fn handle_slash(
 fn banner(cfg: &Config, mode_override: Option<PermissionMode>) {
     let mode =
         mode_override.unwrap_or_else(|| PermissionMode::parse(&cfg.tools.mode).unwrap_or_default());
-    let t = Theme::new(cfg.repl.color);
+    let color_on = cfg.repl.color
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
 
-    let width = term_width().clamp(60, 96);
-    let val_max = width.saturating_sub(14);
+    // Gold/amber border palette. Softer than pure orange (214) so the frame
+    // frames the content without screaming.
+    let gold = if color_on { "\x1b[38;5;214m" } else { "" };
+    let dim = if color_on { "\x1b[2m" } else { "" };
+    let bold = if color_on { "\x1b[1m" } else { "" };
+    let cyan = if color_on { "\x1b[38;5;81m" } else { "" };
+    let peach = if color_on { "\x1b[38;5;216m" } else { "" };
+    let rst = if color_on { "\x1b[0m" } else { "" };
 
-    let memory = truncate_middle(
-        &collapse_home(&cfg.memory.db_path_resolved().to_string_lossy()),
-        val_max,
+    // Detect user for the welcome line.
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "friend".into());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| collapse_home(&p.to_string_lossy()))
+        .unwrap_or_else(|| "~".into());
+
+    // Layout — two panels separated by a vertical rule. Width auto-adapts
+    // to the terminal with a sensible floor/ceiling so the box always
+    // reads cleanly.
+    let total = term_width().clamp(70, 110);
+    let inner = total.saturating_sub(4); // 2 border + 2 pad (one each side)
+    let left_w = (inner * 52) / 100; // ~52% for left panel
+    let right_w = inner.saturating_sub(left_w + 3); // rest minus " │ "
+
+    // Left panel content. Coloured strings are kept aligned via visible-width
+    // aware padding in render_row.
+    let model_line = format!(
+        "{bold}{}{rst}",
+        truncate_middle(&cfg.ollama.chat_model, left_w - 2)
     );
-    let audit_path = directories::ProjectDirs::from("com", "calligoit", "localmind")
-        .map(|p| {
-            p.data_dir()
-                .join("audit.log")
-                .to_string_lossy()
-                .into_owned()
-        })
-        .unwrap_or_else(|| "./data/audit.log".into());
-    let audit = truncate_middle(&collapse_home(&audit_path), val_max);
+    let mode_line = mode_badge_dim(mode, color_on);
+    let cwd_line = format!("{dim}{}{rst}", truncate_middle(&cwd, left_w - 2));
 
-    let rule = "─".repeat(width.saturating_sub(2));
+    let left: Vec<String> = vec![
+        String::new(),
+        format!(
+            "{bold}Welcome back, {peach}{username}{rst}{bold}!{rst}",
+            peach = peach,
+        ),
+        String::new(),
+        // Friendly little mascot — a curious face, centred in the left
+        // panel. In cyan so it pops against the gold frame.
+        center(
+            &format!("{cyan}   ▄▀▀▀▀▄{rst}", cyan = cyan, rst = rst),
+            left_w,
+        ),
+        center(
+            &format!("{cyan}  ( ◕ ◡ ◕ ){rst}", cyan = cyan, rst = rst),
+            left_w,
+        ),
+        center(
+            &format!("{cyan}   ▀▄▄▄▄▀{rst}", cyan = cyan, rst = rst),
+            left_w,
+        ),
+        String::new(),
+        model_line,
+        mode_line,
+        cwd_line,
+        String::new(),
+    ];
+
+    // Right panel — tips + a memory/activity snapshot. Keeping this static
+    // for now; future work can query audit.log for real recent activity.
+    let tips_header = format!("{bold}Tips for getting started{rst}");
+    let mem_header = format!("{bold}Memory & activity{rst}");
+    let data_dir = directories::ProjectDirs::from("com", "calligoit", "localmind")
+        .map(|p| collapse_home(&p.data_dir().to_string_lossy()))
+        .unwrap_or_else(|| "~/.local/share/localmind".into());
+    let data_line = format!("{dim}{}{rst}", truncate_middle(&data_dir, right_w));
+
+    let right: Vec<String> = vec![
+        tips_header,
+        format!("{cyan}/help{rst}     slash commands"),
+        format!("{cyan}/models{rst}   switch models"),
+        format!("{cyan}/mode{rst}     change permission mode"),
+        format!("{cyan}/quit{rst}     exit"),
+        String::new(),
+        mem_header,
+        data_line,
+        format!("{dim}audit log + memory db live here{rst}"),
+        String::new(),
+        String::new(),
+    ];
+
+    // Pad columns to equal height so the box bottom lines up.
+    let rows = left.len().max(right.len());
+    let pad_vec = |v: Vec<String>, n: usize| -> Vec<String> {
+        let mut v = v;
+        while v.len() < n {
+            v.push(String::new());
+        }
+        v
+    };
+    let left = pad_vec(left, rows);
+    let right = pad_vec(right, rows);
+
+    // Frame characters and title.
+    let title = format!(" localmind v{} ", env!("CARGO_PKG_VERSION"));
+    let title_cells = visible_width(&title);
+    let top_dashes = "─".repeat(total.saturating_sub(title_cells + 3));
 
     println!();
-    println!(
-        "  {diamond}  {brand} {version}  {sep}  {tagline}",
-        diamond = t.brand("◆"),
-        brand = t.title("localmind"),
-        version = t.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        sep = t.faint("·"),
-        tagline = t.dim("local AI · runs on your machine"),
-    );
-    println!("  {}", t.faint(&rule));
+    println!("  {gold}╭─{bold}{title}{rst}{gold}{top_dashes}╮{rst}");
+    for (l, r) in left.iter().zip(right.iter()) {
+        let l_padded = pad_visible(l, left_w);
+        let r_padded = pad_visible(r, right_w);
+        println!("  {gold}│{rst} {l_padded} {gold}│{rst} {r_padded} {gold}│{rst}");
+    }
+    let bottom = "─".repeat(total.saturating_sub(2));
+    println!("  {gold}╰{bottom}╯{rst}");
     println!();
-    println!("  {}  {}", t.key("ollama  "), cfg.ollama.host);
-    println!(
-        "  {}  {}",
-        t.key("chat    "),
-        t.value(&cfg.ollama.chat_model)
-    );
-    println!("  {}  {}", t.key("embed   "), cfg.ollama.embed_model);
-    println!("  {}  {}", t.key("memory  "), t.path(&memory));
-    println!("  {}  {}", t.key("mode    "), t.mode_badge(mode));
-    println!("  {}  {}", t.key("audit   "), t.path(&audit));
-    println!();
-    println!(
-        "  {help}  {sep}  {quit}",
-        help = t.tip("/help"),
-        sep = t.faint("·"),
-        quit = t.tip("/quit"),
-    );
-    println!();
+}
+
+/// A dim "mode: <mode>" line that sits under the model in the left panel.
+/// The mode name gets the same coloured badge style the old banner used,
+/// keeping the semantic (green = read-only, amber = workspace-write, red =
+/// unrestricted) visible at a glance.
+fn mode_badge_dim(mode: PermissionMode, color: bool) -> String {
+    if !color {
+        return format!("mode: {}", mode.as_str());
+    }
+    let label = format!(" {} ", mode.as_str());
+    let painted = match mode {
+        PermissionMode::ReadOnly => format!("\x1b[48;5;29;38;5;231;1m{label}\x1b[0m"),
+        PermissionMode::WorkspaceWrite => format!("\x1b[48;5;178;38;5;232;1m{label}\x1b[0m"),
+        PermissionMode::Unrestricted => format!("\x1b[48;5;160;38;5;231;1m{label}\x1b[0m"),
+    };
+    painted
+}
+
+/// Count visible characters in a string, skipping ANSI SGR escape sequences.
+/// Used by the banner so coloured panel content aligns against the frame.
+fn visible_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c == 'm' {
+                in_esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_esc = true;
+            continue;
+        }
+        w += 1;
+    }
+    w
+}
+
+/// Right-pad `s` with spaces so its visible width equals `w`. Truncates via
+/// middle-ellipsis if already too long.
+fn pad_visible(s: &str, w: usize) -> String {
+    let vis = visible_width(s);
+    if vis >= w {
+        // Can't safely truncate colour-coded strings mid-escape; fall back
+        // to the raw string (terminal will wrap).
+        return s.to_string();
+    }
+    format!("{}{}", s, " ".repeat(w - vis))
+}
+
+/// Center `s` inside a column of width `w`, padding both sides with spaces.
+fn center(s: &str, w: usize) -> String {
+    let vis = visible_width(s);
+    if vis >= w {
+        return s.to_string();
+    }
+    let total_pad = w - vis;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+}
+
+/// Same as `center`, but adds `extra_cells` to the reported visible width —
+/// use this when the string contains a double-width glyph (emoji, CJK) so
+/// padding still lines up against the frame.
+fn center_visual(s: &str, w: usize, extra_cells: usize) -> String {
+    let vis = visible_width(s) + extra_cells;
+    if vis >= w {
+        return s.to_string();
+    }
+    let total_pad = w - vis;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
 // ---------------------------------------------------------------------------
-// Banner helpers — ANSI 256-colour theme, terminal width, path tidying.
+// Banner helpers — terminal width, path tidying.
+// (The old Theme struct lived here; the boxed banner uses inline colour
+// constants now so the struct's wrapper methods were dead weight.)
 // ---------------------------------------------------------------------------
-
-struct Theme {
-    color: bool,
-}
-
-impl Theme {
-    fn new(color: bool) -> Self {
-        // Honour NO_COLOR (https://no-color.org) and skip ANSI if stdout isn't
-        // a TTY to keep piped output clean.
-        let enabled = color
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
-        Self { color: enabled }
-    }
-
-    fn paint(&self, code: &str, text: &str) -> String {
-        if self.color {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
-    }
-
-    fn brand(&self, t: &str) -> String {
-        self.paint("38;5;199;1", t)
-    } // hot pink, bold
-    fn title(&self, t: &str) -> String {
-        self.paint("38;5;51;1", t)
-    } // cyan, bold
-    fn key(&self, t: &str) -> String {
-        self.paint("38;5;111", t)
-    } // soft sky-blue
-    fn value(&self, t: &str) -> String {
-        self.paint("38;5;255", t)
-    } // bright white
-    fn path(&self, t: &str) -> String {
-        self.paint("38;5;250", t)
-    } // light grey
-    fn dim(&self, t: &str) -> String {
-        self.paint("38;5;245", t)
-    } // mid grey
-    fn faint(&self, t: &str) -> String {
-        self.paint("38;5;238", t)
-    } // dark grey
-    fn tip(&self, t: &str) -> String {
-        self.paint("38;5;81", t)
-    } // muted cyan
-
-    fn mode_badge(&self, m: PermissionMode) -> String {
-        let label = format!(" {} ", m.as_str());
-        match m {
-            // bg / fg combos chosen for readable contrast on both light and dark themes.
-            PermissionMode::ReadOnly => self.paint("48;5;29;38;5;231;1", &label), // green
-            PermissionMode::WorkspaceWrite => self.paint("48;5;178;38;5;232;1", &label), // amber
-            PermissionMode::Unrestricted => self.paint("48;5;160;38;5;231;1", &label), // red
-        }
-    }
-}
 
 fn term_width() -> usize {
     std::env::var("COLUMNS")
