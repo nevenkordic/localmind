@@ -28,6 +28,17 @@ pub async fn run(
         true,
     )?;
 
+    // Stream tokens to stdout as Ollama generates them so the reply
+    // materialises in real time instead of dropping at the end in a wall.
+    // Stderr keeps the spinner + tool-step indicators so piping the REPL
+    // (`llm | tee`) still captures just the model output.
+    agent.set_token_sink(std::sync::Arc::new(|chunk: &str| {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(chunk.as_bytes());
+        let _ = out.flush();
+    }));
+
     let hist_path = history_path();
     let mut rl = DefaultEditor::new()?;
     if let Some(p) = &hist_path {
@@ -51,10 +62,17 @@ pub async fn run(
                     continue;
                 }
 
+                println!();
                 match agent.turn(l).await {
                     Ok(reply) => {
+                        // With the token sink installed, tokens were
+                        // already written to stdout as they arrived;
+                        // skip the trailing re-print so we don't echo
+                        // the reply twice. Keep the spacing either way.
+                        if !agent.is_streaming() {
+                            println!("{reply}");
+                        }
                         println!();
-                        println!("{reply}");
                         println!();
                     }
                     Err(e) => eprintln!("! {e}"),

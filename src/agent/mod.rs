@@ -14,6 +14,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
 
+/// Callback the agent invokes for each streamed token from the final
+/// assistant reply. The REPL writes these straight to stdout so the user
+/// sees the answer materialise instead of a long spinner-then-dump wait.
+pub type TokenSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct AgentRun {
     pub ctx: Arc<ToolContext>,
     pub client: Ollama,
@@ -25,6 +30,11 @@ pub struct AgentRun {
     /// Last memory primer text we injected — same dedup as `last_primer` but
     /// for general (non-skill) memories.
     last_memory_primer: Option<String>,
+    /// When set, chat calls stream tokens through this callback instead of
+    /// blocking until the whole reply lands. Callers who set a sink should
+    /// NOT re-print the return value of `turn()` — the content has already
+    /// been rendered progressively.
+    token_sink: Option<TokenSink>,
 }
 
 impl AgentRun {
@@ -74,7 +84,21 @@ impl AgentRun {
             max_tool_iterations: 12,
             last_primer: None,
             last_memory_primer: None,
+            token_sink: None,
         })
+    }
+
+    /// Enable progressive token streaming. Each content chunk from the
+    /// final assistant reply is passed to `sink` as it arrives from
+    /// Ollama. Intermediate tool-call iterations still use non-streaming
+    /// chat — interleaved tool-narration wouldn't play nicely with the
+    /// REPL's output formatting.
+    pub fn set_token_sink(&mut self, sink: TokenSink) {
+        self.token_sink = Some(sink);
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.token_sink.is_some()
     }
 
     /// Send a user turn and iterate through any tool calls the model requests.
@@ -211,8 +235,50 @@ impl AgentRun {
         let color = crate::ui::color_enabled(self.ctx.cfg.repl.color);
         for _ in 0..self.max_tool_iterations {
             let spinner = crate::ui::Spinner::start("thinking", color);
-            let reply_res = self.client.chat(&self.messages, Some(&specs), false).await;
-            spinner.stop().await;
+
+            // Streaming path: if the caller installed a token sink, route
+            // the reply through chat_stream so tokens land progressively.
+            // The spinner stops on the first content byte; subsequent
+            // tokens flow straight to the sink.
+            //
+            // We only stream when the iteration ends up being the final
+            // assistant reply (no tool_calls). There's no reliable way to
+            // know that ahead of time, but in practice:
+            //   - If the model emits tool calls, it usually narrates them
+            //     first ("Let me check...") — those tokens are informative
+            //     output the user actually wants to see stream.
+            //   - If the model emits the final reply, 100% of tokens are
+            //     wanted in stream order.
+            // So we stream unconditionally on every iteration when the
+            // sink is set.
+            let reply_res = if let Some(sink) = self.token_sink.clone() {
+                // Hand the spinner to the callback via a Mutex<Option<>> so
+                // the first token tick can consume and drop it.
+                let spinner_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(spinner)));
+                let slot_clone = spinner_slot.clone();
+                let cb = move |chunk: &str| {
+                    if let Some(sp) = slot_clone.lock().unwrap().take() {
+                        sp.stop_sync();
+                    }
+                    sink(chunk);
+                };
+                let r = self
+                    .client
+                    .chat_stream(&self.messages, Some(&specs), false, cb)
+                    .await;
+                // If the stream ended without ever calling the callback
+                // (error before the first token) the spinner is still
+                // ticking — drop it now.
+                if let Some(sp) = spinner_slot.lock().unwrap().take() {
+                    sp.stop_sync();
+                }
+                r
+            } else {
+                let r = self.client.chat(&self.messages, Some(&specs), false).await;
+                spinner.stop().await;
+                r
+            };
+
             let reply = reply_res?;
             self.messages.push(reply.clone());
             match reply.tool_calls.as_ref() {

@@ -199,8 +199,20 @@ install_ollama_linux() {
 
 install_ollama_macos() {
   if command -v brew >/dev/null 2>&1; then
-    info "Installing Ollama via Homebrew (cask)"
-    brew install --cask ollama 2>&1 | tail -5
+    # Formula (CLI + launchd) is the default — smaller (~50 MB vs ~300 MB
+    # for the cask) and no menu-bar app. Pass LOCALMIND_OLLAMA_GUI=1 to get
+    # the full Ollama.app cask if you want the GUI.
+    if [ "${LOCALMIND_OLLAMA_GUI:-0}" = "1" ]; then
+      info "Installing Ollama via Homebrew (cask, full GUI app)"
+      brew install --cask ollama 2>&1 | tail -5
+    else
+      info "Installing Ollama via Homebrew (formula, CLI + launchd, headless)"
+      brew install ollama 2>&1 | tail -5
+      # Start the launchd service so the server auto-starts on login and
+      # right now. `brew services` is part of the homebrew-services tap
+      # that ships with Homebrew.
+      brew services start ollama >/dev/null 2>&1 || true
+    fi
   else
     warn "Homebrew not found. Please install Ollama from https://ollama.com/download"
     warn "Then re-run this installer, or pass LOCALMIND_SKIP_OLLAMA=1 to skip."
@@ -215,7 +227,13 @@ start_ollama_server() {
   fi
   case "$os" in
     darwin)
-      if [ -d "/Applications/Ollama.app" ]; then
+      # Prefer the launchd service installed by `brew install ollama`
+      # (headless). Fall back to the GUI app if someone opted in via
+      # LOCALMIND_OLLAMA_GUI=1, else spawn in background.
+      if command -v brew >/dev/null 2>&1 && brew services list 2>/dev/null | grep -q '^ollama'; then
+        info "Starting Ollama launchd service"
+        brew services start ollama >/dev/null 2>&1 || true
+      elif [ -d "/Applications/Ollama.app" ]; then
         info "Starting Ollama.app"
         open -a Ollama || true
       else

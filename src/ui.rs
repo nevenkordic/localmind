@@ -85,6 +85,20 @@ impl Spinner {
             let _ = h.await;
         }
     }
+
+    /// Same as `stop`, but synchronous — clears the line inline so a caller
+    /// in a non-async context (e.g. a streaming token callback) can print
+    /// the next byte on column 0 without waiting for the spinner task to
+    /// notice the stop flag on its next tick. The background task is left
+    /// to exit on its own time; double-clearing is harmless.
+    pub fn stop_sync(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if self.handle.is_some() {
+            let _ = write!(std::io::stderr(), "\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+        self.handle.take();
+    }
 }
 
 impl Drop for Spinner {

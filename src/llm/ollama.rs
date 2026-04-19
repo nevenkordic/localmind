@@ -198,6 +198,141 @@ impl OllamaClient {
         Ok(recover_text_tool_calls(parsed.message))
     }
 
+    /// Streaming chat call. Calls `on_token` for each content chunk as it
+    /// arrives, then returns the fully-assembled message once Ollama reports
+    /// `done: true`. Same request body as `chat` with `stream: true` and
+    /// newline-delimited JSON response framing.
+    ///
+    /// `on_token` runs on the request's tokio task — it must not block.
+    /// Expect a few-to-many calls per response; Ollama emits one chunk per
+    /// generated token in practice. Tool calls, if any, arrive in the final
+    /// chunk and are returned via the `ChatMessage.tool_calls` field — the
+    /// callback sees only user-visible content.
+    pub async fn chat_stream<F>(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        use_vision: bool,
+        mut on_token: F,
+    ) -> Result<ChatMessage>
+    where
+        F: FnMut(&str),
+    {
+        use futures::StreamExt;
+        #[derive(Serialize)]
+        struct Req<'a> {
+            model: &'a str,
+            messages: &'a [ChatMessage],
+            stream: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<&'a [ToolSpec]>,
+            options: Options,
+            keep_alive: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Options {
+            num_ctx: u32,
+            temperature: f32,
+        }
+        #[derive(Deserialize)]
+        struct Chunk {
+            #[serde(default)]
+            message: Option<ChatMessage>,
+            #[serde(default)]
+            done: bool,
+        }
+        let model = if use_vision {
+            &self.vision_model
+        } else {
+            &self.chat_model
+        };
+        let url = format!("{}/api/chat", self.host);
+        let body = Req {
+            model,
+            messages,
+            stream: true,
+            tools,
+            options: Options {
+                num_ctx: self.num_ctx,
+                temperature: 0.2,
+            },
+            keep_alive: &self.keep_alive,
+        };
+
+        // Same watchdog as the non-streaming path, but it bounds the TTFB
+        // (time to first byte) — once streaming starts, the reqwest-level
+        // timeout keeps guard for the rest.
+        let resp = match tokio::time::timeout(
+            CHAT_WATCHDOG,
+            self.http.post(&url).json(&body).send(),
+        )
+        .await
+        {
+            Ok(r) => r.context("POST /api/chat")?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "no response from Ollama after {}s — model '{model}' may be hung or corrupt.\n  \
+                     Try: ollama ps ; ollama rm {model} && ollama pull {model}",
+                    CHAT_WATCHDOG.as_secs()
+                ));
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ollama /api/chat {}: {}", status, text));
+        }
+
+        // Ollama emits newline-delimited JSON: one `{"message": {...}, "done": bool}`
+        // object per chunk. Buffer bytes and split on '\n' so a chunk split
+        // mid-object doesn't get parsed in two halves.
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut aggregated = ChatMessage::assistant(String::new());
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.context("reading chat stream")?;
+            buf.extend_from_slice(&bytes);
+            // Drain complete lines.
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let trimmed = &line[..line.len().saturating_sub(1)]; // drop '\n'
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parsed: Chunk = match serde_json::from_slice(trimmed) {
+                    Ok(c) => c,
+                    // Ollama shouldn't emit partial lines, but tolerate one
+                    // so we don't abort the whole stream on a transient glitch.
+                    Err(e) => {
+                        tracing::debug!("chat stream: unparseable chunk: {e}");
+                        continue;
+                    }
+                };
+                if let Some(m) = parsed.message {
+                    // Every chunk carries only the newly-generated fragment
+                    // of content; concatenate into the running total.
+                    if !m.content.is_empty() {
+                        on_token(&m.content);
+                        aggregated.content.push_str(&m.content);
+                    }
+                    // Tool calls arrive in the `done: true` chunk; take the
+                    // latest non-empty set we see.
+                    if let Some(tc) = m.tool_calls {
+                        if !tc.is_empty() {
+                            aggregated.tool_calls = Some(tc);
+                        }
+                    }
+                }
+                if parsed.done {
+                    return Ok(recover_text_tool_calls(aggregated));
+                }
+            }
+        }
+        // Stream ended without a `done: true` — treat any parsed content as
+        // the final reply rather than erroring.
+        Ok(recover_text_tool_calls(aggregated))
+    }
+
     /// Generate an embedding for a single text. Cached on (model, text) so
     /// repeated lookups (e.g. user re-runs the same `memory search`) skip
     /// the Ollama round-trip entirely.
