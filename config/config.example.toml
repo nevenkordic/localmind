@@ -91,8 +91,10 @@ max_results = 8
 block_private_addrs = true
 
 [repl]
-# Show tool calls as they happen.
-show_tool_calls = true
+# Show `· tool_name` lines in the REPL when the model runs a tool. Off by
+# default — clutters the transcript and tools are already in the audit log.
+# Flip on when you're debugging what the model is reaching for.
+show_tool_calls = false
 # Ask before running any shell command or file write.
 confirm_writes = true
 # Colour output.

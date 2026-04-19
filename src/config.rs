@@ -148,7 +148,11 @@ fn default_block_private() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplConfig {
-    #[serde(default = "default_true")]
+    /// Off by default — the `· tool_name` noise clutters the chat
+    /// transcript for interactive use. Tool calls are always recorded
+    /// in the audit log regardless; flip this on in local.toml for
+    /// debugging or to see what the model is reaching for.
+    #[serde(default)]
     pub show_tool_calls: bool,
     #[serde(default = "default_true")]
     pub confirm_writes: bool,
