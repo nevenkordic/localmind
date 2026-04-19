@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 /// fresh curl-installed users whose cwd is unrelated to the repo. Also
 /// seeded into the user-scope config file when the preflight prompt
 /// converts a "no config at all" state into a persisted choice.
-pub(crate) const EMBEDDED_DEFAULT_CONFIG: &str =
-    include_str!("../config/config.example.toml");
+pub(crate) const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../config/config.example.toml");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -237,8 +236,7 @@ impl Config {
         let dir = directories::ProjectDirs::from("com", "calligoit", "localmind")
             .map(|p| p.config_dir().to_path_buf())
             .context("no platform config dir available")?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let p = dir.join("config.toml");
         if !p.exists() {
             std::fs::write(&p, EMBEDDED_DEFAULT_CONFIG)

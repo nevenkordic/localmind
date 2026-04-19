@@ -297,18 +297,25 @@ impl AgentRun {
                 // leak to the user.
                 let spinner_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(spinner)));
                 let slot_clone = spinner_slot.clone();
-                let filter = std::sync::Arc::new(std::sync::Mutex::new(
-                    StreamingToolCallFilter::new(),
-                ));
+                let filter =
+                    std::sync::Arc::new(std::sync::Mutex::new(StreamingToolCallFilter::new()));
+                // Pipeline: Ollama → StreamingToolCallFilter (strips JSON /
+                // template tokens) → MarkdownHighlighter (colours fenced
+                // code blocks) → user's sink (stdout).
                 let filter_clone = filter.clone();
+                let md = std::sync::Arc::new(std::sync::Mutex::new(MarkdownHighlighter::new()));
+                let md_clone = md.clone();
                 let sink_clone = sink.clone();
+                let sink_for_md = sink.clone();
                 let cb = move |chunk: &str| {
                     if let Some(sp) = slot_clone.lock().unwrap().take() {
                         sp.stop_sync();
                     }
                     let mut f = filter_clone.lock().unwrap();
                     if let Some(emit) = f.feed(chunk) {
-                        sink_clone(&emit);
+                        let mut h = md_clone.lock().unwrap();
+                        let sink_inner = sink_clone.clone();
+                        h.feed(&emit, move |s| sink_inner(s));
                     }
                 };
                 let r = self
@@ -317,9 +324,16 @@ impl AgentRun {
                     .await;
                 // Flush any remainder of the filter's buffer if the stream
                 // ended while we were still deciding whether the content
-                // was JSON or prose.
+                // was JSON or prose, then flush the markdown highlighter.
                 if let Some(tail) = filter.lock().unwrap().flush() {
-                    sink(&tail);
+                    let mut h = md.lock().unwrap();
+                    let sink_inner = sink_for_md.clone();
+                    h.feed(&tail, move |s| sink_inner(s));
+                }
+                {
+                    let mut h = md.lock().unwrap();
+                    let sink_inner = sink.clone();
+                    h.flush(move |s| sink_inner(s));
                 }
                 // If the stream ended without ever calling the callback
                 // (error before the first token) the spinner is still
@@ -345,7 +359,12 @@ impl AgentRun {
             // produced a real reply around the fabrication) or replace with
             // a clear "I didn't actually run that — escalate to chat_model"
             // error so the user sees the failure instead of fake content.
-            if reply.tool_calls.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
+            if reply
+                .tool_calls
+                .as_ref()
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+            {
                 if let Some(scrubbed) = scrub_hallucinated_tool_output(&reply.content) {
                     reply.content = scrubbed;
                 }
@@ -437,7 +456,7 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 mod tests {
     use super::{
         extract_facts, is_trivial_turn, scrub_hallucinated_tool_output, should_use_fast,
-        StreamingToolCallFilter,
+        MarkdownHighlighter, StreamingToolCallFilter,
     };
 
     fn first(input: &str) -> Option<(String, String, String)> {
@@ -512,7 +531,7 @@ mod tests {
             "hi what was my deploy command",
             "remember the port number",
             "fix the failing test",
-            "why",   // 3 chars but not a known interjection — let recall decide
+            "why", // 3 chars but not a known interjection — let recall decide
             "what",
         ] {
             assert!(!is_trivial_turn(w), "expected '{w}' to run recall");
@@ -569,23 +588,23 @@ mod tests {
         // One sample per tool family — if a 3B model would have fabricated
         // it, scrub should catch it.
         let samples = [
-            "[Content of the file]",                   // read_file
-            "[Content of the PDF]",                    // read_pdf
-            "[Document content here]",                 // read_docx
-            "[Spreadsheet content: rows follow]",      // read_xlsx
-            "[Image description here]",                // read_image
-            "[Command output: ls -la]",                // shell
-            "[Shell output here]",                     // shell (variant)
-            "[Webpage content from https://x.com]",    // web_fetch
-            "[HTML content]",                          // web_fetch (variant)
-            "[Response body: {...}]",                  // http_fetch
-            "[Search results here: ...]",              // web_search
-            "[Query results]",                         // search_memory
-            "[DNS result: A record]",                  // dns_lookup
-            "[Whois result: ...]",                     // whois
-            "[Port status here]",                      // port_check
-            "[Output here]",                           // generic
-            "[Tool result]",                           // generic
+            "[Content of the file]",                // read_file
+            "[Content of the PDF]",                 // read_pdf
+            "[Document content here]",              // read_docx
+            "[Spreadsheet content: rows follow]",   // read_xlsx
+            "[Image description here]",             // read_image
+            "[Command output: ls -la]",             // shell
+            "[Shell output here]",                  // shell (variant)
+            "[Webpage content from https://x.com]", // web_fetch
+            "[HTML content]",                       // web_fetch (variant)
+            "[Response body: {...}]",               // http_fetch
+            "[Search results here: ...]",           // web_search
+            "[Query results]",                      // search_memory
+            "[DNS result: A record]",               // dns_lookup
+            "[Whois result: ...]",                  // whois
+            "[Port status here]",                   // port_check
+            "[Output here]",                        // generic
+            "[Tool result]",                        // generic
         ];
         for s in samples {
             assert!(
@@ -623,9 +642,7 @@ mod tests {
     fn filter_drops_tool_call_json_at_start() {
         // The exact failure the user hit: qwen emits `{"name":"read_pdf",...}`
         // as text before the structured tool_call runs.
-        let out = run_filter(&[
-            r#"{"name":"read_pdf","arguments":{"path":"/tmp/x.pdf"}}"#,
-        ]);
+        let out = run_filter(&[r#"{"name":"read_pdf","arguments":{"path":"/tmp/x.pdf"}}"#]);
         assert_eq!(out, "", "tool-call JSON must not leak: got {out:?}");
     }
 
@@ -691,7 +708,10 @@ mod tests {
             r#"{"name":"write_file","arguments":{"path":"/b","content":"y"}}"#,
             r#"{"name":"write_file","arguments":{"path":"/c","content":"z"}}"#,
         ]);
-        assert_eq!(out, "", "consecutive tool-call JSON must all be dropped, got {out:?}");
+        assert_eq!(
+            out, "",
+            "consecutive tool-call JSON must all be dropped, got {out:?}"
+        );
     }
 
     #[test]
@@ -703,7 +723,10 @@ mod tests {
             "<|im_start|>",
             r#"{"name":"write_file","arguments":{"path":"/c","content":"z"}}"#,
         ]);
-        assert_eq!(out, "", "template tokens + JSON must all be dropped, got {out:?}");
+        assert_eq!(
+            out, "",
+            "template tokens + JSON must all be dropped, got {out:?}"
+        );
     }
 
     #[test]
@@ -724,14 +747,50 @@ mod tests {
 
     #[test]
     fn filter_strips_template_tokens_in_prose() {
-        let out = run_filter(&[
-            "Hello there.<|im_end|>\n",
-            "<|im_start|>",
-            "World.",
-        ]);
+        let out = run_filter(&["Hello there.<|im_end|>\n", "<|im_start|>", "World."]);
         assert!(out.contains("Hello there."));
         assert!(out.contains("World."));
-        assert!(!out.contains("<|im_"), "template tokens must not leak: {out:?}");
+        assert!(
+            !out.contains("<|im_"),
+            "template tokens must not leak: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_drops_tool_response_block_inline() {
+        let out = run_filter(&[
+            "Sure, reading the file now.\n",
+            "<tool_response>\nPDF Content:\n[Content of the PDF file]\n</tool_response>",
+            "\nDone.",
+        ]);
+        assert!(out.contains("Sure, reading the file now."));
+        assert!(out.contains("Done."));
+        assert!(
+            !out.contains("<tool_response>") && !out.contains("</tool_response>"),
+            "tags must be fully stripped, got: {out:?}"
+        );
+        assert!(
+            !out.contains("[Content of the PDF file]"),
+            "body of the fake tool response must be dropped, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_drops_tool_response_split_across_chunks() {
+        let out = run_filter(&["<tool_", "response>\nfake body\n</tool_", "response>"]);
+        assert_eq!(
+            out, "",
+            "split tool_response must still be dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_drops_orphan_closing_tool_response_tag() {
+        // Some models emit only the closing tag. Don't leak it.
+        let out = run_filter(&["hello</tool_response> world"]);
+        assert!(out.contains("hello"));
+        assert!(out.contains(" world"));
+        assert!(!out.contains("</tool_response>"));
     }
 
     #[test]
@@ -739,6 +798,127 @@ mod tests {
         // Real stream could split the token mid-way; filter must stitch.
         let out = run_filter(&["<|im_st", "art|>hello"]);
         assert_eq!(out, "hello");
+    }
+
+    // ----- MarkdownHighlighter ---------------------------------------
+
+    fn run_md(chunks: &[&str]) -> String {
+        let mut h = MarkdownHighlighter::new();
+        let mut out = String::new();
+        for c in chunks {
+            let collected = std::cell::RefCell::new(String::new());
+            h.feed(c, |s| collected.borrow_mut().push_str(s));
+            out.push_str(&collected.borrow());
+        }
+        let collected = std::cell::RefCell::new(String::new());
+        h.flush(|s| collected.borrow_mut().push_str(s));
+        out.push_str(&collected.borrow());
+        out
+    }
+
+    #[test]
+    fn md_prose_passes_through_unchanged() {
+        let out = run_md(&["Hello world.\nHow are you?\n"]);
+        assert_eq!(out, "Hello world.\nHow are you?\n");
+    }
+
+    #[test]
+    fn md_fenced_code_gets_highlighted_and_added_marker() {
+        let out = run_md(&["Here is Rust:\n", "```rust\n", "fn main() {}\n", "```\n"]);
+        // Fence markers are now swallowed — user asked for them hidden.
+        assert!(!out.contains("```"));
+        assert!(
+            out.contains("   1"),
+            "expected line-number gutter, got: {out:?}"
+        );
+        assert!(
+            out.contains("+"),
+            "expected `+` add marker on code line, got: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[48;2;12;36;12m"),
+            "expected muted green background, got: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[K"),
+            "expected EL for full-row fill, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn md_fenced_block_without_lang_still_gutters() {
+        let out = run_md(&["```\n", "some plaintext\n", "```\n"]);
+        assert!(out.contains("   1"));
+        assert!(out.contains("+"));
+        assert!(!out.contains("```"));
+    }
+
+    #[test]
+    fn md_handles_chunked_fence_open() {
+        // Split the opening fence across chunk boundaries — the "could be
+        // fence prefix" guard should hold bytes until we see the newline.
+        let out = run_md(&["``", "`rust\n", "fn main() {}\n", "```\n"]);
+        // Now that fences are swallowed, the output is just the highlighted
+        // code line (no fence markers).
+        assert!(
+            !out.contains("```"),
+            "fence markers must be hidden: {out:?}"
+        );
+        assert!(out.contains("   1"));
+    }
+
+    #[test]
+    fn md_diff_fence_renders_plus_minus_colors() {
+        // ```diff fences get per-line semantics: + green, - red, space
+        // context. The user asked for visible red removals in replies.
+        let out = run_md(&[
+            "```diff\n",
+            "+ added line\n",
+            "- removed line\n",
+            "  context line\n",
+            "```\n",
+        ]);
+        // Fence markers stripped.
+        assert!(!out.contains("```"));
+        // Add row: green bg (12/36/12).
+        assert!(
+            out.contains("\x1b[48;2;12;36;12m"),
+            "expected green bg on insert row: {out:?}"
+        );
+        // Remove row: red bg (48/12/12).
+        assert!(
+            out.contains("\x1b[48;2;48;12;12m"),
+            "expected red bg on delete row: {out:?}"
+        );
+        // Context row: no bg colour code but a space sign.
+        assert!(out.contains("context line"));
+        // The +/- prefix chars are stripped from the body — check the
+        // body doesn't contain a literal `+ added` pair.
+        assert!(!out.contains("+ added"));
+    }
+
+    #[test]
+    fn md_multiple_fences_in_one_stream() {
+        let out = run_md(&[
+            "First block:\n",
+            "```js\n",
+            "console.log(1);\n",
+            "```\n",
+            "Then more:\n",
+            "```py\n",
+            "print(2)\n",
+            "```\n",
+            "Done.\n",
+        ]);
+        // Each code block's line counter resets to 1 — so the first-line
+        // gutter sequence (green line-no on green bg) appears exactly
+        // twice. ADDED_BG then GUTTER_FG_ADD then `   1`.
+        assert_eq!(
+            out.matches("\x1b[48;2;12;36;12m\x1b[32m   1").count(),
+            2,
+            "expected 2 first-line gutters, got: {out:?}"
+        );
+        assert!(out.contains("Done.\n"));
     }
 
     #[test]
@@ -800,7 +980,7 @@ pub(crate) struct StreamingToolCallFilter {
     escape: bool,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 enum FilterState {
     /// Still accumulating; haven't decided what the next bytes are.
     Pending,
@@ -811,9 +991,333 @@ enum FilterState {
     DroppingJson,
     /// Inside a `<|...|>` template token. Drops until `|>`.
     DroppingTemplate,
+    /// Inside a block-level tag (`<tool_response>...</tool_response>`).
+    /// Drops bytes until the closing tag appears. String is the close
+    /// tag literal (e.g. `</tool_response>`).
+    DroppingBlock(String),
 }
 
 const TEMPLATE_PREFIXES: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
+
+/// Block-level tags the model sometimes emits as text even though they're
+/// meant to come from the protocol layer. Everything between the open
+/// and close tag is discarded. Close tags appearing orphan (without a
+/// matching open) are also dropped. Add new pairs as new failure modes
+/// surface.
+const BLOCK_TAG_PAIRS: &[(&str, &str)] = &[("<tool_response>", "</tool_response>")];
+const ORPHAN_CLOSE_TAGS: &[&str] = &["</tool_response>"];
+
+// ANSI colour constants shared by the markdown-code renderer and the
+// write_file diff preamble so the two look-and-feels stay in sync. The
+// greens and reds are deliberately dark (RGB ~12/36/12, 48/12/12) so they
+// read as a gentle row-fill rather than a glaring block.
+pub(crate) const GUTTER_FG: &str = "\x1b[2;37m"; // dim grey — context / no-change
+                                                 // Gutter + marker share the same shade per row-type so the line-number
+                                                 // and the +/- marker look uniform. Previously the gutter was dimmed and
+                                                 // looked a half-step lighter than the marker; matched now.
+pub(crate) const GUTTER_FG_ADD: &str = "\x1b[32m"; // green for added-line gutter
+pub(crate) const GUTTER_FG_DEL: &str = "\x1b[31m"; // red for removed-line gutter
+pub(crate) const ADDED_BG: &str = "\x1b[48;2;12;36;12m"; // muted dark green
+pub(crate) const REMOVED_BG: &str = "\x1b[48;2;48;12;12m"; // muted dark red
+pub(crate) const MARKER_FG_ADD: &str = "\x1b[32m"; // regular green (not bright)
+pub(crate) const MARKER_FG_DEL: &str = "\x1b[31m"; // regular red
+pub(crate) const FG_RESET: &str = "\x1b[39m"; // reset foreground only — keeps bg
+pub(crate) const CLEAR_EOL: &str = "\x1b[K"; // fills remainder of line with current bg
+pub(crate) const RESET: &str = "\x1b[0m"; // full reset
+
+/// Markdown-aware syntax highlighter for streamed assistant replies. Wraps
+/// a downstream sink and intercepts ```lang code fences, highlighting
+/// their contents via syntect before forwarding. Prose outside fences
+/// passes through char-by-char so the streaming UX stays snappy; code
+/// inside fences renders line-by-line (we need a full line for syntect
+/// to tokenise).
+///
+/// Detection is deliberately lenient:
+///   * Fence is a line whose first non-whitespace run is 3+ backticks
+///   * Language tag is optional (whitespace-terminated after the ticks)
+///   * Closing fence is any line whose first non-whitespace run is ≥ the
+///     opening count of backticks
+///
+/// When the language is absent or unknown, the code still gets a dim
+/// gutter and plain-text styling — never worse than the previous raw
+/// output.
+pub(crate) struct MarkdownHighlighter {
+    state: MdState,
+    /// Buffer of bytes from the current line that haven't been flushed yet.
+    line_buf: String,
+    /// Language tag from the opening fence, used for syntect lookup.
+    lang: String,
+    /// One-off initialised syntect data; shared across all fences in a
+    /// session so we don't reload the syntax set per block.
+    ps: syntect::parsing::SyntaxSet,
+    ts: syntect::highlighting::ThemeSet,
+    /// 1-based line counter inside the current code fence. Reset on fence
+    /// open so each block numbers from 1.
+    code_lineno: usize,
+}
+
+#[derive(PartialEq, Eq)]
+enum MdState {
+    Prose,
+    InFence,
+}
+
+impl MarkdownHighlighter {
+    pub fn new() -> Self {
+        Self {
+            state: MdState::Prose,
+            line_buf: String::new(),
+            lang: String::new(),
+            ps: syntect::parsing::SyntaxSet::load_defaults_newlines(),
+            ts: syntect::highlighting::ThemeSet::load_defaults(),
+            code_lineno: 0,
+        }
+    }
+
+    /// Feed a chunk of post-filter prose and flush everything we can to
+    /// `sink`. Stateful across calls.
+    ///
+    /// Strategy: in Prose mode, characters are forwarded as soon as we
+    /// know the current line cannot be a fence opener (as soon as we see
+    /// any non-whitespace, non-backtick char). Until then, bytes sit in
+    /// `line_buf` so we can recognise a `\`\`\`` fence even when it's
+    /// split across chunks. In fence mode everything is line-buffered —
+    /// syntect needs whole lines.
+    pub fn feed<F: FnMut(&str)>(&mut self, chunk: &str, mut sink: F) {
+        for ch in chunk.chars() {
+            match self.state {
+                MdState::Prose => self.feed_prose_char(ch, &mut sink),
+                MdState::InFence => self.feed_fence_char(ch, &mut sink),
+            }
+        }
+    }
+
+    pub fn flush<F: FnMut(&str)>(&mut self, mut sink: F) {
+        if self.line_buf.is_empty() {
+            return;
+        }
+        let tail = std::mem::take(&mut self.line_buf);
+        match self.state {
+            MdState::InFence => {
+                // Unterminated code block — highlight what we have.
+                self.code_lineno += 1;
+                let rendered = self.highlight_line(&tail);
+                sink(&rendered);
+            }
+            MdState::Prose => {
+                // Held fence prefix that never resolved; emit literal.
+                sink(&tail);
+            }
+        }
+    }
+
+    fn feed_prose_char<F: FnMut(&str)>(&mut self, ch: char, sink: &mut F) {
+        if ch == '\n' {
+            // End of line. If line_buf holds anything, it's either a
+            // complete fence line or an unflushed all-whitespace/backtick
+            // prefix.
+            if !self.line_buf.is_empty() {
+                let held = std::mem::take(&mut self.line_buf);
+                if let Some(lang) = parse_fence(held.trim_start()) {
+                    // Open a fence. SWALLOW the ```lang line + its trailing
+                    // newline — the user asked for the markers hidden; the
+                    // highlighted body alone speaks for itself.
+                    self.state = MdState::InFence;
+                    self.lang = lang;
+                    self.code_lineno = 0;
+                    return;
+                }
+                // Not a fence — flush the held bytes as normal prose.
+                sink(&held);
+            }
+            sink("\n");
+            return;
+        }
+
+        if self.line_buf.is_empty() {
+            // Beginning of a line. Only whitespace or backtick could
+            // possibly lead to a fence; everything else is definitely
+            // prose and can be forwarded immediately.
+            if ch.is_whitespace() || ch == '`' {
+                self.line_buf.push(ch);
+            } else {
+                sink(&ch.to_string());
+            }
+            return;
+        }
+
+        // Mid-line, still holding a potential fence prefix. Append and
+        // check whether it could STILL be a fence.
+        self.line_buf.push(ch);
+        if !could_be_fence_prefix(&self.line_buf) {
+            // Committed to prose for this line — flush everything held.
+            let flush = std::mem::take(&mut self.line_buf);
+            sink(&flush);
+        }
+    }
+
+    fn feed_fence_char<F: FnMut(&str)>(&mut self, ch: char, sink: &mut F) {
+        self.line_buf.push(ch);
+        if ch != '\n' {
+            return;
+        }
+        let line = std::mem::take(&mut self.line_buf);
+        if parse_fence(line.trim()).is_some() {
+            // Closing fence — swallow it for the same reason the opener
+            // is swallowed; the green rows themselves mark the block.
+            self.state = MdState::Prose;
+            self.lang.clear();
+            return;
+        }
+        // A code line. Highlight it with a gutter.
+        self.code_lineno += 1;
+        let rendered = self.highlight_line(&line);
+        sink(&rendered);
+    }
+
+    fn highlight_line(&self, line: &str) -> String {
+        use syntect::easy::HighlightLines;
+        use syntect::util::as_24_bit_terminal_escaped;
+
+        let body_line = line.strip_suffix('\n').unwrap_or(line);
+        let trailing_nl = if line.ends_with('\n') { "\n" } else { "" };
+
+        // `diff` fences get per-line +/- semantics: the first char decides
+        // insert / delete / context, the rest is highlighted as-is. Any
+        // other language: every line is an insert (new code being proposed).
+        let (tag, body_content) = if self.lang == "diff" || self.lang == "patch" {
+            classify_diff_line(body_line)
+        } else {
+            (DiffTag::Insert, body_line)
+        };
+
+        // Pick a syntax highlighter: for diff content, attempt the
+        // sub-language if we can infer one; else plain text. For normal
+        // fences, use the declared language.
+        let syntax = if self.lang == "diff" || self.lang == "patch" {
+            self.ps.find_syntax_plain_text()
+        } else if self.lang.is_empty() {
+            self.ps.find_syntax_plain_text()
+        } else {
+            self.ps
+                .find_syntax_by_token(&self.lang)
+                .unwrap_or_else(|| self.ps.find_syntax_plain_text())
+        };
+        let theme = &self.ts.themes["base16-ocean.dark"];
+        let mut h = HighlightLines::new(syntax, theme);
+        let raw_body = match h.highlight_line(body_content, &self.ps) {
+            Ok(ranges) => as_24_bit_terminal_escaped(&ranges[..], false),
+            Err(_) => body_content.to_string(),
+        };
+        // Syntect emits `\x1b[0m` between ranges; swap for fg-only reset
+        // so our row background stays active.
+        let body = raw_body.replace("\x1b[0m", "\x1b[39m");
+
+        let (bg, gutter_fg, marker_fg, sign) = match tag {
+            DiffTag::Insert => (ADDED_BG, GUTTER_FG_ADD, MARKER_FG_ADD, "+"),
+            DiffTag::Delete => (REMOVED_BG, GUTTER_FG_DEL, MARKER_FG_DEL, "-"),
+            DiffTag::Context => ("", GUTTER_FG, "\x1b[2;37m", " "),
+        };
+
+        if bg.is_empty() {
+            // Context row — no bg fill.
+            format!(
+                "{gutter_fg}{lineno:>4}{RESET} {marker_fg}{sign}{RESET} {body}\x1b[0m{trailing_nl}",
+                lineno = self.code_lineno,
+            )
+        } else {
+            format!(
+                "{bg}{gutter_fg}{lineno:>4}{FG_RESET} {marker_fg}{sign}{FG_RESET} {body}{CLEAR_EOL}{RESET}{trailing_nl}",
+                lineno = self.code_lineno,
+            )
+        }
+    }
+}
+
+/// Per-line classification inside a ```diff fence. The first printable
+/// char of the line decides insertion / deletion / context; that char is
+/// stripped before highlighting so the body itself isn't polluted with
+/// the marker.
+#[derive(Clone, Copy, Debug)]
+enum DiffTag {
+    Insert,
+    Delete,
+    Context,
+}
+
+fn classify_diff_line(line: &str) -> (DiffTag, &str) {
+    // Standard unified-diff prefixes. We treat unrecognised starts as
+    // context so rogue lines don't blow up the render.
+    if let Some(rest) = line.strip_prefix('+') {
+        (DiffTag::Insert, rest)
+    } else if let Some(rest) = line.strip_prefix('-') {
+        (DiffTag::Delete, rest)
+    } else if let Some(rest) = line.strip_prefix(' ') {
+        (DiffTag::Context, rest)
+    } else {
+        (DiffTag::Context, line)
+    }
+}
+
+/// Is `line_buf` still possibly the start of a fence line? We hold off on
+/// forwarding to the sink while this is true so that `\`\`\`rust\n` at the
+/// start of a new line doesn't leak the first ticks before we recognise
+/// the fence.
+fn could_be_fence_prefix(line_buf: &str) -> bool {
+    // Only applies at the start of a line (nothing before the last \n in
+    // the cumulative stream). We approximate by checking the current line
+    // buffer: if it's whitespace + up to 3 backticks + optional tag chars,
+    // it COULD be a fence.
+    let s = line_buf.trim_start();
+    if s.is_empty() {
+        return true;
+    }
+    // Fence requires at least one backtick at the start.
+    let ticks = s.chars().take_while(|c| *c == '`').count();
+    if ticks == 0 {
+        return false;
+    }
+    // If we've seen < 3 backticks and nothing else, keep holding.
+    if ticks < 3 && ticks == s.chars().count() {
+        return true;
+    }
+    // 3+ backticks followed by a language tag — still developing.
+    if ticks >= 3 {
+        // Everything after the ticks must be identifier-ish (or whitespace
+        // leading to a newline). We don't have the newline yet, so assume
+        // it's still a fence candidate.
+        let rest = &s[ticks..];
+        if rest.is_empty()
+            || rest
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '+')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a fence line. Returns `Some(lang)` if the trimmed line opens /
+/// closes a fence (`lang` empty for an untagged fence), None otherwise.
+fn parse_fence(trimmed: &str) -> Option<String> {
+    let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+    if ticks < 3 {
+        return None;
+    }
+    let rest: String = trimmed
+        .chars()
+        .skip(ticks)
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    // Anything AFTER the tag must be whitespace only — fences don't carry
+    // arbitrary prose.
+    let after_tag: String = trimmed.chars().skip(ticks + rest.chars().count()).collect();
+    if !after_tag.chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(rest)
+}
 
 /// Walk backwards from `at` until we find a UTF-8 char boundary. Used by
 /// the streaming filter to slice `buf` at safe byte positions — without
@@ -848,7 +1352,7 @@ impl StreamingToolCallFilter {
         // Each iteration either consumes bytes (produces output or drops
         // them) or breaks out when more input is needed.
         loop {
-            match self.state {
+            match &self.state {
                 FilterState::Pending => {
                     if !self.try_decide() {
                         break; // need more bytes
@@ -864,6 +1368,13 @@ impl StreamingToolCallFilter {
                 }
                 FilterState::DroppingTemplate => {
                     if !self.consume_template() {
+                        break;
+                    }
+                    self.state = FilterState::Pending;
+                }
+                FilterState::DroppingBlock(close_tag) => {
+                    let close_tag = close_tag.clone();
+                    if !self.consume_block(&close_tag) {
                         break;
                     }
                     self.state = FilterState::Pending;
@@ -894,10 +1405,7 @@ impl StreamingToolCallFilter {
                             // `{"name"` is 7. 16 covers both with headroom.
                             const HOLDBACK: usize = 16;
                             if self.buf.len() > HOLDBACK {
-                                let cut = prev_char_boundary(
-                                    &self.buf,
-                                    self.buf.len() - HOLDBACK,
-                                );
+                                let cut = prev_char_boundary(&self.buf, self.buf.len() - HOLDBACK);
                                 out.push_str(&self.buf[..cut]);
                                 self.buf.drain(..cut);
                             }
@@ -923,12 +1431,15 @@ impl StreamingToolCallFilter {
             FilterState::Emitting => std::mem::take(&mut self.buf),
             FilterState::Pending => {
                 let trimmed = self.buf.trim_start();
-                if trimmed.is_empty()
+                let looks_unfinished_unsafe = trimmed.is_empty()
                     || trimmed.starts_with('{')
                     || trimmed.starts_with('[')
                     || TEMPLATE_PREFIXES.iter().any(|p| trimmed.starts_with(p))
-                {
-                    // Looks like unfinished JSON / template / empty — drop.
+                    || BLOCK_TAG_PAIRS
+                        .iter()
+                        .any(|(open, _)| trimmed.starts_with(open))
+                    || ORPHAN_CLOSE_TAGS.iter().any(|t| trimmed.starts_with(t));
+                if looks_unfinished_unsafe {
                     self.buf.clear();
                     String::new()
                 } else {
@@ -951,18 +1462,39 @@ impl StreamingToolCallFilter {
     /// template token, or prose. Returns true if a decision was made (state
     /// changed away from Pending), false if we need more bytes.
     fn try_decide(&mut self) -> bool {
-        // Skip leading whitespace we can safely emit later.
         let trimmed = self.buf.trim_start();
         if trimmed.is_empty() {
             return false;
         }
-        // Template token at current position?
+        // Block-level tags (open → drop through matching close).
+        for (open, close) in BLOCK_TAG_PAIRS {
+            if trimmed.starts_with(open) {
+                self.state = FilterState::DroppingBlock((*close).to_string());
+                return true;
+            }
+            if open.starts_with(trimmed) && trimmed.len() < open.len() {
+                return false;
+            }
+        }
+        // Orphan close tags — a stray `</tool_response>` with no matching
+        // open. Drop it as a unit to avoid leaking the literal text.
+        for tag in ORPHAN_CLOSE_TAGS {
+            if trimmed.starts_with(tag) {
+                // Drain the leading whitespace + tag, back to Pending.
+                let skip = self.buf.len() - trimmed.len() + tag.len();
+                self.buf.drain(..skip);
+                return true;
+            }
+            if tag.starts_with(trimmed) && trimmed.len() < tag.len() {
+                return false;
+            }
+        }
+        // Inline template tokens like <|im_start|>.
         for prefix in TEMPLATE_PREFIXES {
             if trimmed.starts_with(prefix) {
                 self.state = FilterState::DroppingTemplate;
                 return true;
             }
-            // Partial prefix — need more bytes before we know.
             if prefix.starts_with(trimmed) && trimmed.len() < prefix.len() {
                 return false;
             }
@@ -976,15 +1508,30 @@ impl StreamingToolCallFilter {
                 return true;
             }
             if trimmed.len() > 256 {
-                // Long JSON-looking prose without a "name" key — emit.
                 self.state = FilterState::Emitting;
                 return true;
             }
-            return false; // wait for more
+            return false;
         }
-        // Everything else is prose.
         self.state = FilterState::Emitting;
         true
+    }
+
+    fn consume_block(&mut self, close_tag: &str) -> bool {
+        if let Some(idx) = self.buf.find(close_tag) {
+            self.buf.drain(..idx + close_tag.len());
+            true
+        } else {
+            // Hold back the last (close_tag.len() - 1) chars in case the
+            // close tag is split across chunks; drop everything before.
+            let keep = close_tag.len().saturating_sub(1);
+            let drain_to = self.buf.len().saturating_sub(keep);
+            if drain_to > 0 {
+                let cut = prev_char_boundary(&self.buf, drain_to);
+                self.buf.drain(..cut);
+            }
+            false
+        }
     }
 
     fn consume_json(&mut self) -> bool {
@@ -1048,17 +1595,28 @@ impl StreamingToolCallFilter {
     /// found, None if the buffer is all prose.
     fn find_restart_point(&self) -> Option<usize> {
         let mut earliest: Option<usize> = None;
-        // JSON tool-call boundary — `{"name"` is our signature.
+        let mut record = |idx: usize| {
+            earliest = Some(match earliest {
+                Some(e) => e.min(idx),
+                None => idx,
+            });
+        };
         if let Some(idx) = self.buf.find("{\"name\"") {
-            earliest = Some(idx);
+            record(idx);
         }
-        // Template tokens.
         for prefix in TEMPLATE_PREFIXES {
             if let Some(idx) = self.buf.find(prefix) {
-                earliest = Some(match earliest {
-                    Some(e) => e.min(idx),
-                    None => idx,
-                });
+                record(idx);
+            }
+        }
+        for (open, _) in BLOCK_TAG_PAIRS {
+            if let Some(idx) = self.buf.find(open) {
+                record(idx);
+            }
+        }
+        for tag in ORPHAN_CLOSE_TAGS {
+            if let Some(idx) = self.buf.find(tag) {
+                record(idx);
             }
         }
         earliest
@@ -1102,8 +1660,8 @@ pub(crate) fn scrub_hallucinated_tool_output(content: &str) -> Option<String> {
     // "[Content of the ___]") that false positives are rare.
     const RED_FLAGS: &[&str] = &[
         // file contents
-        "[content of",        // covers "[Content of the file]", "[Content of the PDF]", etc.
-        "[contents of",       // plural variant
+        "[content of",  // covers "[Content of the file]", "[Content of the PDF]", etc.
+        "[contents of", // plural variant
         "[file contents]",
         "[file content]",
         "[pdf content",
@@ -1172,8 +1730,8 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
         return false;
     }
     const CODE_MARKERS: &[&str] = &[
-        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java",
-        ".rb", ".cpp", ".c ", "::", "=>", "->", "()", "{}", "[]", "&&", "||",
+        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".cpp", ".c ",
+        "::", "=>", "->", "()", "{}", "[]", "&&", "||",
     ];
     if CODE_MARKERS.iter().any(|m| t.contains(m)) {
         return false;
@@ -1183,11 +1741,28 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
         return false;
     }
     const TOOL_VERBS: &[&str] = &[
-        "fix ", "refactor", "debug", "implement", "build",
-        "read file", "open file", "run ", "execute", "shell ",
-        "fetch ", "download", "scrape", "curl ", "http",
-        "search web", "look up online", "google", "wget",
-        "deploy", "commit", "git ",
+        "fix ",
+        "refactor",
+        "debug",
+        "implement",
+        "build",
+        "read file",
+        "open file",
+        "run ",
+        "execute",
+        "shell ",
+        "fetch ",
+        "download",
+        "scrape",
+        "curl ",
+        "http",
+        "search web",
+        "look up online",
+        "google",
+        "wget",
+        "deploy",
+        "commit",
+        "git ",
     ];
     let lower = t.to_lowercase();
     if TOOL_VERBS.iter().any(|w| lower.contains(w)) {
@@ -1201,7 +1776,9 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
 /// and costs an Ollama embed round-trip. For substantive messages we always
 /// recall.
 pub(crate) fn is_trivial_turn(input: &str) -> bool {
-    let t = input.trim().trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';'));
+    let t = input
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';'));
     if t.len() < 3 {
         return true;
     }
@@ -1212,13 +1789,9 @@ pub(crate) fn is_trivial_turn(input: &str) -> bool {
         return false;
     }
     const TRIVIAL: &[&str] = &[
-        "hi", "hey", "hello", "yo", "sup",
-        "ok", "okay", "kk", "k",
-        "yes", "yep", "yeah", "yup", "sure",
-        "no", "nope", "nah",
-        "thanks", "thx", "ty",
-        "bye", "goodbye", "cya",
-        "cool", "nice", "neat",
+        "hi", "hey", "hello", "yo", "sup", "ok", "okay", "kk", "k", "yes", "yep", "yeah", "yup",
+        "sure", "no", "nope", "nah", "thanks", "thx", "ty", "bye", "goodbye", "cya", "cool",
+        "nice", "neat",
     ];
     let lower = t.to_lowercase();
     TRIVIAL.iter().any(|w| *w == lower)

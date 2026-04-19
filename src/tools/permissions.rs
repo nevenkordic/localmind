@@ -279,7 +279,7 @@ impl PermissionManager {
         // mirroring conventional traffic-light semantics.
         let box_c = "\x1b[2;36m"; // dim cyan for borders
         let hdr_c = "\x1b[1;33m"; // bold yellow for the header
-        let lbl_c = "\x1b[2m";    // dim for labels (tool:, mode:, …)
+        let lbl_c = "\x1b[2m"; // dim for labels (tool:, mode:, …)
         let val_c = "\x1b[1;97m"; // bright white for values
         let rst = "\x1b[0m";
 
@@ -299,13 +299,9 @@ impl PermissionManager {
             eprintln!("  {box_c}┃{rst} \x1b[1;33mwarn:{rst}  \x1b[33m{w}{rst}");
         }
         if forced_ask {
-            eprintln!(
-                "  {box_c}┃{rst} {lbl_c}note:{rst}  matched ask-rule; will always prompt"
-            );
+            eprintln!("  {box_c}┃{rst} {lbl_c}note:{rst}  matched ask-rule; will always prompt");
         }
-        eprintln!(
-            "  {box_c}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{rst}"
-        );
+        eprintln!("  {box_c}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{rst}");
 
         // Color-coded choices. Green for grants (progressively brighter from
         // once→session→forever), red for no, yellow for edit. The key

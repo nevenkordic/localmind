@@ -113,12 +113,14 @@ impl Registry {
             "write_file" | "zip_create" | "zip_extract" | "create_dir"
         )) && ctx.confirm_writes);
 
+        // Preamble is informational — users want to see what's being
+        // written regardless of whether a permission prompt fires. Show
+        // it on EVERY write_file / create_dir call, even when a prior
+        // allow_rule / session-allow auto-approves. No-op for tools
+        // that don't have a preamble handler.
+        print_preamble(name, args);
+
         if needs_permission {
-            // For destructive tools, print a rich preamble (full-width
-            // diff, file header, +N/-M summary) BEFORE the permission
-            // prompt. Keeps the prompt box short and lets the diff
-            // breathe across the terminal width.
-            print_preamble(name, args);
             match ctx.permissions.ask(name, &scope, validator_note) {
                 Decision::Allow | Decision::AllowSession => {}
                 Decision::AllowPersistent(rule) => {
@@ -325,10 +327,7 @@ pub(crate) fn print_preamble(name: &str, args: &Value) {
     match name {
         "write_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let new_content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let new_content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let resolved = Path::new(path);
             let exists = resolved.exists();
             let old_content = std::fs::read_to_string(resolved).unwrap_or_default();
@@ -340,7 +339,10 @@ pub(crate) fn print_preamble(name: &str, args: &Value) {
                     format!("Added {plus} lines, removed {minus} lines"),
                 )
             } else {
-                ("Create", format!("New file, {} lines", new_content.lines().count()))
+                (
+                    "Create",
+                    format!("New file, {} lines", new_content.lines().count()),
+                )
             };
 
             eprintln!();
@@ -356,7 +358,9 @@ pub(crate) fn print_preamble(name: &str, args: &Value) {
         "create_dir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
             eprintln!();
-            eprintln!("\x1b[1;36m●\x1b[0m \x1b[1mCreate directory(\x1b[36m{path}\x1b[0m\x1b[1m)\x1b[0m");
+            eprintln!(
+                "\x1b[1;36m●\x1b[0m \x1b[1mCreate directory(\x1b[36m{path}\x1b[0m\x1b[1m)\x1b[0m"
+            );
             eprintln!();
         }
         _ => {}
@@ -411,25 +415,41 @@ pub(crate) fn render_diff(old: &str, new: &str, path: &str, max_lines: usize) ->
         let lineno = lineno.map(|n| n + 1).unwrap_or(0);
         let lineno_str = format!("{:>width$}", lineno, width = gutter_width);
 
-        // Background + sign colouring per tag. Background uses 256-colour
-        // codes (52 = dark red, 22 = dark green) so the row stays visible
-        // without overpowering the foreground.
-        let (sign, bg_ansi, sign_fg) = match change.tag() {
-            ChangeTag::Delete => ("-", "\x1b[48;5;52m", "\x1b[91m"),
-            ChangeTag::Insert => ("+", "\x1b[48;5;22m", "\x1b[92m"),
-            ChangeTag::Equal => (" ", "", "\x1b[2;37m"),
+        // Muted row backgrounds + regular-weight sign fg + per-row
+        // gutter colour (green for adds, red for deletes, dim for
+        // context). Matches the constants in agent::mod so code looks the
+        // same whether it's in a streamed reply or a file diff.
+        use crate::agent::{
+            ADDED_BG, CLEAR_EOL, FG_RESET, GUTTER_FG, GUTTER_FG_ADD, GUTTER_FG_DEL, MARKER_FG_ADD,
+            MARKER_FG_DEL, REMOVED_BG, RESET,
+        };
+        let (sign, bg_ansi, sign_fg, gutter_fg) = match change.tag() {
+            ChangeTag::Delete => ("-", REMOVED_BG, MARKER_FG_DEL, GUTTER_FG_DEL),
+            ChangeTag::Insert => ("+", ADDED_BG, MARKER_FG_ADD, GUTTER_FG_ADD),
+            ChangeTag::Equal => (" ", "", "\x1b[2;37m", GUTTER_FG),
         };
 
         let raw = change.to_string();
         let body = raw.strip_suffix('\n').unwrap_or(&raw);
-        // Highlight the body if we have a syntax; else fall back to plain.
         let highlighted_body = highlight_line(syntax, theme, &ps, body);
+        let body_safe = highlighted_body.replace("\x1b[0m", FG_RESET);
 
-        // Gutter (line number + separator) is always dim, no background.
-        // Then row: background + sign + highlighted body + reset.
-        out.push_str(&format!(
-            "\x1b[2;37m{lineno_str} \u{2502}\x1b[0m {bg_ansi}{sign_fg}{sign}\x1b[39m {highlighted_body}\x1b[0m\n"
-        ));
+        // For +/- rows, the background starts at column 0 (wrapping the
+        // line number and sign) and extends to end-of-line via EL. For
+        // context (no bg), the gutter stays dim on default bg so
+        // unchanged rows read as neutral.
+        let row = if bg_ansi.is_empty() {
+            // Context row — dim gutter, no row background.
+            format!(
+                "{gutter_fg}{lineno_str} \u{2502}{RESET} {sign_fg}{sign}{RESET} {highlighted_body}\x1b[0m\n"
+            )
+        } else {
+            // Insert or delete — bg wraps line number too.
+            format!(
+                "{bg_ansi}{gutter_fg}{lineno_str} \u{2502}{FG_RESET} {sign_fg}{sign}{FG_RESET} {body_safe}{CLEAR_EOL}{RESET}\n"
+            )
+        };
+        out.push_str(&row);
         rendered += 1;
     }
     if skipped > 0 {
@@ -506,8 +526,8 @@ fn count_changes(old: &str, new: &str) -> (usize, usize) {
 /// or no allow_rules array yet, both are created with sensible defaults.
 fn persist_allow_rule(rule: &str) -> Result<()> {
     let path = Config::ensure_writable_path(None)?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
     let mut doc: toml_edit::DocumentMut = raw
         .parse()
         .map_err(|e| anyhow!("parsing TOML in {}: {e}", path.display()))?;

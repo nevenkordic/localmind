@@ -204,7 +204,10 @@ pub fn run_installer() -> Result<()> {
         if !status.success() {
             anyhow::bail!(
                 "installer exited with {}",
-                status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
             );
         }
         Ok(())
@@ -213,8 +216,7 @@ pub fn run_installer() -> Result<()> {
     #[cfg(windows)]
     {
         // Windows users: point at the PowerShell installer instead.
-        let ps_url =
-            format!("https://raw.githubusercontent.com/{REPO}/main/scripts/install.ps1");
+        let ps_url = format!("https://raw.githubusercontent.com/{REPO}/main/scripts/install.ps1");
         let cmd = format!("irm {ps_url} | iex");
         eprintln!("==> powershell -NoProfile -Command \"{cmd}\"");
         let status = std::process::Command::new("powershell")

@@ -97,9 +97,7 @@ pub async fn check(cfg: &mut Config, explicit_config: Option<&Path>) -> bool {
                     }
                     Err(e) => {
                         eprintln!("\x1b[1;31merror:\x1b[0m could not update config: {e:#}");
-                        eprintln!(
-                            "  Run manually: \x1b[1mllm models --chat {fb}\x1b[0m"
-                        );
+                        eprintln!("  Run manually: \x1b[1mllm models --chat {fb}\x1b[0m");
                     }
                 },
                 Prompt::No | Prompt::Unreadable => {
@@ -119,9 +117,7 @@ pub async fn check(cfg: &mut Config, explicit_config: Option<&Path>) -> bool {
         eprintln!("    ollama pull {}", cfg.ollama.embed_model);
     }
     if let Some(fb) = &fallback {
-        eprintln!(
-            "    llm models --chat {fb}   # use this installed model instead"
-        );
+        eprintln!("    llm models --chat {fb}   # use this installed model instead");
     }
     eprintln!("    llm models                              # interactive picker");
     eprintln!();
@@ -196,7 +192,10 @@ fn pick_chat_fallback(models: &[String]) -> Option<String> {
             return Some(m.clone());
         }
     }
-    if let Some(m) = models.iter().find(|m| m.starts_with("qwen") && !m.contains("embed")) {
+    if let Some(m) = models
+        .iter()
+        .find(|m| m.starts_with("qwen") && !m.contains("embed"))
+    {
         return Some(m.clone());
     }
     models.iter().find(|m| !m.contains("embed")).cloned()
@@ -260,8 +259,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("local.toml");
         std::fs::write(&path, crate::config::EMBEDDED_DEFAULT_CONFIG).unwrap();
-        let mut cfg: Config =
-            toml::from_str(crate::config::EMBEDDED_DEFAULT_CONFIG).unwrap();
+        let mut cfg: Config = toml::from_str(crate::config::EMBEDDED_DEFAULT_CONFIG).unwrap();
         let written = apply_chat_model(&mut cfg, Some(&path), "llama3:8b").unwrap();
         assert_eq!(written, path);
         assert_eq!(cfg.ollama.chat_model, "llama3:8b");
