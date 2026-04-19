@@ -114,6 +114,11 @@ impl Registry {
         )) && ctx.confirm_writes);
 
         if needs_permission {
+            // For destructive tools, print a Claude-Code-style preamble
+            // (full-width diff, file header, +N/-M summary) BEFORE the
+            // permission prompt. Keeps the prompt box short and lets the
+            // diff breathe across the terminal width.
+            print_preamble(name, args);
             match ctx.permissions.ask(name, &scope, validator_note) {
                 Decision::Allow | Decision::AllowSession => {}
                 Decision::AllowPersistent(rule) => {
@@ -234,32 +239,12 @@ fn mode_guard(
 
 fn describe_scope(name: &str, args: &Value) -> String {
     match name {
-        "write_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let new_content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let old_content = std::fs::read_to_string(path).unwrap_or_default();
-            let mut out = format!("write to: {path}\n");
-            if old_content.is_empty() {
-                out.push_str(&format!(
-                    "new file, {} lines, {} chars\n",
-                    new_content.lines().count(),
-                    new_content.len()
-                ));
-            } else {
-                let (plus, minus) = count_changes(&old_content, new_content);
-                out.push_str(&format!(
-                    "edit: +{plus} / -{minus} lines ({} → {} total)\n",
-                    old_content.lines().count(),
-                    new_content.lines().count()
-                ));
-            }
-            out.push_str("---- diff ----\n");
-            out.push_str(&render_diff(&old_content, new_content, 60));
-            out
-        }
+        // Intentionally short now — the full diff is rendered by
+        // print_preamble before this fires, so the prompt box stays tight.
+        "write_file" => format!(
+            "write {}",
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
         "create_dir" => format!(
             "create directory: {}",
             args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
@@ -321,27 +306,94 @@ fn describe_scope(name: &str, args: &Value) -> String {
     }
 }
 
-/// Unified-diff-ish summary of `old` vs `new`, truncated to `max_lines`,
-/// colorised with ANSI escapes and prefixed with line numbers for the
-/// side that owns each line (original line number on delete, new line
-/// number on insert). Designed to land inside the permission-prompt box
-/// so the user sees exactly what's being written before approving.
+/// Print a rich-format context block to stderr BEFORE the permission
+/// prompt fires. Currently only `write_file` and `create_dir` have one;
+/// other tools (shell, web, etc.) don't need a preamble — the short scope
+/// inside the prompt box is enough.
 ///
-///   237 | + let mut out = format!(...);
-///   238 | + if old_content.is_empty() {
-///    42 | -   old line being removed
+/// For write_file, the preamble renders:
+///   ● Update(path)  |  ● Create(path)
+///      └─ Added N lines, removed M lines
 ///
-/// Green '+' for additions, red '-' for removals, dim for unchanged
-/// context. The line-number gutter width adapts to the larger of the
-/// two files so the `|` column stays straight on large diffs.
-pub(crate) fn render_diff(old: &str, new: &str, max_lines: usize) -> String {
+///   123      unchanged context line
+///   124 -    removed line            (red on dark-red background)
+///   124 +    added line              (green on dark-green background)
+///
+/// Using a full-width render outside the prompt box so long lines don't
+/// wrap awkwardly against the `┃` gutter.
+pub(crate) fn print_preamble(name: &str, args: &Value) {
+    match name {
+        "write_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let new_content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let resolved = Path::new(path);
+            let exists = resolved.exists();
+            let old_content = std::fs::read_to_string(resolved).unwrap_or_default();
+
+            let (verb, summary) = if exists {
+                let (plus, minus) = count_changes(&old_content, new_content);
+                (
+                    "Update",
+                    format!("Added {plus} lines, removed {minus} lines"),
+                )
+            } else {
+                ("Create", format!("New file, {} lines", new_content.lines().count()))
+            };
+
+            eprintln!();
+            eprintln!("\x1b[1;36m●\x1b[0m \x1b[1m{verb}(\x1b[36m{path}\x1b[0m\x1b[1m)\x1b[0m");
+            eprintln!("  \x1b[2m└─ {summary}\x1b[0m");
+            eprintln!();
+            let diff = render_diff(&old_content, new_content, path, 60);
+            for line in diff.lines() {
+                eprintln!("  {line}");
+            }
+            eprintln!();
+        }
+        "create_dir" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            eprintln!();
+            eprintln!("\x1b[1;36m●\x1b[0m \x1b[1mCreate directory(\x1b[36m{path}\x1b[0m\x1b[1m)\x1b[0m");
+            eprintln!();
+        }
+        _ => {}
+    }
+}
+
+/// Syntax-highlighted, background-coloured unified diff of `old` vs `new`.
+/// Matches the visual style of modern diff UIs: a dim line-number gutter,
+/// a red-tinted row background for deletions, green-tinted for insertions,
+/// and syntect-powered foreground colouring based on the language
+/// detected from `path` (file extension). Context lines get no background
+/// and a dim foreground.
+///
+///   199      "http_fetch" | "port_check" ...        ← dim context
+///   202 -    "zip_create" | "zip_extract" => ...    ← red bg, red sign
+///   202 +    "zip_create" | "zip_extract" | ...     ← green bg, green sign
+///
+/// Truncated to `max_lines`. `path` is used only for syntax detection —
+/// pass an empty string to disable highlighting and get plain-colored text.
+pub(crate) fn render_diff(old: &str, new: &str, path: &str, max_lines: usize) -> String {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::from_lines(old, new);
 
-    // Gutter width from whichever side has more lines, +1 for safety on
-    // the exclusive upper bound similar reports.
     let max_line_no = old.lines().count().max(new.lines().count()).max(1);
-    let width = max_line_no.to_string().len();
+    let gutter_width = max_line_no.to_string().len();
+
+    // Syntax highlighter setup. We build these per-call because the diff
+    // render isn't on a hot path and the one-time cost of the syntax set
+    // (loaded from embedded binary data) is <50ms on first call, then
+    // cached in syntect's static tables for subsequent calls.
+    let ps = syntect::parsing::SyntaxSet::load_defaults_newlines();
+    let ts = syntect::highlighting::ThemeSet::load_defaults();
+    // base16-ocean.dark has sensible defaults and reads well on both dark
+    // and light terminals; users who want true theme integration can
+    // customise later.
+    let theme = &ts.themes["base16-ocean.dark"];
+    let syntax = detect_syntax_for_path(&ps, path);
 
     let mut out = String::new();
     let mut rendered = 0usize;
@@ -351,28 +403,32 @@ pub(crate) fn render_diff(old: &str, new: &str, max_lines: usize) -> String {
             skipped += 1;
             continue;
         }
-        // Pick the relevant line number for this side of the diff.
         let lineno = match change.tag() {
             ChangeTag::Delete => change.old_index(),
             ChangeTag::Insert => change.new_index(),
             ChangeTag::Equal => change.new_index(),
         };
         let lineno = lineno.map(|n| n + 1).unwrap_or(0);
-        let lineno_str = format!("{:>width$}", lineno, width = width);
+        let lineno_str = format!("{:>width$}", lineno, width = gutter_width);
 
-        // Colour palette — bright green for inserts, bright red for
-        // deletes, dim for context. The gutter itself (line number + pipe)
-        // stays dim so the eye goes straight to the change.
-        let (sign, line_ansi, gutter_ansi) = match change.tag() {
-            ChangeTag::Delete => ("-", "\x1b[31m", "\x1b[2;31m"),
-            ChangeTag::Insert => ("+", "\x1b[32m", "\x1b[2;32m"),
-            ChangeTag::Equal => (" ", "\x1b[2;37m", "\x1b[2;37m"),
+        // Background + sign colouring per tag. Background uses 256-colour
+        // codes (52 = dark red, 22 = dark green) so the row stays visible
+        // without overpowering the foreground.
+        let (sign, bg_ansi, sign_fg) = match change.tag() {
+            ChangeTag::Delete => ("-", "\x1b[48;5;52m", "\x1b[91m"),
+            ChangeTag::Insert => ("+", "\x1b[48;5;22m", "\x1b[92m"),
+            ChangeTag::Equal => (" ", "", "\x1b[2;37m"),
         };
 
         let raw = change.to_string();
         let body = raw.strip_suffix('\n').unwrap_or(&raw);
+        // Highlight the body if we have a syntax; else fall back to plain.
+        let highlighted_body = highlight_line(syntax, theme, &ps, body);
+
+        // Gutter (line number + separator) is always dim, no background.
+        // Then row: background + sign + highlighted body + reset.
         out.push_str(&format!(
-            "{gutter_ansi}{lineno_str} \u{2502}\x1b[0m {line_ansi}{sign} {body}\x1b[0m\n"
+            "\x1b[2;37m{lineno_str} \u{2502}\x1b[0m {bg_ansi}{sign_fg}{sign}\x1b[39m {highlighted_body}\x1b[0m\n"
         ));
         rendered += 1;
     }
@@ -386,6 +442,44 @@ pub(crate) fn render_diff(old: &str, new: &str, max_lines: usize) -> String {
         out.pop();
     }
     out
+}
+
+/// Pick a syntect syntax definition from a file path. Falls back to plain
+/// text when the extension is unknown or the path is empty.
+fn detect_syntax_for_path<'a>(
+    ps: &'a syntect::parsing::SyntaxSet,
+    path: &str,
+) -> &'a syntect::parsing::SyntaxReference {
+    use std::path::Path;
+    if path.is_empty() {
+        return ps.find_syntax_plain_text();
+    }
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        if let Some(s) = ps.find_syntax_by_extension(ext) {
+            return s;
+        }
+    }
+    // Try first line detection (shebangs etc.) if we had content here;
+    // we don't, so just plain text.
+    ps.find_syntax_plain_text()
+}
+
+/// Highlight a single line of source. Returns an ANSI-coloured string.
+/// Syntax-highlighting failures (corrupt theme, etc.) downgrade to
+/// returning the unstyled line rather than failing the whole diff render.
+fn highlight_line(
+    syntax: &syntect::parsing::SyntaxReference,
+    theme: &syntect::highlighting::Theme,
+    ps: &syntect::parsing::SyntaxSet,
+    line: &str,
+) -> String {
+    use syntect::easy::HighlightLines;
+    use syntect::util::as_24_bit_terminal_escaped;
+    let mut h = HighlightLines::new(syntax, theme);
+    match h.highlight_line(line, ps) {
+        Ok(ranges) => as_24_bit_terminal_escaped(&ranges[..], false),
+        Err(_) => line.to_string(),
+    }
 }
 
 /// Count added / removed lines between `old` and `new`. Cheap — the full

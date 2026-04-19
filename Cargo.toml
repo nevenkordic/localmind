@@ -58,6 +58,10 @@ once_cell = "1"
 regex = "1"
 dotenvy = "0.15"
 similar = "2"
+# Syntax-highlighted diff previews. fancy-regex keeps the binary ~4 MB lighter
+# than the default onig dependency; default-syntaxes/themes bundle ~200
+# language definitions and a handful of themes into the binary.
+syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 
 # document parsing
 pdf-extract = "0.7"
