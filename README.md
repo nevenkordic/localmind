@@ -72,6 +72,26 @@ llm models                  # interactive picker
 llm models --chat qwen2.5-coder:32b --vision gemma3:27b
 ```
 
+## Backup / move to another machine
+
+Your memory DB (facts, skills, embeddings, KG) is a single SQLite file. Two
+commands let you copy it around safely — no need to re-teach on a new laptop.
+
+```bash
+llm backup                          # writes ~/localmind-backup-YYYYMMDD-HHMMSS.db
+llm backup /path/to/somewhere.db    # explicit destination
+
+# On the new machine (or after `ollama pull` elsewhere):
+llm restore /path/to/somewhere.db   # prompts y/N before overwriting
+llm restore ...  --yes              # skip the prompt (required in non-TTY)
+```
+
+`backup` uses SQLite's `VACUUM INTO` — safe to run while localmind is in use
+and produces a self-contained file (no need for WAL/shm sidecars). `restore`
+keeps your previous DB at `memory.db.bak-before-restore` so you can roll back
+if something looks wrong. Quit any other running `llm` processes before
+restoring so nothing races the file swap.
+
 ## Update
 
 `localmind` checks GitHub for a newer release once every 24 hours (cached in

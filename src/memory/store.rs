@@ -79,6 +79,49 @@ impl Store {
         })
     }
 
+    /// Make a self-contained copy of the database at `dest`. Uses SQLite's
+    /// `VACUUM INTO`, which produces a fully-defragmented single-file copy
+    /// that doesn't depend on the original WAL / journal — safe to ship via
+    /// scp / AirDrop / USB without losing data. Refuses to overwrite an
+    /// existing destination so a mistyped path can't clobber an older
+    /// backup.
+    pub async fn backup(&self, dest: &std::path::Path) -> Result<u64> {
+        if dest.exists() {
+            anyhow::bail!(
+                "backup destination already exists: {} (refusing to overwrite)",
+                dest.display()
+            );
+        }
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+        let inner = self.inner.clone();
+        let dest_owned = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            // `VACUUM INTO ?1` requires the path as a bound parameter; using
+            // plain string interpolation would risk SQL injection through a
+            // malicious filename.
+            conn.execute(
+                "VACUUM INTO ?1",
+                rusqlite::params![dest_owned.to_str().ok_or_else(|| anyhow::anyhow!(
+                    "backup path is not valid UTF-8: {:?}",
+                    dest_owned
+                ))?],
+            )
+            .context("VACUUM INTO")?;
+            Ok(())
+        })
+        .await??;
+        let bytes = std::fs::metadata(dest)
+            .with_context(|| format!("reading size of {}", dest.display()))?
+            .len();
+        Ok(bytes)
+    }
+
     /// Run embedded migrations. Idempotent — safe to call on every startup.
     pub async fn migrate(&self) -> Result<()> {
         let inner = self.inner.clone();

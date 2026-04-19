@@ -78,6 +78,22 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Write a portable copy of the memory database to a file. Default path:
+    /// ~/localmind-backup-YYYYMMDD-HHMMSS.db. Safe to run while localmind is
+    /// in use (uses SQLite VACUUM INTO).
+    Backup {
+        /// Destination file. Omit for a timestamped filename in $HOME.
+        path: Option<PathBuf>,
+    },
+    /// Replace the memory database with the contents of a backup file. Keeps
+    /// a .bak-before-restore copy of your current DB in case you want it back.
+    Restore {
+        /// Path to a backup .db file produced by `llm backup`.
+        path: PathBuf,
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Pick which Ollama models to use (interactive picker, or set via flags).
     Models {
         /// Just list installed models and current selections, then exit.
@@ -185,7 +201,10 @@ async fn main() -> Result<()> {
         .context("opening memory store")?;
     store.migrate().await.context("running migrations")?;
 
-    // Start the background embedding worker.
+    // Start the background embedding worker. Restore is the one command
+    // where the worker could race with us (it writes outbox rows to the
+    // old DB mid-copy), so the dispatcher below aborts the handle before
+    // running the restore itself.
     let embedder_handle = memory::embedder::spawn(store.clone(), cfg.clone());
 
     let command = cli.command.unwrap_or(Command::Chat {
@@ -239,6 +258,17 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Backup { path } => backup_cmd(&cfg, &store, path).await,
+        Command::Restore { path, yes } => {
+            // Stop the background embedder before swapping the file — it
+            // holds an open handle to the current DB and would otherwise
+            // write outbox rows into the about-to-be-renamed file. Abort
+            // is cooperative; give the worker a small grace period to
+            // drop its Connection before the copy starts.
+            embedder_handle.abort();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            restore_cmd(&cfg, &store, &path, yes).await
+        }
         Command::Update { force } => {
             println!("current version: v{}", update::current_version());
             match update::fetch_and_cache().await {
@@ -278,6 +308,139 @@ async fn main() -> Result<()> {
 
     embedder_handle.abort();
     result
+}
+
+async fn backup_cmd(
+    cfg: &config::Config,
+    store: &memory::Store,
+    dest: Option<PathBuf>,
+) -> Result<()> {
+    let dest = dest.unwrap_or_else(default_backup_path);
+    if dest.exists() {
+        anyhow::bail!(
+            "destination already exists: {} — pick another path or remove it first",
+            dest.display()
+        );
+    }
+    println!("source:      {}", cfg.memory.db_path_resolved().display());
+    println!("destination: {}", dest.display());
+    let bytes = store.backup(&dest).await.context("running VACUUM INTO")?;
+    println!("wrote {} bytes", bytes);
+    println!();
+    println!("Ship it:");
+    println!("  scp {} user@host:", dest.display());
+    println!("  llm restore {}", dest.display());
+    Ok(())
+}
+
+async fn restore_cmd(
+    cfg: &config::Config,
+    store: &memory::Store,
+    src: &std::path::Path,
+    yes: bool,
+) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !src.exists() {
+        anyhow::bail!("backup file not found: {}", src.display());
+    }
+    validate_localmind_backup(src)?;
+    let dest = cfg.memory.db_path_resolved();
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "refusing to replace {} in non-interactive mode — pass --yes to skip the prompt",
+                dest.display()
+            );
+        }
+        use std::io::Write;
+        eprint!(
+            "Replace \x1b[1m{}\x1b[0m with \x1b[1m{}\x1b[0m?\nThis overwrites your current memory. A .bak-before-restore copy will be kept. [y/N] ",
+            dest.display(),
+            src.display()
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+
+    // Note: other localmind processes could still have the DB open — this
+    // command only races safely with itself. Close other sessions before
+    // running. The in-process embedder is aborted in main before we get
+    // here (see the Restore guard there).
+    let _ = store;
+
+    if dest.exists() {
+        let bak = dest.with_file_name(format!(
+            "{}.bak-before-restore",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("memory.db")
+        ));
+        // Remove any stale bak so consecutive restores don't fail.
+        if bak.exists() {
+            std::fs::remove_file(&bak).ok();
+        }
+        std::fs::rename(&dest, &bak)
+            .with_context(|| format!("moving current DB aside to {}", bak.display()))?;
+        println!("kept previous DB at {}", bak.display());
+    } else if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    std::fs::copy(src, &dest)
+        .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
+    // Also wipe any leftover WAL / SHM from the replaced DB so SQLite
+    // doesn't try to replay journals that don't match the new file.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let side = dest.with_file_name(format!(
+            "{}{suffix}",
+            dest.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        ));
+        let _ = std::fs::remove_file(side);
+    }
+
+    let bytes = std::fs::metadata(&dest)?.len();
+    println!("✓ restored {} bytes to {}", bytes, dest.display());
+    Ok(())
+}
+
+fn default_backup_path() -> PathBuf {
+    let home = directories::UserDirs::new()
+        .and_then(|u| Some(u.home_dir().to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    home.join(format!("localmind-backup-{ts}.db"))
+}
+
+/// Minimal sanity check that a candidate file is actually a localmind
+/// backup — opens it read-only and confirms the `memories` table is there.
+/// Catches the case where a user fat-fingers the path and points at a
+/// random SQLite file (or a totally unrelated file).
+fn validate_localmind_backup(path: &std::path::Path) -> Result<()> {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {} as SQLite", path.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+        .context("querying sqlite_master")?;
+    let found = stmt
+        .query_row([], |_| Ok(()))
+        .optional()
+        .context("checking for memories table")?
+        .is_some();
+    if !found {
+        anyhow::bail!(
+            "{} is a SQLite file but not a localmind backup — no 'memories' table",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store) -> Result<()> {
