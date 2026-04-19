@@ -319,7 +319,19 @@ impl AgentRun {
                 r
             };
 
-            let reply = reply_res?;
+            let mut reply = reply_res?;
+            // Small models (qwen2.5-coder:3b in particular) sometimes write
+            // what a tool response would LOOK like — e.g. a `<tool_response>`
+            // block with "[Content of the file]" — instead of actually
+            // calling the tool. Detect and either strip (if the model also
+            // produced a real reply around the fabrication) or replace with
+            // a clear "I didn't actually run that — escalate to chat_model"
+            // error so the user sees the failure instead of fake content.
+            if reply.tool_calls.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
+                if let Some(scrubbed) = scrub_hallucinated_tool_output(&reply.content) {
+                    reply.content = scrubbed;
+                }
+            }
             self.messages.push(reply.clone());
             match reply.tool_calls.as_ref() {
                 Some(calls) if !calls.is_empty() => {
@@ -405,7 +417,7 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_facts, is_trivial_turn, should_use_fast};
+    use super::{extract_facts, is_trivial_turn, scrub_hallucinated_tool_output, should_use_fast};
 
     fn first(input: &str) -> Option<(String, String, String)> {
         extract_facts(input).into_iter().next()
@@ -523,6 +535,73 @@ mod tests {
     }
 
     #[test]
+    fn scrubs_fabricated_tool_response_block() {
+        let fake = "<tool_response>\nPDF Content:\n[Content of the PDF file]\n</tool_response>";
+        let out = scrub_hallucinated_tool_output(fake).expect("should scrub");
+        assert!(out.contains("fake"));
+        assert!(out.contains("/retry-big"));
+        assert!(out.contains("qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn scrubs_fabrication_across_every_tool_category() {
+        // One sample per tool family — if a 3B model would have fabricated
+        // it, scrub should catch it.
+        let samples = [
+            "[Content of the file]",                   // read_file
+            "[Content of the PDF]",                    // read_pdf
+            "[Document content here]",                 // read_docx
+            "[Spreadsheet content: rows follow]",      // read_xlsx
+            "[Image description here]",                // read_image
+            "[Command output: ls -la]",                // shell
+            "[Shell output here]",                     // shell (variant)
+            "[Webpage content from https://x.com]",    // web_fetch
+            "[HTML content]",                          // web_fetch (variant)
+            "[Response body: {...}]",                  // http_fetch
+            "[Search results here: ...]",              // web_search
+            "[Query results]",                         // search_memory
+            "[DNS result: A record]",                  // dns_lookup
+            "[Whois result: ...]",                     // whois
+            "[Port status here]",                      // port_check
+            "[Output here]",                           // generic
+            "[Tool result]",                           // generic
+        ];
+        for s in samples {
+            assert!(
+                scrub_hallucinated_tool_output(s).is_some(),
+                "expected scrub for: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_legitimate_prose_alone() {
+        // A reply that genuinely just answers the user without fabricating
+        // tool output must not be clobbered.
+        let real = "Your name is Neven Kordic based on the memory recall.";
+        assert!(scrub_hallucinated_tool_output(real).is_none());
+    }
+
+    #[test]
+    fn leaves_literal_bracket_mentions_alone() {
+        // Messages that HAPPEN to contain square brackets but aren't fake-
+        // tool-response placeholders must not trigger.
+        let benign = [
+            "I got a [warning] flag from the linter in [src/foo.rs].",
+            "timestamp [2024-01-15T10:00:00Z]",
+            "see section [1.2.3] of the spec",
+            "[INFO] starting worker",
+            "the array was [1, 2, 3] before the fix",
+        ];
+        for s in benign {
+            assert!(
+                scrub_hallucinated_tool_output(s).is_none(),
+                "false positive on: {s}"
+            );
+        }
+    }
+
+    #[test]
     fn extracts_name_and_remember_together() {
         // Single input may carry multiple facts (one per line).
         let facts = extract_facts("My name is Cory.\nremember I prefer 4-space indent");
@@ -533,6 +612,86 @@ mod tests {
             .iter()
             .any(|(_, c, k)| k == "note" && c.contains("4-space")));
     }
+}
+
+/// Detect when the model fabricated a tool response in its own text (a
+/// failure mode on smaller models — they emit `<tool_response>...`
+/// blocks or placeholder brackets instead of actually calling the tool).
+///
+/// Returns `Some(replacement)` when the content contains a red-flag
+/// pattern. The replacement is an honest error the user can act on:
+/// try `/retry-big` or configure a larger chat_model.
+///
+/// Returns `None` when the content looks legitimate (most turns).
+///
+/// Covers every tool localmind offers — not just PDF:
+///   files: read_file, read_pdf, read_docx, read_xlsx, read_image
+///   memory: search_memory (fake-hit fabrication)
+///   web:   web_search, web_fetch, http_fetch
+///   shell: shell (fake stdout)
+///   net:   port_check, dns_lookup, whois (fake results)
+/// New placeholders can be added here; false positives are cheap to
+/// diagnose (the replacement tells the user what was flagged) whereas
+/// silent hallucinations corrupt memory and mislead the user.
+pub(crate) fn scrub_hallucinated_tool_output(content: &str) -> Option<String> {
+    let lower = content.to_ascii_lowercase();
+    // Protocol tag — NEVER legitimately present in assistant text; only the
+    // tool-result message role is allowed to carry tool output.
+    if lower.contains("<tool_response>") || lower.contains("</tool_response>") {
+        return Some(hallucination_error("<tool_response>"));
+    }
+    // Placeholder brackets. Tuned against real hallucinations seen in the
+    // wild; patterns are distinctive enough (no legitimate prose talks about
+    // "[Content of the ___]") that false positives are rare.
+    const RED_FLAGS: &[&str] = &[
+        // file contents
+        "[content of",        // covers "[Content of the file]", "[Content of the PDF]", etc.
+        "[contents of",       // plural variant
+        "[file contents]",
+        "[file content]",
+        "[pdf content",
+        "[document content",
+        "[spreadsheet content",
+        "[image content",
+        "[image description",
+        "[extracted text]",
+        // shell / command output
+        "[command output",
+        "[shell output",
+        "[stdout here]",
+        "[stderr here]",
+        // web
+        "[webpage content",
+        "[webpage text",
+        "[page content",
+        "[html content",
+        "[response body",
+        // network / memory
+        "[query results]",
+        "[search results here",
+        "[dns result",
+        "[whois result",
+        "[port status here]",
+        // generic
+        "[output here]",
+        "[results here]",
+        "[result here]",
+        "[response here]",
+        "[tool output]",
+        "[tool result]",
+    ];
+    let hit = RED_FLAGS.iter().find(|flag| lower.contains(*flag))?;
+    Some(hallucination_error(hit))
+}
+
+fn hallucination_error(flag: &str) -> String {
+    format!(
+        "(localmind: the model emitted a fake `{flag}` block instead of actually \
+         calling a tool — no real result was produced. This usually means the current \
+         chat_model is too small for reliable tool use. Try `/retry-big` to re-run on \
+         [ollama].chat_model, or switch to a larger model with \
+         `llm models --chat qwen2.5-coder:7b`.)"
+    )
 }
 
 /// Cascade router heuristic: true if this turn should run on `fast_model`.

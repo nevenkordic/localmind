@@ -156,6 +156,14 @@ TOOL CALL FORMAT
   plain prose. When you do call a tool, wait for its result in the next turn
   before writing your final answer.
 
+  NEVER FABRICATE TOOL OUTPUT. Do not write fake `<tool_response>` blocks,
+  invented file contents, invented command output, invented web-fetch
+  results, or placeholders like "[Content of the file]" / "[results here]"
+  in your reply. If you need the content of a file, CALL `read_file` or
+  `read_pdf` and wait for the result — do not paraphrase, summarise, or
+  guess what it would say. If you cannot call the tool, say so plainly;
+  don't pretend you did.
+
 Always address the user directly. No meta-commentary about being an AI."#;
 
 #[cfg(test)]
