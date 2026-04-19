@@ -2,7 +2,64 @@
 //! code + networking + security + admin, running locally, no cloud.
 
 pub fn render() -> String {
-    r#"You are localmind, a local AI assistant running on the user's machine.
+    let env_block = environment_block();
+    let body = BODY;
+    format!("{env_block}\n{body}")
+}
+
+/// Dynamic ENVIRONMENT section prepended to the static prompt body. Gives
+/// the model concrete OS / home / cwd facts so it doesn't default to Linux
+/// conventions on macOS (e.g. writing to `/home/user/Desktop/...` which
+/// macOS rejects with EOPNOTSUPP — `/home` is an autofs mount point, not a
+/// real directory).
+fn environment_block() -> String {
+    let os = os_label();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "<unknown>".into());
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "<unknown>".into());
+
+    let mut out = String::new();
+    out.push_str("ENVIRONMENT (authoritative — do not assume different paths)\n");
+    out.push_str(&format!("  os:       {os}\n"));
+    out.push_str(&format!("  user:     {user}\n"));
+    out.push_str(&format!("  home:     {home}\n"));
+    out.push_str(&format!("  cwd:      {cwd}\n"));
+    out.push_str(&format!("  desktop:  {home}/Desktop\n"));
+    out.push_str(&format!("  documents: {home}/Documents\n"));
+    if cfg!(target_os = "macos") {
+        out.push_str(
+            "  NOTE: macOS home directories live under /Users/<name>. DO NOT write to \
+             /home/<name> — that path is an autofs mount point and will fail with \
+             EOPNOTSUPP even with workspace permissions.\n",
+        );
+    } else if cfg!(target_os = "windows") {
+        out.push_str(
+            "  NOTE: Windows paths use backslashes (C:\\Users\\...). Forward slashes \
+             work in most tools but the canonical form uses backslashes.\n",
+        );
+    }
+    out
+}
+
+fn os_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "unknown-unix"
+    }
+}
+
+const BODY: &str = r#"You are localmind, a local AI assistant running on the user's machine.
 No cloud. No telemetry. You help with:
 
   * writing, reviewing, and debugging code
@@ -68,6 +125,9 @@ OPERATING RULES
    model was trained, use web_search.
 7. Keep tool calls small and targeted. One-shot: search_memory -> read_file
    -> edit -> store_memory is a good pattern.
+8. FILE PATHS — always use the paths from the ENVIRONMENT block above.
+   If the user says "Desktop", use the `desktop:` value, not a guessed path.
+   On macOS this means `/Users/<name>/Desktop`, NEVER `/home/<name>/Desktop`.
 
 TOOLS AVAILABLE (names only — schemas are provided separately):
   read_file, write_file, list_dir,
@@ -96,6 +156,26 @@ TOOL CALL FORMAT
   plain prose. When you do call a tool, wait for its result in the next turn
   before writing your final answer.
 
-Always address the user directly. No meta-commentary about being an AI."#
-        .to_string()
+Always address the user directly. No meta-commentary about being an AI."#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_block_includes_os_and_home() {
+        let p = render();
+        assert!(p.contains("ENVIRONMENT"));
+        // HOME is set for the test runner regardless of platform.
+        assert!(p.contains("home:"));
+        assert!(p.contains("desktop:"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_prompt_warns_against_home_autofs() {
+        let p = render();
+        assert!(p.contains("/Users/<name>"));
+        assert!(p.contains("DO NOT write to /home"));
+    }
 }
