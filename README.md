@@ -2,6 +2,8 @@
 
 Run any local LLM with persistent memory.
 
+![localmind REPL banner](docs/banner.png)
+
 ## What it is
 
 A single CLI binary (`llm`) that turns an [Ollama](https://ollama.com)-served
