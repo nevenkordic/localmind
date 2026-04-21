@@ -91,9 +91,9 @@ async fn structured_tool_call_is_dispatched_and_loop_terminates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_form_tool_call_is_recovered_end_to_end() {
-    // Regression: qwen often emits a tool call as `name key="value"` text in
-    // the message content instead of structured `tool_calls`. The agent must
-    // recover, dispatch, and continue the loop.
+    // Regression: some models emit a tool call as `name key="value"` text
+    // in the message content instead of structured `tool_calls`. The agent
+    // must recover, dispatch, and continue the loop.
     let mock = MockOllama::start(vec![
         MockReply::chat_text_form_tool_call(r#"search_memory query="test query" top_k=3"#),
         MockReply::chat_text("recovered and answered"),
@@ -281,9 +281,9 @@ async fn name_persists_across_sessions_via_auto_extract() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loose_call_recovery_fires_for_thinking_out_loud() {
-    // Regression: qwen "thinks out loud" — emits `<read_only_tool> <free text>`
-    // with no `=`, no JSON. We recover by mapping the remainder to the tool's
-    // primary string arg.
+    // Regression: models that "think out loud" emit `<read_only_tool>
+    // <free text>` with no `=`, no JSON. We recover by mapping the
+    // remainder to the tool's primary string arg.
     let mock = MockOllama::start(vec![
         MockReply::chat_text_form_tool_call("search_memory what do you know about the user"),
         MockReply::chat_text("done thinking out loud"),

@@ -5,10 +5,10 @@
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
     memory_id    TEXT PRIMARY KEY,
-    embedding    float[768]           -- nomic-embed-text dimension
+    embedding    float[768]           -- 768 is the typical embed model dim
 );
 
--- Entity vectors — broodlink's `broodlink_kg_entities` Qdrant collection.
+-- Entity vectors — ANN index over the knowledge graph.
 CREATE VIRTUAL TABLE IF NOT EXISTS kg_entity_vec USING vec0(
     entity_id    TEXT PRIMARY KEY,
     embedding    float[768]

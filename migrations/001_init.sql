@@ -1,7 +1,7 @@
 -- localmind memory schema
--- Borrowed from nevenkordic/broodlink: multi-layer memory (versioned store +
--- FTS5 full-text + vector embeddings + knowledge graph + outbox). Collapsed
--- from Dolt/Postgres/Qdrant to a single SQLite file for a single-user tool.
+-- Multi-layer memory (versioned store + FTS5 full-text + vector
+-- embeddings + knowledge graph + outbox) collapsed into a single SQLite
+-- file for a single-user tool.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -32,8 +32,8 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 
 -- ---------------------------------------------------------------------------
--- Core memory — equivalent to broodlink's `agent_memory` table in Dolt.
--- Each row is a durable fact, decision, or extracted summary the agent keeps.
+-- Core memory. Each row is a durable fact, decision, or extracted
+-- summary the agent keeps.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memories (
     id            TEXT PRIMARY KEY,           -- uuid
@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 
 -- ---------------------------------------------------------------------------
--- Full-text search (BM25) — replaces broodlink's Postgres tsvector index.
+-- Full-text search (BM25) via SQLite's FTS5.
 -- ---------------------------------------------------------------------------
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -83,8 +83,8 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
--- Vector store — replaces broodlink's Qdrant `broodlink_memory` collection.
--- Embeddings are stored as little-endian f32 blobs and scored in Rust.
+-- Vector store. Embeddings stored as little-endian f32 blobs and
+-- scored in Rust.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memory_vectors (
     memory_id     TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS memory_vectors (
 );
 
 -- ---------------------------------------------------------------------------
--- Knowledge graph — mirrors broodlink's kg_entities / kg_edges in Postgres.
+-- Knowledge graph — entities + edges + provenance link to memories.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS kg_entities (
     id            TEXT PRIMARY KEY,           -- uuid
@@ -131,8 +131,8 @@ CREATE TABLE IF NOT EXISTS kg_entity_memories (
 );
 
 -- ---------------------------------------------------------------------------
--- Outbox — broodlink's async embedding pattern. The agent inserts a row
--- after writing a memory; the embedding worker polls, generates the vector,
+-- Outbox — async embedding pattern. The agent inserts a row after
+-- writing a memory; the embedding worker polls, generates the vector,
 -- upserts to memory_vectors, and marks the row done.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS embedding_outbox (

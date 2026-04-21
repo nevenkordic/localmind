@@ -61,7 +61,7 @@ impl MockReply {
     }
 
     /// Build a `/api/chat` reply where the model emits a text-form tool call
-    /// in `content` instead of structured `tool_calls` (qwen's quirk).
+    /// in `content` instead of structured `tool_calls`.
     pub fn chat_text_form_tool_call(text: &str) -> Self {
         Self::ok_json(serde_json::json!({
             "message": {

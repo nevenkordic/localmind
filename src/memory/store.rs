@@ -183,6 +183,59 @@ impl Store {
         Ok(id)
     }
 
+    /// Batch-fetch memories by id. Order of the returned vec is NOT
+    /// guaranteed to match the input order — callers that need
+    /// positional order should build a HashMap<id, StoredMemory> and
+    /// look up from there. Used by graph-based retrieval which has
+    /// ranked ids but doesn't care about DB-order.
+    pub async fn get_memories_by_ids(&self, ids: &[String]) -> Result<Vec<StoredMemory>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.clone();
+        let ids: Vec<String> = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
+            let conn = inner.lock().unwrap();
+            // Build an IN-clause dynamically. Safe because we only bind
+            // via positional params — the '?' placeholders are the only
+            // variable part of the SQL string.
+            let placeholders = (1..=ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, title, content, source, tags_json, importance,
+                        created_at, updated_at, accessed_at, access_count
+                 FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let bound: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(&bound[..], |row| {
+                let tags_json: String = row.get(5)?;
+                Ok(StoredMemory {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    source: row.get(4)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    importance: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    accessed_at: row.get(9)?,
+                    access_count: row.get(10)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
     #[allow(dead_code)]
     pub async fn get_memory(&self, id: &str) -> Result<Option<StoredMemory>> {
         let inner = self.inner.clone();
@@ -234,6 +287,45 @@ impl Store {
 
     /// List all memories of a given kind, ordered by importance then recency.
     /// Used by the `/skills` REPL command and similar audit views.
+    /// Return every memory, newest first. Used by the `memory reembed`
+    /// command which needs to walk the whole corpus. `limit` bounds the
+    /// response for debugging / partial re-embeds.
+    pub async fn list_all(&self, limit: usize) -> Result<Vec<StoredMemory>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
+            let conn = inner.lock().unwrap();
+            let mut stmt = conn.prepare(
+                r#"SELECT id, kind, title, content, source, tags_json, importance,
+                          created_at, updated_at, accessed_at, access_count
+                   FROM memories
+                   ORDER BY updated_at DESC
+                   LIMIT ?1"#,
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                let tags_json: String = row.get(5)?;
+                Ok(StoredMemory {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    source: row.get(4)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    importance: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    accessed_at: row.get(9)?,
+                    access_count: row.get(10)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
     pub async fn list_by_kind(&self, kind: &str, limit: usize) -> Result<Vec<StoredMemory>> {
         let inner = self.inner.clone();
         let kind = kind.to_string();
@@ -509,8 +601,17 @@ impl Store {
                      created_at=excluded.created_at"#,
                 params![id, dim, model, blob, norm, now],
             )?;
+            // memory_vec is a sqlite-vec virtual table. vec0 doesn't honour
+            // `INSERT OR REPLACE` / `ON CONFLICT` — the row has to be
+            // explicitly removed before re-insert, otherwise the ANN index
+            // rejects the second write with a UNIQUE-constraint error.
+            // Harmless when the row doesn't exist.
             conn.execute(
-                "INSERT OR REPLACE INTO memory_vec(memory_id, embedding) VALUES (?1, ?2)",
+                "DELETE FROM memory_vec WHERE memory_id = ?1",
+                params![id],
+            )?;
+            conn.execute(
+                "INSERT INTO memory_vec(memory_id, embedding) VALUES (?1, ?2)",
                 params![id, blob],
             )?;
             Ok(())
@@ -582,6 +683,149 @@ impl Store {
             )?;
             Ok(())
         }).await??;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Session / message persistence
+    // -----------------------------------------------------------------
+
+    /// Find or create the most-recent session for the given cwd. When a
+    /// session exists and was active within `max_age_secs`, its id is
+    /// reused (continuation). Otherwise a new session is created. This
+    /// keeps per-project conversations distinct without exposing explicit
+    /// session management to the user.
+    pub async fn session_get_or_create(
+        &self,
+        cwd: &str,
+        max_age_secs: i64,
+    ) -> Result<(String, bool)> {
+        let inner = self.inner.clone();
+        let cwd = cwd.to_string();
+        let now = util::now_ts();
+        tokio::task::spawn_blocking(move || -> Result<(String, bool)> {
+            let conn = inner.lock().unwrap();
+            let existing: Option<String> = conn
+                .query_row(
+                    r#"SELECT id FROM sessions
+                       WHERE cwd = ?1 AND last_active >= ?2
+                       ORDER BY last_active DESC LIMIT 1"#,
+                    params![cwd, now - max_age_secs],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(id) = existing {
+                conn.execute(
+                    "UPDATE sessions SET last_active = ?1 WHERE id = ?2",
+                    params![now, id],
+                )?;
+                return Ok((id, false));
+            }
+            let id = util::new_uuid();
+            conn.execute(
+                r#"INSERT INTO sessions(id, title, started_at, last_active, cwd, metadata_json)
+                   VALUES (?1, '', ?2, ?2, ?3, '{}')"#,
+                params![id, now, cwd],
+            )?;
+            Ok((id, true))
+        })
+        .await?
+    }
+
+    /// Append one message to a session. `extras_json` is free-form JSON
+    /// carrying tool_calls + tool_call_id so we don't need a schema
+    /// migration for fields not present at v1 of the table.
+    pub async fn append_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_name: Option<&str>,
+        extras_json: Option<&str>,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        let tool_name = tool_name.map(|s| s.to_string());
+        let extras_json = extras_json.map(|s| s.to_string());
+        let now = util::now_ts();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO messages(session_id, role, content, tool_name, tool_args_json, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![session_id, role, content, tool_name, extras_json, now],
+            )?;
+            conn.execute(
+                "UPDATE sessions SET last_active = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Load the last `limit` messages for a session in chronological
+    /// order. Returns (role, content, tool_name, extras_json) tuples —
+    /// the caller reconstructs ChatMessage from these.
+    pub async fn load_recent_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+        let inner = self.inner.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+                let conn = inner.lock().unwrap();
+                // Pull the newest `limit` rows, then reverse so the caller
+                // gets them in chronological order.
+                let mut stmt = conn.prepare(
+                    r#"SELECT role, content, tool_name, tool_args_json
+                       FROM messages
+                       WHERE session_id = ?1
+                       ORDER BY id DESC
+                       LIMIT ?2"#,
+                )?;
+                let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                out.reverse();
+                Ok(out)
+            },
+        )
+        .await?
+    }
+
+    /// Clear all messages for a session (used by the `/new` slash command).
+    /// Leaves the session row itself in place so subsequent messages in
+    /// the same cwd land in a logically-fresh conversation; the row's
+    /// started_at is refreshed to mark the reset point.
+    pub async fn clear_session_messages(&self, session_id: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let session_id = session_id.to_string();
+        let now = util::now_ts();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            conn.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+            conn.execute(
+                "UPDATE sessions SET started_at = ?1, last_active = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 }

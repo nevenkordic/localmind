@@ -46,6 +46,34 @@ pub struct OllamaConfig {
     /// cold-load penalty on any idle gap longer than that.
     #[serde(default = "default_keep_alive")]
     pub keep_alive: String,
+    /// Sampling temperature. Lower (~0.2) is tight/deterministic and
+    /// suits strict coding models; reasoning MoEs typically do better
+    /// around 0.6. Default 0.3 is a compromise that works acceptably
+    /// for both.
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    /// Nucleus sampling. 0.95 is the Ollama default and a good all-rounder.
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    /// Auto-compact the in-session message history when it exceeds this
+    /// fraction of `num_ctx`. A summariser LLM call replaces the oldest
+    /// middle messages with a single system message; the system prompt
+    /// and the last `compact_keep_tail` messages are preserved verbatim.
+    /// Fires only between turns, never mid-tool-loop. Set to 0.0 to
+    /// disable auto-compaction (the `/compact` slash command still works).
+    #[serde(default = "default_auto_compact_at")]
+    pub auto_compact_at: f32,
+    /// Messages preserved verbatim at the tail during compaction. Larger
+    /// = safer but less context reclaimed.
+    #[serde(default = "default_compact_keep_tail")]
+    pub compact_keep_tail: usize,
+    /// How many messages to pull from the previous session when `llm`
+    /// launches in a directory with recent activity. Small values keep
+    /// short-term continuity without letting stale prior-session style
+    /// anchor the model's behaviour on the new turn. Set to 0 to
+    /// disable auto-resume entirely.
+    #[serde(default = "default_resume_messages")]
+    pub resume_messages: usize,
 }
 fn default_timeout() -> u64 {
     600
@@ -56,12 +84,30 @@ fn default_ctx() -> u32 {
 fn default_keep_alive() -> String {
     "30m".into()
 }
+fn default_temperature() -> f32 {
+    0.3
+}
+fn default_top_p() -> f32 {
+    0.95
+}
+fn default_auto_compact_at() -> f32 {
+    0.75
+}
+fn default_compact_keep_tail() -> usize {
+    8
+}
+fn default_resume_messages() -> usize {
+    8
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     pub db_path: String,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    /// Legacy score-fusion weights. Kept for backwards compat but ignored
+    /// when fusion is RRF (the default) — RRF is rank-based and
+    /// parameter-free, removing the tuning cliff.
     #[serde(default = "default_bm25_weight")]
     pub bm25_weight: f32,
     #[serde(default = "default_vector_weight")]
@@ -77,6 +123,38 @@ pub struct MemoryConfig {
     /// no model round-trip — ~10× faster on a fresh Ollama).
     #[serde(default = "default_vector_search")]
     pub vector_search: bool,
+    /// Contextual Retrieval — before embedding a stored memory, ask the
+    /// LLM for a one-sentence context line and prepend it. Improves recall
+    /// on short/ambiguous notes at the cost of one extra call per insert
+    /// on the background embedding worker. Off by default.
+    #[serde(default)]
+    pub contextual_embed: bool,
+    /// Entity extraction — ask the LLM for entities + relationships in
+    /// each stored memory and populate `kg_entities` / `kg_edges` /
+    /// `kg_entity_memories`. One extra chat call per insert on the
+    /// background worker. Required to unlock graph-based retrieval.
+    /// Off by default.
+    #[serde(default)]
+    pub entity_extraction: bool,
+    /// Graph-based retrieval. When true, hybrid_search runs
+    /// Personalized PageRank over the entity graph seeded from query
+    /// entities, aggregates per-memory, and fuses the result with BM25
+    /// + vector via RRF. Requires `entity_extraction = true` to have
+    /// useful content in the graph; harmless (returns empty) otherwise.
+    /// `hippo_rag` accepted as an alias for backwards compat.
+    #[serde(default, alias = "hippo_rag")]
+    pub graph_search: bool,
+    /// LLM-as-judge reranker. When set, after hybrid_search returns its
+    /// top-N, this model rescores (query, doc) pairs and the final top_k
+    /// is taken from that reranked list. Recommended: a small/fast model
+    /// distinct from chat_model. Empty string disables reranking entirely.
+    #[serde(default)]
+    pub rerank_model: String,
+    /// Pool size fed to the reranker. Hybrid search returns this many
+    /// candidates; reranker picks top_k from them. Larger = better recall,
+    /// slower. Ignored when rerank_model is empty.
+    #[serde(default = "default_rerank_fetch_k")]
+    pub rerank_fetch_k: usize,
 }
 fn default_top_k() -> usize {
     12
@@ -97,6 +175,9 @@ fn default_expansion() -> usize {
 }
 fn default_vector_search() -> bool {
     true
+}
+fn default_rerank_fetch_k() -> usize {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

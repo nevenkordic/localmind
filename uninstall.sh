@@ -12,8 +12,8 @@
 #
 # Environment overrides:
 #   LOCALMIND_PURGE_DATA=1    also delete the memory DB, audit log, history
-#   LOCALMIND_PURGE_MODELS=1  also `ollama rm` the default models this
-#                             installer pulled (qwen2.5-coder:7b + nomic-embed-text)
+#   LOCALMIND_PURGE_MODELS=1  also `ollama rm` the default chat and
+#                             embed models (see CHAT_MODEL / EMBED_MODEL below)
 #   LOCALMIND_CHAT_MODEL      override which chat model is removed on purge
 #   LOCALMIND_EMBED_MODEL     override which embed model is removed on purge
 

@@ -15,8 +15,11 @@ no dependencies beyond Ollama.
 
 - Talk to any local chat / vision / embedding model Ollama has installed.
 - Remember what you tell it across sessions. Facts, decisions, skills,
-  embeddings — all in one SQLite file you can back up or move.
-- Recall relevant prior context automatically at the start of every turn.
+  embeddings, an entity graph — all in one SQLite file you can back up
+  or move.
+- Recall relevant prior context automatically at the start of every turn
+  via a hybrid BM25 + vector + graph retriever.
+- Resume each session where you left off, per working directory.
 - Read files, PDFs, docx, xlsx, images. Describe images with vision models.
 - Run shell, networking, and web tools with per-call permission prompts and
   a hard credential deny-list.
@@ -25,55 +28,101 @@ no dependencies beyond Ollama.
 
 ```
 you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop  ─►  streamed reply
-                    │                      │                 │
-                    ▼                      ▼                 ▼
-              SQLite memory.db       BM25 + vector ANN    tool calls
+                    │                       │                 │
+                    ▼                       ▼                 ▼
+              SQLite memory.db      BM25 + vector +       tool calls
+                                    graph, fused by RRF
 ```
 
 1. **Auto-extract.** A regex catches obvious directives (`my name is X`,
    `call me X`, `remember X`) before the model sees the turn. Stored
    regardless of whether the model would have called `store_memory`.
-2. **Recall.** Hybrid search (BM25 + vector, fused) over past memories is
-   run concurrently, and the top hits are injected as a system message.
-   BM25 and the embed round-trip execute in parallel so recall latency is
-   the slower of the two, not the sum. Trivial turns (`hi`, `ok`, `thanks`)
-   skip recall entirely.
+2. **Recall.** Three retrievers run concurrently: BM25 (FTS5), vector
+   ANN (sqlite-vec), and optional graph retrieval (Personalized PageRank
+   over the entity graph). Results are fused via Reciprocal Rank Fusion —
+   rank-based, parameter-free — then pruned by temporal decay. An optional
+   LLM-as-judge reranker can rescore the top N before the final cut.
+   Trivial turns (`hi`, `ok`, `thanks`) skip recall entirely.
 3. **Agent loop.** The model sees tool specs and may call `read_file`,
    `shell`, `web_fetch`, `store_memory`, etc. Side-effecting tools are
    gated by the permission mode and / or prompt before running.
 4. **Streamed reply.** Tokens are printed as they're generated — no long
-   "thinking…" pause before the wall of text drops.
-5. **Persistence.** New facts, skills, and conversation summaries are
-   written back to SQLite and embedded in the background.
+   "thinking…" pause before the wall of text drops. Reasoning-model
+   chain-of-thought (`<think>…</think>`) is filtered out; only the final
+   answer reaches the transcript.
+5. **Persistence.** Conversation messages, new memories, and extracted
+   entities are written back to SQLite. Embedding + entity extraction
+   run on a background worker so turns never wait on them.
+6. **Context care.** When the live message history approaches `num_ctx`,
+   a summariser compacts the oldest middle messages into a single system
+   message automatically — the system prompt and last few turns stay
+   verbatim. `/compact` triggers manually.
 
 ## Features
 
-- **Portable memory.** Single SQLite file, `llm backup` / `llm restore` copy
-  it cleanly between machines. No re-teaching.
-- **Hybrid recall.** BM25 + vector ANN via `sqlite-vec`, fused with
-  temporal decay. Falls back to pure BM25 with one config flag.
-- **Learnable skills.** Tell it _"from now on when X, do Y"_ — stored as a
-  `kind="skill"` memory, surfaced automatically on matching turns.
+### Memory
+
+- **Portable.** Single SQLite file; `llm backup` / `llm restore` copy it
+  cleanly between machines. No re-teaching.
+- **Hybrid recall.** BM25 + vector ANN + optional graph retrieval, fused
+  by Reciprocal Rank Fusion. Rank-based fusion removes the "tune the
+  weights" problem that plagues score-based setups.
+- **Graph retrieval (opt-in).** Entities and relationships extracted from
+  each memory populate a knowledge graph. Personalized PageRank seeded
+  from query entities finds memories that are multi-hop related even
+  when they share no keywords.
+- **Contextual embeddings (opt-in).** A one-sentence model-generated
+  context line is prepended to each memory before embedding — improves
+  recall on short or ambiguous notes.
+- **LLM-as-judge reranker (opt-in).** A small instruct model can rescore
+  the top-N candidates in a single batched call before the final cut.
+- **Temporal decay.** Older memories fade in ranking; the half-life is
+  configurable.
+- **Learnable skills.** Tell it _"from now on when X, do Y"_ — stored as
+  a `kind="skill"` memory, surfaced automatically on matching turns.
+- **Session persistence.** Each working directory gets its own persistent
+  conversation thread. Re-launching `llm` in the same directory resumes
+  the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
+- **Auto-compaction.** In-session message history is summarised
+  automatically when it approaches `num_ctx`. `/compact` triggers manually.
+
+### Agent behaviour
+
+- **Reasoning-model aware.** `<think>…</think>` blocks are stripped from
+  the streamed transcript so users see the final answer only.
+- **Narrated-write detector.** Some models describe file writes by
+  printing numbered diff rows in prose instead of actually calling
+  `write_file`. When detected, the agent nudges the model once per turn
+  to call the tool for real.
+- **Streaming responses.** Tokens appear in real time.
+- **Fast repeat turns.** `keep_alive: 30m` stops Ollama from unloading
+  the model between turns; no cold-load per message.
+- **Cascade router.** Optional two-model setup: short / chatty turns and
+  auxiliary calls (query expansion, etc.) run on a small `fast_model`;
+  code-heavy or long turns route to the configured `chat_model`.
+  `/retry-big` manually escalates the last turn when the router picked
+  wrong.
+
+### Tools & safety
+
 - **Safe-by-default tools.** Workspace-confined writes, SSRF guard on
   `web_fetch` and `whois`, destructive-pattern detection on `shell`,
   credential deny-list that's always on.
 - **Interactive permission grants.** When the model wants to write / run
   something it isn't pre-approved for, you get a prompt:
-  `[y]es  [a]lways this session  [f]orever  [n]o  [e]dit(reason)`. Pick
-  `forever` and the grant is saved to your config (comment-preserving
+  `[y]es  [a]lways this session  [f]orever  [n]o  [e]dit(reason)`.
+  Pick `forever` and the grant is saved to your config (comment-preserving
   toml_edit — other settings untouched) so the next session starts
-  already pre-approved. No manual config editing required.
-- **Streaming responses.** Tokens appear in real time.
-- **Fast repeat turns.** `keep_alive: 30m` stops Ollama from unloading the
-  model between turns; no cold-load per message.
-- **Cascade router.** Optional two-model setup: short / chatty turns run on
-  a small `fast_model` (e.g. `qwen2.5-coder:3b`, ~50 tok/s), code-heavy or
-  long turns route to the configured `chat_model`. `/retry-big` manually
-  escalates the last turn when the router picked wrong.
-- **Self-updating.** Daily background check for a newer release; `llm update`
-  re-runs the installer in place.
-- **Model picker.** `llm models` lists installed Ollama models and lets you
-  set chat / vision / embed non-interactively or via a picker.
+  already pre-approved.
+- **Permission modes.** `read-only`, `workspace-write` (default),
+  `unrestricted`. Switch mid-session with `/mode`.
+
+### Operations
+
+- **Self-updating.** Daily background check for a newer release;
+  `llm update` re-runs the installer in place.
+- **Model picker.** `llm models` lists installed Ollama models and lets
+  you set chat / vision / embed non-interactively or via a picker.
 - **Inspectable.** `llm health` reports DB, embedder, and Ollama state.
   `/recall <q>`, `/context`, `/audit` expose what the model is actually
   seeing. JSONL audit log of every tool call.
@@ -93,15 +142,15 @@ curl -fsSL https://raw.githubusercontent.com/nevenkordic/localmind/main/install.
 
 **Environment overrides:**
 
-| var                         | default                 | what                                          |
-|-----------------------------|-------------------------|-----------------------------------------------|
-| `LOCALMIND_INSTALL_DIR`     | `$HOME/.local/bin`      | install target (auto-added to PATH)           |
-| `LOCALMIND_VERSION`         | `latest`                | pin a release tag                             |
-| `LOCALMIND_CHAT_MODEL`      | `qwen2.5-coder:3b`      | chat model the installer pulls (1.9 GB, fast)  |
-| `LOCALMIND_EMBED_MODEL`     | `nomic-embed-text`      | embed model the installer pulls               |
-| `LOCALMIND_OLLAMA_GUI=1`    | —                       | install the full Ollama.app (macOS cask)      |
-| `LOCALMIND_SKIP_OLLAMA=1`   | —                       | don't install or start Ollama                 |
-| `LOCALMIND_SKIP_MODELS=1`   | —                       | don't pull models (saves ~5 GB on metered)    |
+| var                         | what                                                  |
+|-----------------------------|-------------------------------------------------------|
+| `LOCALMIND_INSTALL_DIR`     | install target (default `$HOME/.local/bin`)           |
+| `LOCALMIND_VERSION`         | pin a release tag (default `latest`)                  |
+| `LOCALMIND_CHAT_MODEL`      | override the chat model the installer pulls           |
+| `LOCALMIND_EMBED_MODEL`     | override the embed model the installer pulls          |
+| `LOCALMIND_OLLAMA_GUI=1`    | install the full Ollama.app (macOS cask)              |
+| `LOCALMIND_SKIP_OLLAMA=1`   | don't install or start Ollama                         |
+| `LOCALMIND_SKIP_MODELS=1`   | don't pull models (saves ~5 GB on metered)            |
 
 **Build from source** (Intel Mac / Windows, or if you don't want the release
 binary):
@@ -116,15 +165,18 @@ cd localmind
 ## Use
 
 ```bash
-llm                         # interactive REPL
+llm                          # interactive REPL, resumes last session for cwd
 llm ask "fix the failing test"
-llm health                  # DB stats, Ollama reachability, recall config
+llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)
-llm models                  # pick chat / vision / embed models
-llm backup [<path>]         # copy memory DB to a file
-llm restore <path>          # replace memory DB from a backup
-llm update                  # grab a newer release
+llm memory reembed           # re-run the embedding + extraction pipeline
+llm memory reindex           # rebuild the ANN index over existing vectors
+llm memory stats             # counts: memories, vectors, entities, edges
+llm models                   # pick chat / vision / embed models
+llm backup [<path>]          # copy memory DB to a file
+llm restore <path>           # replace memory DB from a backup
+llm update                   # grab a newer release
 ```
 
 **REPL slash commands:**
@@ -134,6 +186,9 @@ llm update                  # grab a newer release
 /config  /tools   /mode    /model
 /skills  /forget <id>  /remember <fact>
 /recall <query>  /context
+/compact                        summarise history now (auto-fires near num_ctx)
+/new     /clear   /reset        wipe this session's history, start fresh
+/retry-big                      re-run the last turn on chat_model
 ```
 
 ## Configure
@@ -142,32 +197,54 @@ llm update                  # grab a newer release
 cp config/config.example.toml config/local.toml
 ```
 
-Common knobs in `config/local.toml`:
+### `[ollama]`
 
-| `[ollama]`           |                                                      |
-|----------------------|------------------------------------------------------|
-| `chat_model`         | capable model — used for code / tools / long prompts |
-| `fast_model`         | optional small model for short/chatty turns (cascade)|
-| `embed_model`        | for the memory index                                 |
-| `num_ctx`            | per-reply token budget (default 8192)                |
-| `keep_alive`         | how long Ollama holds the model in RAM (default 30m) |
+| key                 | effect                                                   |
+|---------------------|----------------------------------------------------------|
+| `chat_model`        | capable model — used for code / tools / long prompts     |
+| `fast_model`        | optional small model for short turns + auxiliary calls   |
+| `vision_model`      | used when a turn includes image input                    |
+| `embed_model`       | used by the memory index                                 |
+| `num_ctx`           | per-reply token budget                                   |
+| `keep_alive`        | how long Ollama holds the model in RAM (default 30m)     |
+| `temperature`       | sampling temperature                                     |
+| `top_p`             | nucleus sampling                                         |
+| `auto_compact_at`   | compaction threshold as fraction of `num_ctx` (0 = off)  |
+| `compact_keep_tail` | messages preserved verbatim at the tail on compaction    |
+| `resume_messages`   | messages to reload from previous session per cwd (0 = off) |
 
-| `[memory]`           |                                                      |
-|----------------------|------------------------------------------------------|
-| `vector_search`      | `false` = pure BM25 recall, ~10× faster              |
-| `expansion_variants` | LLM query paraphrasings (default 0)                  |
-| `bm25_weight` / `vector_weight` | fusion weights                            |
+### `[memory]`
 
-| `[tools]`            |                                                      |
-|----------------------|------------------------------------------------------|
-| `mode`               | `read-only` / `workspace-write` / `unrestricted`     |
-| `workspace_root`     | confines writes to a directory tree                  |
-| `deny_globs`         | extra paths to refuse                                |
+| key                    | effect                                                   |
+|------------------------|----------------------------------------------------------|
+| `vector_search`        | `false` = pure BM25 recall (~10× faster, less semantic)  |
+| `expansion_variants`   | LLM query paraphrasings (0 = off; uses `fast_model`)     |
+| `temporal_half_life_days` | how fast old memories decay in ranking                |
+| `auto_persist`         | auto-summarise turns into memories                       |
+| `contextual_embed`     | prepend a model-generated context line before embedding  |
+| `entity_extraction`    | populate the entity graph from each new memory           |
+| `graph_search`         | PPR-based graph retriever in the fusion mix              |
+| `rerank_model`         | LLM-as-judge reranker model (empty = disabled)           |
+| `rerank_fetch_k`       | candidate pool size when reranking                       |
+| `bm25_weight` / `vector_weight` | legacy score-fusion weights; ignored (RRF now)  |
 
-| `[web]`              |                                                      |
-|----------------------|------------------------------------------------------|
-| `brave_api_key`      | enables `web_search`                                 |
-| `block_private_addrs`| refuse fetches to RFC1918 / metadata IPs             |
+### `[tools]`
+
+| key              | effect                                                       |
+|------------------|--------------------------------------------------------------|
+| `mode`           | `read-only` / `workspace-write` / `unrestricted`             |
+| `workspace_root` | confines writes to a directory tree                          |
+| `deny_globs`     | extra paths to refuse                                        |
+| `allow_rules`    | auto-approve patterns (populated by `[f]orever` grants)      |
+| `deny_rules`     | hard refusals                                                |
+| `ask_rules`      | always prompt, even when allowed elsewhere                   |
+
+### `[web]`
+
+| key                   | effect                                                  |
+|-----------------------|---------------------------------------------------------|
+| `brave_api_key`       | enables `web_search`                                    |
+| `block_private_addrs` | refuse fetches to RFC1918 / metadata IPs                |
 
 Env vars override: `LOCALMIND_CHAT_MODEL`, `LOCALMIND_DB_PATH`,
 `BRAVE_API_KEY`, `LOCALMIND_NO_UPDATE_CHECK`, etc.
@@ -197,6 +274,10 @@ llm restore /path/to/somewhere.db   # prompts y/N before overwriting
 `backup` uses SQLite's `VACUUM INTO` — safe while localmind is running.
 `restore` keeps your previous DB at `memory.db.bak-YYYYMMDD-HHMMSS` so repeat
 restores never clobber each other's rollback points.
+
+After a restore, or after changing `embed_model` / enabling
+`contextual_embed`, run `llm memory reembed` to regenerate vectors
+against the current settings.
 
 ## Update
 
@@ -233,7 +314,7 @@ itself is never removed.
 ~/Library/Application Support/com.calligoit.localmind/   macOS
 ~/.local/share/localmind/                                Linux
 %LOCALAPPDATA%\localmind\                                Windows
-  ├── memory.db       facts, skills, embeddings, KG
+  ├── memory.db       facts, skills, embeddings, KG, session history
   ├── audit.log       JSONL log of every tool call
   └── history.txt     REPL history (mode 0600 on Unix)
 ```

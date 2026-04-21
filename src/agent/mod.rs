@@ -39,6 +39,12 @@ pub struct AgentRun {
     /// what the router would have picked. Cleared after the turn. Set via
     /// REPL slash commands like `/retry-big` and `/fast <msg>`.
     force_model: Option<String>,
+    /// When set, messages are persisted under this session id so the next
+    /// REPL launch in the same cwd can resume. `None` = in-memory only.
+    session_id: Option<String>,
+    /// How many of `messages` have been flushed to the session store.
+    /// Only the delta past this index is written on each flush.
+    persisted_up_to: usize,
 }
 
 impl AgentRun {
@@ -90,7 +96,133 @@ impl AgentRun {
             last_memory_primer: None,
             token_sink: None,
             force_model: None,
+            session_id: None,
+            persisted_up_to: 1, // system prompt never needs persisting
         })
+    }
+
+    /// Bind this agent to a persistent session id. After this, every new
+    /// message pushed onto `self.messages` will be flushed to the store
+    /// by `persist_new_messages`.
+    pub fn set_session(&mut self, id: String) {
+        self.session_id = Some(id);
+    }
+
+    /// Wipe the persisted session for this cwd AND the in-memory history,
+    /// leaving only the system prompt at index 0. The session id stays
+    /// bound so future messages are saved into the (now-empty) session
+    /// record rather than creating a new row. Primer dedup trackers are
+    /// cleared so recall runs fresh on the next turn.
+    pub fn reset_to_fresh_session(&mut self) {
+        if let Some(id) = &self.session_id {
+            let id = id.clone();
+            let store = self.ctx.store.clone();
+            tokio::spawn(async move {
+                let _ = store.clear_session_messages(&id).await;
+            });
+        }
+        self.messages.truncate(1);
+        self.persisted_up_to = 1;
+        self.last_primer = None;
+        self.last_memory_primer = None;
+    }
+
+    /// Replace the in-memory message list with `loaded` (appended after
+    /// the system prompt at index 0) and mark everything as already
+    /// persisted so we don't double-write on the first turn.
+    pub fn restore_messages(&mut self, loaded: Vec<ChatMessage>) {
+        // Keep self.messages[0] (fresh system prompt from this boot) and
+        // append the historical tail. The system prompt itself is not
+        // persisted — it rebuilds on every launch.
+        self.messages.truncate(1);
+        self.messages.extend(loaded);
+        self.persisted_up_to = self.messages.len();
+    }
+
+    /// Flush any newly-pushed messages to the session store. Safe to call
+    /// repeatedly; each call writes only the delta since the last flush.
+    /// No-op when no session is bound.
+    pub async fn persist_new_messages(&mut self) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let start = self.persisted_up_to;
+        let end = self.messages.len();
+        if start >= end {
+            return;
+        }
+        for i in start..end {
+            let m = &self.messages[i];
+            let extras = Self::message_extras_json(m);
+            if let Err(e) = self
+                .ctx
+                .store
+                .append_message(
+                    &session_id,
+                    &m.role,
+                    &m.content,
+                    m.name.as_deref(),
+                    extras.as_deref(),
+                )
+                .await
+            {
+                // Log but don't fail the turn — persistence is a
+                // convenience, not correctness-critical.
+                tracing::warn!("persist_new_messages: {e}");
+                break;
+            }
+        }
+        self.persisted_up_to = end;
+    }
+
+    /// Serialize the fields of a ChatMessage that don't fit the flat
+    /// (role, content, tool_name) schema into a JSON blob — tool_calls
+    /// on assistant messages, tool_call_id on tool-role responses. Used
+    /// in both persistence and reconstruction paths.
+    fn message_extras_json(m: &ChatMessage) -> Option<String> {
+        if m.tool_calls.is_none() && m.tool_call_id.is_none() {
+            return None;
+        }
+        let mut obj = serde_json::Map::new();
+        if let Some(calls) = &m.tool_calls {
+            obj.insert("tool_calls".into(), serde_json::to_value(calls).ok()?);
+        }
+        if let Some(id) = &m.tool_call_id {
+            obj.insert("tool_call_id".into(), serde_json::Value::String(id.clone()));
+        }
+        serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+    }
+
+    /// Inverse of message_extras_json — rebuild a ChatMessage from the
+    /// persisted row tuple (role, content, tool_name, extras_json).
+    pub fn message_from_persisted(
+        role: String,
+        content: String,
+        tool_name: Option<String>,
+        extras_json: Option<String>,
+    ) -> ChatMessage {
+        let (tool_calls, tool_call_id) = extras_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .map(|v| {
+                let calls = v
+                    .get("tool_calls")
+                    .and_then(|c| serde_json::from_value(c.clone()).ok());
+                let id = v
+                    .get("tool_call_id")
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string());
+                (calls, id)
+            })
+            .unwrap_or((None, None));
+        ChatMessage {
+            role,
+            content,
+            images: None,
+            tool_calls,
+            tool_call_id,
+            name: tool_name,
+        }
     }
 
     /// Force the next turn to use a specific model, overriding the cascade
@@ -135,12 +267,142 @@ impl AgentRun {
         }
     }
 
+    /// Rough token estimate — char count / 4 plus a flat per-message
+    /// overhead for role / formatting. Matches the industry rule-of-thumb
+    /// close enough to drive compaction decisions without pulling in a
+    /// tokenizer crate.
+    fn estimate_tokens(&self) -> usize {
+        const PER_MESSAGE_OVERHEAD: usize = 10;
+        self.messages
+            .iter()
+            .map(|m| {
+                let body = m.content.len()
+                    + m.tool_calls
+                        .as_ref()
+                        .map(|v| v.len() * 80)
+                        .unwrap_or(0);
+                PER_MESSAGE_OVERHEAD + body / 4
+            })
+            .sum()
+    }
+
+    /// Check whether `auto_compact_at` has been crossed; if so, run
+    /// compaction. Silent no-op when disabled (threshold = 0) or when
+    /// history is still short enough to fit comfortably.
+    async fn maybe_compact(&mut self) {
+        let threshold = self.ctx.cfg.ollama.auto_compact_at;
+        if threshold <= 0.0 {
+            return;
+        }
+        let budget = self.ctx.cfg.ollama.num_ctx as f32;
+        let used = self.estimate_tokens() as f32;
+        if used < threshold * budget {
+            return;
+        }
+        if let Err(e) = self.compact_now(/*forced=*/ false).await {
+            eprintln!("  \x1b[2m(auto-compact failed: {e}; continuing without)\x1b[0m");
+        }
+    }
+
+    /// Replace the middle of `self.messages` with a summary system
+    /// message. Keeps the main system prompt (index 0) and the last
+    /// `compact_keep_tail` messages verbatim. Tail boundary is snapped
+    /// forward to the next `user` message so a tool_call / tool_response
+    /// pair never gets split.
+    ///
+    /// `forced = true` bypasses the "is there anything worth compacting?"
+    /// guard — used by the `/compact` slash command.
+    pub async fn compact_now(&mut self, forced: bool) -> Result<()> {
+        let keep_tail = self.ctx.cfg.ollama.compact_keep_tail.max(2);
+        // Need at least: system prompt + some middle + tail. If the
+        // history is already short, there's nothing to do.
+        if self.messages.len() < keep_tail + 3 {
+            if forced {
+                eprintln!("  \x1b[2m· already compact ({} messages)\x1b[0m", self.messages.len());
+            }
+            return Ok(());
+        }
+
+        // Candidate split: everything in messages[1..split] becomes the
+        // summary; messages[split..] is kept verbatim.
+        let candidate = self.messages.len().saturating_sub(keep_tail);
+        let split = self.next_user_boundary(candidate).unwrap_or(candidate);
+        if split <= 1 {
+            return Ok(());
+        }
+
+        // Render the middle as plain text for the summariser. Tool-call
+        // JSON is stringified inline so the summariser sees what actually
+        // happened, not opaque structs.
+        let mut transcript = String::new();
+        for m in &self.messages[1..split] {
+            transcript.push_str(&format!("[{}] {}\n", m.role, m.content.trim()));
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    transcript.push_str(&format!(
+                        "  <tool_call name={} args={}>\n",
+                        c.function.name,
+                        serde_json::to_string(&c.function.arguments).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+
+        let before_count = self.messages.len();
+        let before_tokens = self.estimate_tokens();
+
+        let summary = self
+            .client
+            .summarize_history(&transcript)
+            .await
+            .map_err(|e| anyhow::anyhow!("summarize failed: {e}"))?;
+
+        let placeholder = ChatMessage::system(format!(
+            "[Earlier conversation summary — replaces {} messages]\n{}",
+            split - 1,
+            summary.trim()
+        ));
+
+        // Splice: messages[0] + placeholder + messages[split..].
+        let tail: Vec<ChatMessage> = self.messages.split_off(split);
+        self.messages.truncate(1); // keep only the main system prompt
+        self.messages.push(placeholder);
+        self.messages.extend(tail);
+
+        // Primers are inside the summary now — clear the dedup trackers
+        // so the next turn's recall can reinject them if still relevant.
+        self.last_primer = None;
+        self.last_memory_primer = None;
+
+        let after_tokens = self.estimate_tokens();
+        eprintln!(
+            "  \x1b[2m· auto-compacted {} messages (~{} → {} tokens)\x1b[0m",
+            before_count - self.messages.len(),
+            before_tokens,
+            after_tokens,
+        );
+        Ok(())
+    }
+
+    /// Walk forward from `from` until the next `user`-role message; that
+    /// sits on a clean turn boundary (never between an assistant
+    /// tool_call and its tool response). `None` if there's no user
+    /// message at/after `from`.
+    fn next_user_boundary(&self, from: usize) -> Option<usize> {
+        (from..self.messages.len()).find(|&i| self.messages[i].role == "user")
+    }
+
     /// Send a user turn and iterate through any tool calls the model requests.
     /// Returns the final assistant text.
     pub async fn turn(&mut self, user_input: &str) -> Result<String> {
+        // Auto-compact history if it's pushing num_ctx. Runs only at turn
+        // boundaries — compacting mid-tool-loop would break the
+        // assistant-tool_call → tool-result pairing and confuse the model.
+        self.maybe_compact().await;
+
         // Auto-extract personal facts ("my name is X", "call me X",
         // "remember X") and persist BEFORE the model sees the turn. The
-        // system prompt also tells qwen to do this; the regex guarantees
+        // system prompt also tells the model to do this; the regex guarantees
         // the obvious cases never depend on model cooperation.
         for (title, content, kind) in extract_facts(user_input) {
             let _ = self
@@ -270,6 +532,10 @@ impl AgentRun {
     async fn loop_tools(&mut self, model: &str) -> Result<String> {
         let specs = Registry::specs(&self.ctx);
         let color = crate::ui::color_enabled(self.ctx.cfg.repl.color);
+        // One-shot guard — we nudge at most once per turn on detected
+        // narrated-write hallucinations, so a repeatedly-misbehaving
+        // model can't pin the loop against max_tool_iterations.
+        let mut already_nudged_fake_write = false;
         for _ in 0..self.max_tool_iterations {
             let spinner = crate::ui::Spinner::start("thinking", color);
 
@@ -352,7 +618,7 @@ impl AgentRun {
             };
 
             let mut reply = reply_res?;
-            // Small models (qwen2.5-coder:3b in particular) sometimes write
+            // Small models sometimes write
             // what a tool response would LOOK like — e.g. a `<tool_response>`
             // block with "[Content of the file]" — instead of actually
             // calling the tool. Detect and either strip (if the model also
@@ -383,11 +649,78 @@ impl AgentRun {
                     }
                 }
                 _ => {
+                    // Hallucination check: some models narrate file
+                    // writes as rendered diff output in prose instead of
+                    // calling write_file. If we spot 3+ diff-style rows
+                    // and made no tool calls, nudge the model to actually
+                    // call the tool. Fires at most once per turn.
+                    if !already_nudged_fake_write {
+                        if let Some(count) = detect_narrated_write(&reply.content) {
+                            already_nudged_fake_write = true;
+                            eprintln!(
+                                "  \x1b[2m· detected narrated write ({count} fenced-code lines, no write_file call) — nudging model\x1b[0m"
+                            );
+                            self.messages.push(ChatMessage::user(
+                                "STOP describing file contents in code fences. You MUST call the \
+                                 write_file tool directly with a structured tool_call to actually \
+                                 create the file. Do not paste file bodies as assistant prose. If \
+                                 you genuinely cannot call the tool, say so in one short sentence. \
+                                 Call the tool now.".to_string()
+                            ));
+                            continue;
+                        }
+                    }
                     return Ok(reply.content);
                 }
             }
         }
         Ok("(max tool iterations reached)".into())
+    }
+}
+
+/// Detect the "narrated write" hallucination: the model describes
+/// creating a file by pasting its content into a fenced code block
+/// instead of calling `write_file`. Fires when either:
+///
+///   (a) any fenced code block carries a fake structured tool call
+///       (shape `{"name": "write_file" | "create_dir" | ...}`), or
+///   (b) the reply has ≥ FENCE_LINE_THRESHOLD lines of fenced code with
+///       no accompanying tool call.
+///
+/// Returns the offending line count when suspicious, `None` otherwise.
+/// Threshold keeps short explanatory snippets (`one-liner in ```bash```)
+/// from false-firing. The caller has already confirmed no structured
+/// tool_calls were made.
+pub(crate) fn detect_narrated_write(reply: &str) -> Option<usize> {
+    const FENCE_LINE_THRESHOLD: usize = 12;
+    static FENCE_RE: Lazy<Regex> = Lazy::new(|| {
+        // Matches ```<optional-lang>\n<body>\n``` as a balanced block.
+        // (?s) so `.` crosses newlines; non-greedy body captures up to
+        // the nearest closing fence.
+        Regex::new(r"(?s)```[^\n`]{0,30}\n(.*?)\n```").unwrap()
+    });
+    static FAKE_TOOL_CALL_RE: Lazy<Regex> =
+        // `"name"` key paired with a known side-effecting tool name in
+        // the same block is a strong signal the model is describing a
+        // call, not making one.
+        Lazy::new(|| {
+            Regex::new(
+                r#""name"\s*:\s*"(write_file|create_dir|shell|web_fetch|http_fetch|zip_create|zip_extract)""#,
+            )
+            .unwrap()
+        });
+    let mut fence_line_count = 0usize;
+    for caps in FENCE_RE.captures_iter(reply) {
+        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if FAKE_TOOL_CALL_RE.is_match(body) {
+            return Some(body.lines().count().max(1));
+        }
+        fence_line_count += body.lines().count();
+    }
+    if fence_line_count >= FENCE_LINE_THRESHOLD {
+        Some(fence_line_count)
+    } else {
+        None
     }
 }
 
@@ -455,8 +788,8 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_facts, is_trivial_turn, scrub_hallucinated_tool_output, should_use_fast,
-        MarkdownHighlighter, StreamingToolCallFilter,
+        detect_narrated_write, extract_facts, is_trivial_turn, scrub_hallucinated_tool_output,
+        should_use_fast, MarkdownHighlighter, StreamingToolCallFilter,
     };
 
     fn first(input: &str) -> Option<(String, String, String)> {
@@ -622,6 +955,58 @@ mod tests {
         assert!(scrub_hallucinated_tool_output(real).is_none());
     }
 
+    // ----- detect_narrated_write tests ---------------------------------
+
+    #[test]
+    fn narrated_write_fires_on_fake_tool_call_json() {
+        // The exact pathology from the wild: model pastes a JSON block
+        // describing a tool call instead of emitting a structured call.
+        let reply = "### Step 1\n```json\n{\n  \"name\": \"write_file\",\n  \"arguments\": {\n    \"path\": \"/tmp/x.html\"\n  }\n}\n```\n";
+        assert!(detect_narrated_write(reply).is_some());
+    }
+
+    #[test]
+    fn narrated_write_fires_on_large_code_fence() {
+        // A substantial fenced code block with no accompanying tool
+        // call, on a turn where one was expected, is our softer signal.
+        let mut reply = String::from("Here's the HTML:\n```html\n");
+        for i in 0..15 {
+            reply.push_str(&format!("<div class=\"row-{i}\">content</div>\n"));
+        }
+        reply.push_str("```\n");
+        assert!(detect_narrated_write(&reply).is_some());
+    }
+
+    #[test]
+    fn narrated_write_ignores_short_snippet() {
+        // A one-liner in a fence (e.g. `ls -la`) shouldn't fire.
+        let reply = "Run this to check:\n```bash\nls -la ~/Desktop\n```";
+        assert_eq!(detect_narrated_write(reply), None);
+    }
+
+    #[test]
+    fn narrated_write_ignores_plain_prose() {
+        let reply = "I created the file for you. Open it in your editor.";
+        assert_eq!(detect_narrated_write(reply), None);
+    }
+
+    #[test]
+    fn narrated_write_ignores_numbered_list() {
+        let reply = "1. First do this\n2. Then do that\n3. Finally run tests";
+        assert_eq!(detect_narrated_write(reply), None);
+    }
+
+    #[test]
+    fn narrated_write_detects_unrelated_json_with_tool_name() {
+        // A config snippet mentioning `write_file` in a `"name"` key
+        // would fire — that's acceptable since the caller has already
+        // gated on tool_calls being empty. False positives on genuine
+        // user-facing JSON examples are rare and benign (the nudge
+        // just asks the model to call the tool for real).
+        let reply = "```json\n{\"name\": \"write_file\"}\n```";
+        assert!(detect_narrated_write(reply).is_some());
+    }
+
     // ----- StreamingToolCallFilter tests --------------------------------
 
     fn run_filter(chunks: &[&str]) -> String {
@@ -640,7 +1025,7 @@ mod tests {
 
     #[test]
     fn filter_drops_tool_call_json_at_start() {
-        // The exact failure the user hit: qwen emits `{"name":"read_pdf",...}`
+        // The exact failure the user hit: the model emits `{"name":"read_pdf",...}`
         // as text before the structured tool_call runs.
         let out = run_filter(&[r#"{"name":"read_pdf","arguments":{"path":"/tmp/x.pdf"}}"#]);
         assert_eq!(out, "", "tool-call JSON must not leak: got {out:?}");
@@ -823,25 +1208,20 @@ mod tests {
     }
 
     #[test]
-    fn md_fenced_code_gets_highlighted_and_added_marker() {
+    fn md_fenced_code_gets_highlighted_with_gutter() {
         let out = run_md(&["Here is Rust:\n", "```rust\n", "fn main() {}\n", "```\n"]);
-        // Fence markers are now swallowed — user asked for them hidden.
+        // Fence markers are swallowed — user asked for them hidden.
         assert!(!out.contains("```"));
         assert!(
             out.contains("   1"),
             "expected line-number gutter, got: {out:?}"
         );
+        // Non-diff fences render as context rows: gutter + space sign,
+        // no + marker and no row background. This keeps casual code
+        // examples in chat from looking like proposed file writes.
         assert!(
-            out.contains("+"),
-            "expected `+` add marker on code line, got: {out:?}"
-        );
-        assert!(
-            out.contains("\x1b[48;2;12;36;12m"),
-            "expected muted green background, got: {out:?}"
-        );
-        assert!(
-            out.contains("\x1b[K"),
-            "expected EL for full-row fill, got: {out:?}"
+            !out.contains("\x1b[48;2;12;36;12m"),
+            "non-diff fence must NOT use added-row background, got: {out:?}"
         );
     }
 
@@ -849,7 +1229,6 @@ mod tests {
     fn md_fenced_block_without_lang_still_gutters() {
         let out = run_md(&["```\n", "some plaintext\n", "```\n"]);
         assert!(out.contains("   1"));
-        assert!(out.contains("+"));
         assert!(!out.contains("```"));
     }
 
@@ -911,10 +1290,9 @@ mod tests {
             "Done.\n",
         ]);
         // Each code block's line counter resets to 1 — so the first-line
-        // gutter sequence (green line-no on green bg) appears exactly
-        // twice. ADDED_BG then GUTTER_FG_ADD then `   1`.
+        // gutter `   1` appears exactly twice across the rendered output.
         assert_eq!(
-            out.matches("\x1b[48;2;12;36;12m\x1b[32m   1").count(),
+            out.matches("   1").count(),
             2,
             "expected 2 first-line gutters, got: {out:?}"
         );
@@ -954,8 +1332,8 @@ mod tests {
 }
 
 /// Streaming filter that drops model-emitted tool-call JSON AND chat-template
-/// tokens from the output before they reach the user. Some models (notably
-/// qwen2.5-coder) emit a tool call BOTH as a structured `tool_calls` field
+/// tokens from the output before they reach the user. Some models emit a
+/// tool call BOTH as a structured `tool_calls` field
 /// AND as a serialised `{"name":"...","arguments":{...}}` block inside
 /// `content`, often several back-to-back. Others leak internal chat-template
 /// markers like `<|im_start|>` / `<|im_end|>` when Ollama's template handling
@@ -1004,8 +1382,13 @@ const TEMPLATE_PREFIXES: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|
 /// and close tag is discarded. Close tags appearing orphan (without a
 /// matching open) are also dropped. Add new pairs as new failure modes
 /// surface.
-const BLOCK_TAG_PAIRS: &[(&str, &str)] = &[("<tool_response>", "</tool_response>")];
-const ORPHAN_CLOSE_TAGS: &[&str] = &["</tool_response>"];
+const BLOCK_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<tool_response>", "</tool_response>"),
+    // Reasoning-model chain-of-thought. Strip the think block so the
+    // transcript shows the final reply only.
+    ("<think>", "</think>"),
+];
+const ORPHAN_CLOSE_TAGS: &[&str] = &["</tool_response>", "</think>"];
 
 // ANSI colour constants shared by the markdown-code renderer and the
 // write_file diff preamble so the two look-and-feels stay in sync. The
@@ -1184,11 +1567,14 @@ impl MarkdownHighlighter {
 
         // `diff` fences get per-line +/- semantics: the first char decides
         // insert / delete / context, the rest is highlighted as-is. Any
-        // other language: every line is an insert (new code being proposed).
+        // other language renders as context (line number gutter only, no
+        // + marker) — treating every code fence as "added diff rows"
+        // made casual code examples in chat look like proposed writes,
+        // confusing both readers and downstream hallucination detection.
         let (tag, body_content) = if self.lang == "diff" || self.lang == "patch" {
             classify_diff_line(body_line)
         } else {
-            (DiffTag::Insert, body_line)
+            (DiffTag::Context, body_line)
         };
 
         // Pick a syntax highlighter: for diff content, attempt the
@@ -1721,54 +2107,94 @@ fn hallucination_error(flag: &str) -> String {
 ///   - No tool-implicit verbs ("fix", "refactor", "debug", "fetch",
 ///     "run", "implement", "build", "search web", etc.).
 /// Trivial turns ("hi", "ok", "thanks") trivially qualify.
+/// Cascade-router classifier. Default is `false` — route to `chat_model`.
+///
+/// Returns `true` (→ `fast_model`) only on POSITIVE evidence of
+/// triviality: a bare interjection, or a short lookup / question with
+/// no side-effect verbs. This "safe default" inverts the previous
+/// "fast unless we spotted a tool verb" logic, which leaked any
+/// unclassified substantive request to a small model that can't
+/// reliably tool-call.
 pub(crate) fn should_use_fast(input: &str) -> bool {
     let t = input.trim();
+
+    // Signal 1: bare interjection ("ok", "thanks", "hi") — always fast.
     if is_trivial_turn(t) {
         return true;
     }
-    if t.chars().count() > 300 {
+
+    // From here on, only route to fast on short positive lookups /
+    // questions. Everything else stays on chat_model.
+
+    if t.chars().count() > 120 {
         return false;
     }
-    const CODE_MARKERS: &[&str] = &[
-        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".cpp", ".c ",
-        "::", "=>", "->", "()", "{}", "[]", "&&", "||",
+
+    let lower = t.to_lowercase();
+
+    // Any whiff of a side-effect or file-ish token kills the fast path,
+    // regardless of length. This is the safety net — if we ever add
+    // more routing heuristics above, a stray action verb still forces
+    // chat_model.
+    const SIDE_EFFECT_MARKERS: &[&str] = &[
+        // file / io
+        "create ", "write ", "save ", "edit ", "modify ", "delete ",
+        "remove ", "rename ", "append ", "mkdir", "touch ", "chmod",
+        "chown", "upload", "download", "zip", "extract", "archive",
+        // code
+        "fix ", "refactor", "debug", "implement", "build", "compile",
+        "install", "uninstall", "upgrade", "update ", "lint", "format ",
+        "test ", "tests", "benchmark", "profile", "patch ", "diff ",
+        "generate", "render ", "convert", "translate ", "parse ",
+        "review",
+        // shell / web / network
+        "run ", "execute", "shell ", "fetch ", "scrape", "curl ",
+        "wget", "http", "search web", "look up", "google", "deploy",
+        "commit", " push ", " pull ", "merge ", "rebase", "branch",
+        "checkout", "clone ", "fork ",
+        // content creation
+        "website", "webpage", "web page", "html", "css ", "javascript",
+        "typescript", "json ", "yaml", "markdown", "script ",
+        "readme", "documentation", "pdf", "docx", "xlsx",
+        // code markers
+        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go",
+        ".java", ".rb", ".cpp", "::", "=>", "->", "()", "{}", "[]",
+        "&&", "||",
     ];
-    if CODE_MARKERS.iter().any(|m| t.contains(m)) {
+    if SIDE_EFFECT_MARKERS.iter().any(|m| lower.contains(m)) {
         return false;
     }
-    // Slash / path-like — likely file reference.
+    // Path-like token (`/Users/...`, `src/agent/mod.rs`) → chat_model.
     if t.contains('/') && t.split_whitespace().any(|w| w.contains('/') && w.len() > 3) {
         return false;
     }
-    const TOOL_VERBS: &[&str] = &[
-        "fix ",
-        "refactor",
-        "debug",
-        "implement",
-        "build",
-        "read file",
-        "open file",
-        "run ",
-        "execute",
-        "shell ",
-        "fetch ",
-        "download",
-        "scrape",
-        "curl ",
-        "http",
-        "search web",
-        "look up online",
-        "google",
-        "wget",
-        "deploy",
-        "commit",
-        "git ",
+
+    // Positive triviality signals — short, pure lookup / question.
+    const TRIVIAL_LEADERS: &[&str] = &[
+        "what is ", "what's ", "whats ", "what time", "what day",
+        "what year", "what month", "who is ", "who's ", "whos ",
+        "who am ", "when is ", "when's ", "where is ", "where's ",
+        "why is ", "why's ", "how does ", "how do you ", "how do i say ",
+        "how many ", "how much ", "is it ", "are you ", "can you ",
+        "do you ", "does ", "did ", "define ", "explain ", "tell me ",
+        "remind me ",
     ];
-    let lower = t.to_lowercase();
-    if TOOL_VERBS.iter().any(|w| lower.contains(w)) {
-        return false;
+    if TRIVIAL_LEADERS.iter().any(|p| lower.starts_with(p)) {
+        return true;
     }
-    true
+
+    // Conversational filler / acknowledgement phrases.
+    const FILLER: &[&str] = &[
+        "how are you", "how's it going", "good morning", "good afternoon",
+        "good evening", "good night", "thank you", "thanks for",
+        "you there", "got it", "nice one", "hello ", "hey ", "hi there",
+    ];
+    if FILLER.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    // Default: chat_model. Better to over-invest than to break the turn.
+    false
 }
 
 /// Skip memory recall for interjection-only turns. Recall against "hi" or

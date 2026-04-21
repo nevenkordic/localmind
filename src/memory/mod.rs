@@ -1,4 +1,4 @@
-//! Memory subsystem — SQLite-backed multi-layer store inspired by broodlink.
+//! Memory subsystem — SQLite-backed multi-layer store.
 
 pub mod embedder;
 pub mod kg;

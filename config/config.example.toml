@@ -4,22 +4,22 @@
 [ollama]
 # URL of your local Ollama server.
 host = "http://127.0.0.1:11434"
-# Primary model — the 3B variant runs at 40-60 tok/s on Apple Silicon, fits
-# on any modern laptop, and handles localmind's tool-calling protocol. The
-# installer pulls this by default. If you want better reasoning at the cost
-# of speed, `ollama pull qwen2.5-coder:7b` (or :14b, :32b) then swap via
-# `llm models --chat <name>`.
+# Primary chat model. The installer pulls a small-but-capable default.
+# Swap to a larger variant for better reasoning at the cost of speed:
+# `llm models --chat <name>` after pulling it with Ollama.
 chat_model = "qwen2.5-coder:3b"
 # Optional fast-path model for the cascade router. When set AND different
-# from chat_model, the agent routes trivial / short / chatty turns here and
-# only escalates to chat_model for code changes, long prompts, or
-# explicit-tool requests. Leave blank to disable cascading — every turn
-# will go to chat_model, same as before.
-# Typical setup: fast_model = "qwen2.5-coder:3b", chat_model = "qwen2.5-coder:7b"
+# from chat_model, the agent routes trivial / short / chatty turns here
+# AND auxiliary calls (query expansion, etc.). chat_model still handles
+# real work: code changes, long prompts, explicit-tool requests. Leave
+# blank to disable cascading — every turn will go to chat_model.
 fast_model = ""
-# Secondary/fallback model — smaller, faster, vision-capable.
+# Secondary model used for vision-capable turns (image inputs). Pick
+# something that supports image tokens; otherwise leave equal to
+# chat_model to fall back to text-only.
 vision_model = "gemma3:4b"
-# Embedding model for memory search.
+# Embedding model for memory search. Any Ollama embedding model works;
+# dimension is detected per row (the vec0 table expects 768).
 embed_model = "nomic-embed-text"
 # Request timeout in seconds (large models on cold start can be slow).
 timeout_secs = 600
@@ -32,13 +32,31 @@ num_ctx = 8192
 # pays a full cold-load. "30m" keeps the model resident across typical
 # pauses. Set to "0" to unload immediately, "-1" to keep resident forever.
 keep_alive = "30m"
+# Sampling. 0.3 / 0.95 is a neutral default. For strict coding models,
+# bump temperature down to 0.2. For reasoning MoEs, bump up to 0.6.
+temperature = 0.3
+top_p = 0.95
+# Auto-compact conversation history when it passes this fraction of num_ctx.
+# A summariser call replaces the oldest middle messages with one bulleted
+# summary system message; the main system prompt and the last
+# `compact_keep_tail` messages stay verbatim. Only fires between turns.
+# Set to 0.0 to disable (the `/compact` slash command still works manually).
+auto_compact_at = 0.75
+# Messages preserved verbatim at the tail during compaction. Lower = more
+# aggressive compression, higher = safer but reclaims less.
+compact_keep_tail = 8
+# How many messages to pull from the previous session on launch (per
+# cwd). Small values keep short-term continuity without letting stale
+# prior-session style anchor the model. Set to 0 to disable auto-resume.
+resume_messages = 8
 
 [memory]
 # Path to the SQLite memory database. %DATA% expands to the OS data dir.
 db_path = "%DATA%/memory.db"
 # Max memories to return from a hybrid search.
 top_k = 12
-# Weight given to BM25 vs vector score during fusion (0.0 - 1.0).
+# Legacy score-fusion weights. Ignored now — fusion is Reciprocal Rank Fusion
+# (rank-based, parameter-free). Kept here for config backwards compat.
 bm25_weight = 0.4
 vector_weight = 0.6
 # How aggressively older memories decay in ranking (half-life in days).
@@ -51,6 +69,25 @@ expansion_variants = 0
 # When true, hybrid search asks Ollama for an embedding and runs vector ANN.
 # Set to false for pure-BM25 recall (~10× faster on slow Ollama, less semantic).
 vector_search = true
+# Contextual Retrieval — before embedding a stored memory, ask the LLM for
+# a one-sentence context line and prepend it. ~30-50% recall improvement
+# on short/ambiguous notes at the cost of one extra LLM call per insert
+# (runs on the background embedding worker, doesn't block turns).
+contextual_embed = false
+# Entity extraction — ask the LLM for entities + relationships per memory
+# and populate kg_entities / kg_edges. One extra chat call per insert.
+# Required to unlock graph-based retrieval; harmless when off.
+entity_extraction = false
+# Graph-based retrieval — Personalized PageRank over the entity graph,
+# seeded from query entities, fused with BM25 + vector via RRF. Needs
+# entity_extraction = true to have graph content; harmless (returns
+# empty) when the graph is sparse or no query entities match.
+graph_search = false
+# LLM-as-judge reranker. When set, hybrid_search pulls `rerank_fetch_k`
+# candidates and this model rescores them. Recommended: a small model
+# distinct from chat_model. Empty = disabled.
+rerank_model = ""
+rerank_fetch_k = 50
 
 [tools]
 # Root directory the agent is allowed to read/write under.

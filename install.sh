@@ -10,8 +10,8 @@
 #   LOCALMIND_INSTALL_DIR   install target (default: ~/.local/bin, falls back
 #                           to /usr/local/bin with sudo)
 #   LOCALMIND_VERSION       pin a release tag (default: latest)
-#   LOCALMIND_CHAT_MODEL    chat model to pull (default: qwen2.5-coder:7b)
-#   LOCALMIND_EMBED_MODEL   embed model to pull (default: nomic-embed-text)
+#   LOCALMIND_CHAT_MODEL    chat model to pull (see default below)
+#   LOCALMIND_EMBED_MODEL   embed model to pull (see default below)
 #   LOCALMIND_SKIP_OLLAMA=1 don't install or touch Ollama
 #   LOCALMIND_SKIP_MODELS=1 don't pull default models (saves ~5 GB)
 

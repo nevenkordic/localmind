@@ -117,10 +117,10 @@ fn pct(num: i64, denom: i64) -> f64 {
 }
 
 /// True if `needle` names an installed model. Handles the `:latest` tag
-/// normalisation: a config entry like `nomic-embed-text` must match an
-/// installed `nomic-embed-text:latest` (which is how Ollama actually stores
-/// the default tag). Without this, health reported "embed loaded: NO" even
-/// though the model was right there.
+/// normalisation: a config entry without an explicit tag must match an
+/// installed `<name>:latest` (which is how Ollama stores the default
+/// tag). Without this, health reported "embed loaded: NO" even though
+/// the model was right there.
 fn model_is_installed(models: &[String], needle: &str) -> bool {
     if needle.is_empty() {
         return true;

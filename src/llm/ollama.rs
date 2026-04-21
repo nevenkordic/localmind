@@ -12,6 +12,25 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Output schema for `extract_entities`. Kept intentionally shallow —
+/// callers build the graph from these by calling
+/// `Store::upsert_entity` / `upsert_edge`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtractedEntity {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub etype: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtractedEdge {
+    pub src: String,
+    pub src_type: String,
+    pub dst: String,
+    pub dst_type: String,
+    pub relation: String,
+}
+
 /// First-response watchdog. Bounds how long a `/api/chat` call can sit with
 /// no reply before we treat it as a hung / corrupt model and surface an
 /// actionable error. Kept as a constant rather than a config knob because
@@ -26,10 +45,13 @@ pub struct OllamaClient {
     http: reqwest::Client,
     host: String,
     chat_model: String,
+    fast_model: String,
     embed_model: String,
     vision_model: String,
     num_ctx: u32,
     keep_alive: String,
+    temperature: f32,
+    top_p: f32,
     /// Embedding cache. Sized for ~768KB at the default 256-entry cap with
     /// 768-dim float vectors. Shared across clones of the client so the
     /// agent loop and CLI commands hit the same warm cache when run in the
@@ -86,10 +108,13 @@ impl OllamaClient {
             http,
             host: cfg.host.trim_end_matches('/').to_string(),
             chat_model: cfg.chat_model.clone(),
+            fast_model: cfg.fast_model.clone(),
             embed_model: cfg.embed_model.clone(),
             vision_model: cfg.vision_model.clone(),
             num_ctx: cfg.num_ctx,
             keep_alive: cfg.keep_alive.clone(),
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
             embed_cache: Arc::new(Mutex::new(EmbedCache::new(256))),
         }
     }
@@ -152,6 +177,7 @@ impl OllamaClient {
         struct Options {
             num_ctx: u32,
             temperature: f32,
+            top_p: f32,
         }
         #[derive(Deserialize)]
         struct Resp {
@@ -173,7 +199,8 @@ impl OllamaClient {
             tools,
             options: Options {
                 num_ctx: self.num_ctx,
-                temperature: 0.2,
+                temperature: self.temperature,
+                top_p: self.top_p,
             },
             keep_alive: &self.keep_alive,
         };
@@ -268,6 +295,7 @@ impl OllamaClient {
         struct Options {
             num_ctx: u32,
             temperature: f32,
+            top_p: f32,
         }
         #[derive(Deserialize)]
         struct Chunk {
@@ -289,7 +317,8 @@ impl OllamaClient {
             tools,
             options: Options {
                 num_ctx: self.num_ctx,
-                temperature: 0.2,
+                temperature: self.temperature,
+                top_p: self.top_p,
             },
             keep_alive: &self.keep_alive,
         };
@@ -421,7 +450,7 @@ impl OllamaClient {
     }
 
     /// Ask the chat model to produce N paraphrasings of a query — used by
-    /// hybrid search (broodlink-style query expansion).
+    /// hybrid search for recall via query expansion.
     pub async fn query_expand(&self, query: &str, n: usize) -> Result<Vec<String>> {
         if n == 0 {
             return Ok(vec![]);
@@ -436,7 +465,15 @@ impl OllamaClient {
             ChatMessage::system("You rewrite search queries. Output JSON only."),
             ChatMessage::user(prompt),
         ];
-        let reply = self.chat(&msgs, None, false).await?;
+        // Route expansion to fast_model when configured — paraphrase is a
+        // tiny task and doesn't need chat_model's depth. Keeps `memory
+        // search` off the critical path of a slow reasoning model.
+        let model_override = if self.fast_model.is_empty() {
+            None
+        } else {
+            Some(self.fast_model.as_str())
+        };
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
         let content = reply
             .content
             .trim()
@@ -448,12 +485,101 @@ impl OllamaClient {
             Err(_) => Ok(vec![]),
         }
     }
+
+    /// Summarise a run of past conversation messages into one compact
+    /// narrative. Used by the agent's auto-compaction path when the live
+    /// message history approaches `num_ctx`. Prompt is tuned to preserve
+    /// decisions, tool outcomes, and file paths — the things future turns
+    /// usually care about — while dropping redundant narration.
+    pub async fn summarize_history(&self, transcript: &str) -> Result<String> {
+        let sys = "You compress conversation histories for a long-running coding \
+                   assistant. Preserve: user goals, decisions made, file paths \
+                   touched, commands run, errors hit, and anything the assistant \
+                   promised to do. Drop: chit-chat, partial drafts superseded by \
+                   later versions, repeated tool output. Emit a bulleted \
+                   summary, no preamble, no code fences. Max 400 words.";
+        let user = format!("Conversation history to compress:\n\n{transcript}");
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat(&msgs, None, false).await?;
+        Ok(reply.content.trim().to_string())
+    }
+
+    /// Extract entities + relationships from a stored memory. Used by
+    /// the embedding worker to populate `kg_entities` / `kg_edges` so
+    /// graph-based retrieval can seed queries by entity. The model is
+    /// asked for strict JSON; malformed output returns an empty pair so
+    /// extraction is never fatal to the embedding pipeline.
+    pub async fn extract_entities(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<(Vec<ExtractedEntity>, Vec<ExtractedEdge>)> {
+        const INPUT_BUDGET: usize = 2000;
+        let excerpt: String = content.chars().take(INPUT_BUDGET).collect();
+        let sys = "You extract a compact knowledge graph from a note. Output \
+                   ONLY a JSON object with two arrays:\n\
+                     \"entities\": [{\"name\": str, \"type\": str}, ...]\n\
+                     \"edges\": [{\"src\": str, \"src_type\": str, \"dst\": \
+                   str, \"dst_type\": str, \"relation\": str}, ...]\n\
+                   Entity types: person | project | file | system | tech | \
+                   concept | place | org.\n\
+                   Edge relations: uses | owns | depends_on | related_to | \
+                   authored | located_in | contains | creates | mentions.\n\
+                   Names MUST be canonical (no articles, singular form, \
+                   human-readable). At most 8 entities and 12 edges. If no \
+                   meaningful entities exist, return empty arrays.\n\
+                   No prose, no code fences.";
+        let user = format!("Title: {title}\n\nNote:\n{excerpt}");
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat(&msgs, None, false).await?;
+        let raw = reply
+            .content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        #[derive(Deserialize)]
+        struct Parsed {
+            #[serde(default)]
+            entities: Vec<ExtractedEntity>,
+            #[serde(default)]
+            edges: Vec<ExtractedEdge>,
+        }
+        match serde_json::from_str::<Parsed>(raw) {
+            Ok(p) => Ok((p.entities, p.edges)),
+            Err(_) => Ok((Vec::new(), Vec::new())),
+        }
+    }
+
+    /// Contextual enrichment before embedding. Ask the chat model for a
+    /// one-sentence context line that situates this memory inside the
+    /// user's broader history — topic, date, what kind of thing it is.
+    /// The line is prepended to the content before embedding so short or
+    /// ambiguous notes become findable by semantically adjacent queries.
+    ///
+    /// Returns an empty string on any failure; callers should fall back
+    /// to the raw content in that case.
+    pub async fn contextualize(&self, title: &str, content: &str) -> Result<String> {
+        // Keep the prompt cheap — small model, terse instruction, small
+        // input budget. Aim for ~50-100 tokens of context.
+        const INPUT_BUDGET: usize = 1500;
+        let excerpt: String = content.chars().take(INPUT_BUDGET).collect();
+        let sys = "You produce ONE short sentence (<= 25 words) that situates \
+                   the given note: its topic area, what kind of thing it is, \
+                   and any entities named. No preamble, no quotes, just the \
+                   sentence.";
+        let user = format!("Title: {title}\n\nNote:\n{excerpt}");
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat(&msgs, None, false).await?;
+        Ok(reply.content.trim().trim_matches('"').to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Text-form tool-call recovery
 //
-// Some Ollama models (notably qwen2.5-coder over the default template) emit
+// Some Ollama models (certain coder templates in particular) emit
 // tool calls as plain JSON in the message `content` instead of the structured
 // `tool_calls` field. This function:
 //
@@ -557,7 +683,7 @@ fn extract_tool_calls(s: &str) -> Vec<ToolCall> {
     }
 
     // Try 4: function-call syntax — `name key="value" key=value ...`.
-    // Some Ollama templates make qwen emit calls in this shape instead of JSON.
+    // Some Ollama chat templates emit calls in this shape instead of JSON.
     // Only fires if no JSON form was recovered above. The line must be ENTIRELY
     // a call (identifier + at least one `key=value` pair, nothing else) so
     // ordinary prose doesn't get mistaken for a tool invocation.
@@ -569,7 +695,7 @@ fn extract_tool_calls(s: &str) -> Vec<ToolCall> {
         }
     }
 
-    // Try 5: loose CLI syntax — `<read_only_tool> <free text>`. Catches qwen
+    // Try 5: loose CLI syntax — `<read_only_tool> <free text>`. Catches
     // "thinking out loud" like `search_memory what do you know about the user`.
     // Restricted to read-only tools with an unambiguous primary string arg so
     // the recovery can't trigger destructive actions (shell, write_file, etc.).
@@ -715,9 +841,10 @@ fn parse_call_args(s: &str) -> Option<serde_json::Map<String, serde_json::Value>
     Some(args)
 }
 
-/// Read-only tools whose primary parameter is a single string. When qwen emits
-/// `<tool> <free text>` (no `=`, no JSON braces) we can safely promote the
-/// remainder into this parameter without risking a destructive action.
+/// Read-only tools whose primary parameter is a single string. When a
+/// model emits `<tool> <free text>` (no `=`, no JSON braces) we can
+/// safely promote the remainder into this parameter without risking a
+/// destructive action.
 const LOOSE_CALL_TOOLS: &[(&str, &str)] = &[
     ("search_memory", "query"),
     ("read_file", "path"),
@@ -951,8 +1078,8 @@ mod tests {
 
     #[test]
     fn recovers_call_after_prose() {
-        // Mirrors the real failure: qwen says "Sure, I'll create..." then
-        // emits the tool call.
+        // Mirrors the real failure: the model says "Sure, I'll create..."
+        // then emits the tool call.
         let m = recover_text_tool_calls(msg(
             r#"Sure, I'll create a zip archive of the specified directory.
 {"name": "zip_create", "arguments": {"archive_path":"/tmp/src.zip","inputs":["/Users/neven/workbuddy/localmind/src"]}}"#,
@@ -983,7 +1110,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Function-call syntax fallback — `name key="value" key=value`. Some
-    // Ollama templates emit qwen's tool calls in this shape rather than JSON.
+    // Ollama chat templates emit tool calls in this shape rather than JSON.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1045,7 +1172,7 @@ mod tests {
 
     #[test]
     fn call_syntax_handles_json_array_value() {
-        // The exact shape that was leaking — qwen emits `tags=["a","b"]`.
+        // The exact shape that was leaking — the model emits `tags=["a","b"]`.
         let m = recover_text_tool_calls(msg(
             r#"store_memory title="X" content="Y" kind=preference importance=0.9 tags=["creator", "user-identity"]"#,
         ));
@@ -1072,8 +1199,8 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Loose CLI syntax — `<read_only_tool> <free text>`. Catches the
-    // "thinking out loud" failure mode where qwen names a tool and then a
-    // natural-language argument with no `=`.
+    // "thinking out loud" failure mode where the model names a tool and
+    // then a natural-language argument with no `=`.
     // -----------------------------------------------------------------------
 
     #[test]

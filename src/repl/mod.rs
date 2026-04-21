@@ -21,12 +21,46 @@ pub async fn run(
     banner(&cfg, mode_override);
     let mut agent = AgentRun::new_with_mode(
         Arc::new(cfg.clone()),
-        store,
+        store.clone(),
         mode_override,
         false,
         !cfg.web.brave_api_key.is_empty(),
         true,
     )?;
+
+    // Session persistence: keep one session per cwd. If a recent session
+    // exists (within the last week), resume its last N messages for
+    // short-term continuity. N is kept small by default because large
+    // tails of prior-session assistant style can anchor the model on
+    // patterns unrelated to the user's next turn.
+    const SESSION_MAX_AGE_SECS: i64 = 7 * 86400;
+    let resume_limit = cfg.ollama.resume_messages;
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Ok((session_id, created)) = store
+        .session_get_or_create(&cwd, SESSION_MAX_AGE_SECS)
+        .await
+    {
+        agent.set_session(session_id.clone());
+        if !created && resume_limit > 0 {
+            if let Ok(rows) = store.load_recent_messages(&session_id, resume_limit).await {
+                if !rows.is_empty() {
+                    let n = rows.len();
+                    let restored: Vec<_> = rows
+                        .into_iter()
+                        .map(|(role, content, tool_name, extras_json)| {
+                            AgentRun::message_from_persisted(role, content, tool_name, extras_json)
+                        })
+                        .collect();
+                    agent.restore_messages(restored);
+                    eprintln!(
+                        "  \x1b[2m· resumed session ({n} messages from last run — type /new to start fresh)\x1b[0m"
+                    );
+                }
+            }
+        }
+    }
 
     // Stream tokens to stdout as Ollama generates them so the reply
     // materialises in real time instead of dropping at the end in a wall.
@@ -59,7 +93,12 @@ pub async fn run(
                 }
                 let _ = rl.add_history_entry(l);
 
-                if l.starts_with('/') {
+                // Slash-command dispatch, with a guard against file-path
+                // inputs like `/Users/neven/Desktop/...`. If the first
+                // token contains another `/` after the leading one, it's
+                // a path — send it through as normal user input instead
+                // of printing a confusing "unknown command" error.
+                if l.starts_with('/') && !looks_like_path(l) {
                     match handle_slash(l, &cfg, &mut agent, last_user_turn.as_deref()).await {
                         SlashAction::Continue => {}
                         SlashAction::Quit => break,
@@ -103,6 +142,17 @@ fn chmod_user_only(p: &std::path::Path) {
 #[cfg(not(unix))]
 fn chmod_user_only(_p: &std::path::Path) {}
 
+/// Heuristic: is `line` a filesystem path starting with `/` rather than
+/// a slash command? True when the first whitespace-delimited token
+/// contains a second `/` — real slash commands are alphanumeric-only
+/// after the leading slash (`/help`, `/retry-big`, etc.), so `/Users/…`
+/// is unambiguously a path.
+fn looks_like_path(line: &str) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    // `first` is at least `/` given the caller guarded on starts_with('/').
+    first[1..].contains('/')
+}
+
 enum SlashAction {
     /// Slash command handled; keep the REPL running.
     Continue,
@@ -123,30 +173,39 @@ async fn run_turn(agent: &mut AgentRun, input: &str) {
     // connection and stops generating. Partial messages already pushed to
     // `agent.messages` stay in history so context isn't lost; the user
     // just didn't get a final reply this round.
-    let turn_fut = agent.turn(input);
-    tokio::pin!(turn_fut);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    tokio::select! {
-        r = &mut turn_fut => {
-            match r {
-                Ok(reply) => {
-                    if !streaming {
-                        println!("{reply}");
-                    }
-                    println!();
-                    println!();
-                }
-                Err(e) => eprintln!("! {e}"),
-            }
+    // Run the turn in an inner scope so its mutable borrow on `agent` is
+    // released before we try to flush the message delta to the store.
+    let (outcome, interrupted) = {
+        let turn_fut = agent.turn(input);
+        tokio::pin!(turn_fut);
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        tokio::select! {
+            r = &mut turn_fut => (Some(r), false),
+            _ = &mut ctrl_c => (None, true),
         }
-        _ = &mut ctrl_c => {
-            // Newline so "(interrupted)" lands on a fresh row even if a
-            // streamed token was mid-print.
+    };
+
+    match outcome {
+        Some(Ok(reply)) => {
+            if !streaming {
+                println!("{reply}");
+            }
+            println!();
+            println!();
+        }
+        Some(Err(e)) => eprintln!("! {e}"),
+        None => {
             eprintln!();
             eprintln!("\x1b[1;33m(interrupted — press enter for a new prompt)\x1b[0m");
         }
     }
+
+    // Flush the delta regardless of outcome — a half-finished turn still
+    // has partial messages on agent.messages that should survive a
+    // relaunch. No-op when no session is bound.
+    let _ = interrupted;
+    agent.persist_new_messages().await;
 }
 
 async fn handle_slash(
@@ -220,6 +279,21 @@ async fn handle_slash(
             if let Err(e) = run_init(agent).await {
                 eprintln!("! /init failed: {e}");
             }
+            SlashAction::Continue
+        }
+        "compact" => {
+            if let Err(e) = agent.compact_now(true).await {
+                eprintln!("! /compact failed: {e}");
+            }
+            SlashAction::Continue
+        }
+        "new" | "clear" | "reset" => {
+            // Wipe the persisted session for this cwd AND the in-memory
+            // history, leaving only a fresh system prompt. Next turn
+            // starts clean — useful when the model has drifted or the
+            // user is switching topics.
+            agent.reset_to_fresh_session();
+            println!("· new session — history cleared");
             SlashAction::Continue
         }
         "mode" => {

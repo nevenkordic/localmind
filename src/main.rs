@@ -145,6 +145,17 @@ enum MemoryCmd {
     Stats,
     /// Rebuild the vec0 ANN index from the portable blob table.
     Reindex,
+    /// Re-embed every memory from scratch. Slower than Reindex (one
+    /// Ollama embed call per row, plus one contextualize call per row
+    /// when `contextual_embed = true`). Run this after enabling
+    /// `contextual_embed`, switching `embed_model`, or restoring from a
+    /// backup that lost its vectors.
+    Reembed {
+        /// Cap the number of rows processed. Useful for smoke-testing
+        /// the flow before committing to a full re-embed on a large db.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 fn parse_mode_flag(s: Option<&str>) -> Result<Option<tools::permissions::PermissionMode>> {
@@ -523,6 +534,111 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
         MemoryCmd::Reindex => {
             let n = store.reindex_vectors().await?;
             println!("rebuilt ANN index over {n} vectors");
+            Ok(())
+        }
+        MemoryCmd::Reembed { limit } => {
+            let client = llm::ollama::OllamaClient::new(&cfg.ollama);
+            let cap = limit.unwrap_or(10_000);
+            let rows = store.list_all(cap).await?;
+            let total = rows.len();
+            if total == 0 {
+                println!("no memories to re-embed");
+                return Ok(());
+            }
+            let contextual = cfg.memory.contextual_embed;
+            let entity_extraction = cfg.memory.entity_extraction;
+            println!(
+                "re-embedding {total} memor{plural} (contextual={ctx}, entities={ents}, model={model})",
+                plural = if total == 1 { "y" } else { "ies" },
+                ctx = contextual,
+                ents = entity_extraction,
+                model = cfg.ollama.embed_model,
+            );
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            for (i, mem) in rows.iter().enumerate() {
+                // Same format the outbox worker uses — title\ncontent — so
+                // the embedding space stays consistent regardless of path.
+                let chunk = format!("{}\n{}", mem.title, mem.content);
+                let to_embed = if contextual {
+                    match client.contextualize(&mem.title, &mem.content).await {
+                        Ok(ctx) if !ctx.is_empty() => format!("{ctx}\n\n{chunk}"),
+                        _ => chunk.clone(),
+                    }
+                } else {
+                    chunk.clone()
+                };
+                match client.embed(&to_embed).await {
+                    Ok(vec) => {
+                        match store
+                            .upsert_embedding(&mem.id, &vec, &cfg.ollama.embed_model)
+                            .await
+                        {
+                            Ok(_) => {
+                                ok += 1;
+                                // Entity extraction piggybacks on re-embed
+                                // so the kg stays in sync when the user
+                                // first enables it on an existing corpus.
+                                let (ents, edges) = if entity_extraction {
+                                    match client.extract_entities(&mem.title, &mem.content).await {
+                                        Ok((es, eds)) => {
+                                            let en = es.len();
+                                            let ed = eds.len();
+                                            for e in es.into_iter().take(8) {
+                                                if let Ok(id) = store
+                                                    .upsert_entity(&e.name, &e.etype, &mem.title)
+                                                    .await
+                                                {
+                                                    let _ = store
+                                                        .link_entity_memory(&id, &mem.id)
+                                                        .await;
+                                                }
+                                            }
+                                            for edge in eds.into_iter().take(12) {
+                                                let _ = store
+                                                    .upsert_edge(
+                                                        &edge.src,
+                                                        &edge.src_type,
+                                                        &edge.dst,
+                                                        &edge.dst_type,
+                                                        &edge.relation,
+                                                    )
+                                                    .await;
+                                            }
+                                            (en, ed)
+                                        }
+                                        Err(_) => (0, 0),
+                                    }
+                                } else {
+                                    (0, 0)
+                                };
+                                let ents_suffix = if entity_extraction {
+                                    format!(" ({ents} entities, {edges} edges)")
+                                } else {
+                                    String::new()
+                                };
+                                println!(
+                                    "  [{}/{}] {} — {}{}",
+                                    i + 1,
+                                    total,
+                                    &mem.id[..8.min(mem.id.len())],
+                                    util::truncate(&mem.title, 60),
+                                    ents_suffix,
+                                );
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!("  [{}/{}] upsert failed for {}: {e}", i + 1, total, mem.id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("  [{}/{}] embed failed for {}: {e}", i + 1, total, mem.id);
+                    }
+                }
+            }
+            println!("done — {ok} re-embedded, {failed} failed");
             Ok(())
         }
     }
