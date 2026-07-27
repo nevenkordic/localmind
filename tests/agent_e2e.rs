@@ -365,6 +365,8 @@ async fn harness_plan_act_verify_records_skill() {
     // 3) verify_stage JSON pass
     // 4) distill_skills JSON array
     let mock = MockOllama::start(vec![
+        // plan scout (read-only gather)
+        MockReply::chat_text("No prior greeting files found; no relevant failures."),
         MockReply::chat_text("1. Write the greeting file\n2. Confirm contents"),
         MockReply::chat_text("Created hello.txt with Hello"),
         MockReply::chat_text(r#"{"pass": true, "feedback": "ok"}"#),
@@ -473,6 +475,7 @@ async fn harness_failure_stores_avoidance_note() {
     // checks without verify LLM calls — but testenv has test_command="".
     // Use verify JSON fail with quorum_min=1 and enough scripted replies.
     let mock = MockOllama::start(vec![
+        MockReply::chat_text("Scout: no prior successful runs for this task."),
         MockReply::chat_text("1. Do the wrong thing"),
         MockReply::chat_text("I did the wrong thing"),
         MockReply::chat_text(r#"{"pass": false, "feedback": "missing required output"}"#),

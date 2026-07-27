@@ -179,6 +179,43 @@ pub async fn run(
     // Track skills that were in context so we can credit/debit them.
     let mut outcome_skill_ids = primed_skill_ids;
 
+    // ---- PLAN SCOUT (read-only tools) ---------------------------------
+    eprintln!("  · plan scout (read-only)");
+    let scout_findings = {
+        let mut scout = AgentRun::new_with_mode(
+            cfg.clone(),
+            store.clone(),
+            Some(PermissionMode::ReadOnly),
+            true,
+            false, // no web
+            false, // no shell
+        )?;
+        scout.max_tool_iterations = 4;
+        let scout_prompt = format!(
+            "You are gathering context for a planning stage. Use ONLY \
+             read-only tools (search_memory, list_decisions, \
+             list_recent_actions, read_file, list_dir) to learn what is \
+             relevant to the TASK. Do not modify anything. When done, \
+             summarise findings in under 200 words — what exists, prior \
+             decisions/failures, and pitfalls to avoid.\n\nTASK:\n{task}"
+        );
+        match scout.turn(&scout_prompt).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("plan scout failed: {e}");
+                String::new()
+            }
+        }
+    };
+    let enriched_primer = if scout_findings.trim().is_empty() {
+        memory_primer.clone()
+    } else {
+        format!(
+            "{memory_primer}\n\nSCOUT FINDINGS (read-only gather):\n{}",
+            crate::util::truncate(&scout_findings, 2500)
+        )
+    };
+
     // ---- PLAN ----------------------------------------------------------
     let plan_model = model_for_role(&cfg, "planner");
     eprintln!(
@@ -186,14 +223,14 @@ pub async fn run(
         plan_model.as_deref().unwrap_or(&cfg.ollama.chat_model)
     );
     let plan = client
-        .plan_task(task, &memory_primer, plan_model.as_deref())
+        .plan_task(task, &enriched_primer, plan_model.as_deref())
         .await
         .context("plan stage")?;
 
     // ---- PLAN REVIEW QUORUM --------------------------------------------
     if plan_review {
         eprintln!("  · plan review quorum ({} models)", verifiers.len());
-        let primer = memory_primer.clone();
+        let primer = enriched_primer.clone();
         let task_owned = task.to_string();
         let (ok, feedback, votes) = run_quorum(&cfg, &verifiers, policy, "plan_review", |model| {
             let client = client.clone();

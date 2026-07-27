@@ -624,12 +624,13 @@ impl OllamaClient {
     ) -> Result<String> {
         let sys = "You are the planner stage of a local multi-model harness. \
                    Produce a concrete, ordered plan for the TASK. Cite any \
-                   relevant skills or memories you were given. No tools — \
-                   planning only. Bulleted steps, max 250 words, no preamble.";
+                   relevant skills, memories, or scout findings you were given. \
+                   No tools in this step — planning only. Bulleted steps, max \
+                   250 words, no preamble.";
         let user = if memory_primer.is_empty() {
             format!("TASK:\n{task}")
         } else {
-            format!("RELEVANT MEMORY / SKILLS:\n{memory_primer}\n\nTASK:\n{task}")
+            format!("RELEVANT MEMORY / SKILLS / SCOUT FINDINGS:\n{memory_primer}\n\nTASK:\n{task}")
         };
         let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
         let reply = self.chat_on(&msgs, None, false, model_override).await?;

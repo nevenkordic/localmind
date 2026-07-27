@@ -92,12 +92,13 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
 - **Action history.** `list_recent_actions` surfaces audit-log tool calls
   and LTM work notes (auto-persist, harness runs, compact summaries).
-- **Verify harness.** `llm run "<task>"` runs plan → review → act → verify with
-  verifier quorum, optional ground-truth checks (`test_command`), and skill
-  promotion (`auto` → `verified`) / demotion (`ignored` after repeated
-  failures). Failed runs store avoidance notes. `llm harness stats` /
-  `history` inspect learning metrics. Shared SQLite memory only — no
-  markdown memory files.
+- **Verify harness.** `llm run "<task>"` runs plan scout (read-only tools) →
+  plan → review → act → verify with verifier quorum, optional ground-truth
+  checks (`test_command`), and skill promotion (`auto` → `verified`) /
+  demotion (`ignored` after repeated failures). Failed runs store avoidance
+  notes. Approve skills with `llm skills approve` / `/approve`.
+  `llm harness stats` / `history` inspect learning metrics. Shared SQLite
+  memory only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
@@ -190,6 +191,9 @@ llm run "fix the failing test"  # plan → act → verify harness; records skill
 llm harness stats                # pass rate, attempts, skills from prior runs
 llm harness history              # recent harness runs (what/when)
 llm harness history --failed     # only failed runs
+llm skills list                  # taught skills + trust tiers
+llm skills approve <id>          # mark a skill authoritative (user trust)
+llm skills ignore <id>           # hide a skill from primers
 llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)
@@ -207,7 +211,7 @@ llm update                   # grab a newer release
 ```
 /help    /quit    /init    /stats    /health    /audit
 /config  /tools   /mode    /model
-/skills  /forget <id>  /remember <fact>
+/skills  /approve <id>  /ignore <id>  /forget <id>  /remember <fact>
 /recall <query>  /context
 /compact                        summarise history now (auto-fires near num_ctx)
 /new     /clear   /reset        wipe this session's history, start fresh
@@ -351,6 +355,18 @@ cargo test                 # unit + smoke + e2e
 bash scripts/preflight.sh  # full pre-ship verification
 cargo build --release      # binary at target/release/llm
 ```
+
+### Releases (manual only)
+
+The **Release** GitHub Action does **not** run on push or merge. Publish a
+build only when you want one:
+
+1. Actions → **Release** → **Run workflow**
+2. Enter a version tag like `v0.1.11` (optional: draft)
+3. The workflow builds multi-arch binaries, creates the tag if missing, and
+   attaches assets to a GitHub Release
+
+CI (`fmt` / `clippy` / `tests`) still runs on PRs and pushes to `main`.
 
 ## License
 

@@ -1019,6 +1019,44 @@ impl Store {
         Ok(())
     }
 
+    /// Manually set a memory's trust tier (e.g. approve a skill → `user`,
+    /// or hide it → `ignored`).
+    pub async fn set_trust_tier(&self, id: &str, tier: &str) -> Result<()> {
+        match tier {
+            "user" | "verified" | "auto" | "ignored" => {}
+            other => anyhow::bail!("invalid trust_tier '{other}' (use user|verified|auto|ignored)"),
+        }
+        let inner = self.inner.clone();
+        let id = id.to_string();
+        let tier = tier.to_string();
+        let now = util::now_ts();
+        let importance_bump = if tier == "user" { 0.95f32 } else { 0.0 };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            let changed = if importance_bump > 0.0 {
+                conn.execute(
+                    r#"UPDATE memories
+                       SET trust_tier = ?1,
+                           importance = CASE WHEN importance < ?2 THEN ?2 ELSE importance END,
+                           updated_at = ?3
+                       WHERE id = ?4"#,
+                    params![tier, importance_bump, now, id],
+                )?
+            } else {
+                conn.execute(
+                    "UPDATE memories SET trust_tier = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![tier, now, id],
+                )?
+            };
+            if changed == 0 {
+                anyhow::bail!("no memory with id {id}");
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     /// Bump skill outcome counters; promote to `verified` after enough
     /// successes, or demote to `ignored` after enough failures.
     pub async fn record_skill_outcome(
