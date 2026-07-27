@@ -259,6 +259,35 @@ pub async fn run(
     let mut attempts = 0usize;
     let mut checks_json = "[]".to_string();
 
+    // One AgentRun for all act retries, bound to the cwd session so STM
+    // (and auto_persist LTM) carry prior attempt context + tool history.
+    let mut act_agent =
+        AgentRun::new_with_mode(cfg.clone(), store.clone(), mode, true, true, true)?;
+    const SESSION_MAX_AGE_SECS: i64 = 7 * 86400;
+    let resume_limit = cfg.ollama.resume_messages;
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Ok((session_id, created)) = store
+        .session_get_or_create(&cwd, SESSION_MAX_AGE_SECS)
+        .await
+    {
+        act_agent.set_session(session_id.clone());
+        if !created && resume_limit > 0 {
+            if let Ok(rows) = store.load_recent_messages(&session_id, resume_limit).await {
+                if !rows.is_empty() {
+                    let restored: Vec<_> = rows
+                        .into_iter()
+                        .map(|(role, content, tool_name, extras_json)| {
+                            AgentRun::message_from_persisted(role, content, tool_name, extras_json)
+                        })
+                        .collect();
+                    act_agent.restore_messages(restored);
+                }
+            }
+        }
+    }
+
     for attempt in 0..=max_retries {
         attempts = attempt + 1;
         let act_prompt = if feedback.is_empty() {
@@ -278,9 +307,8 @@ pub async fn run(
         };
 
         eprintln!("  · act attempt {attempts} ({})", cfg.ollama.chat_model);
-        let mut agent =
-            AgentRun::new_with_mode(cfg.clone(), store.clone(), mode, true, true, true)?;
-        result = agent.turn(&act_prompt).await.context("act stage")?;
+        result = act_agent.turn(&act_prompt).await.context("act stage")?;
+        act_agent.persist_new_messages().await;
 
         let audit_tail = checks::read_audit_tail(audit.path(), 40).unwrap_or_default();
         let check_report = checks::run_checks(&test_command, &audit_tail).await;

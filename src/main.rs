@@ -767,6 +767,39 @@ async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
             println!("pass rate:       {:.1}%", s.pass_rate * 100.0);
             println!("skills stored:   {}", s.skills_stored);
             println!("avg attempts:    {:.2}", s.avg_attempts);
+            // Lightweight self-tuning hints from recent history.
+            if s.total_runs >= 3 {
+                let recent = store.list_harness_runs(10, false, None).await?;
+                let recent_pass = recent.iter().filter(|r| r.passed).count();
+                let recent_n = recent.len().max(1);
+                let recent_rate = recent_pass as f64 / recent_n as f64;
+                let recent_avg_attempts = if recent.is_empty() {
+                    0.0
+                } else {
+                    recent.iter().map(|r| r.attempts as f64).sum::<f64>() / recent.len() as f64
+                };
+                println!();
+                println!("hints (last {recent_n} runs):");
+                println!(
+                    "  recent pass rate: {:.0}%  avg attempts: {:.2}",
+                    recent_rate * 100.0,
+                    recent_avg_attempts
+                );
+                if recent_rate < 0.5 {
+                    println!(
+                        "  · pass rate is low — raise [harness].max_retries or add a test_command"
+                    );
+                    println!(
+                        "  · review: llm harness history --failed && llm skills list"
+                    );
+                } else if recent_avg_attempts > 1.5 {
+                    println!(
+                        "  · retries are common — strengthen plan scout memory / skills"
+                    );
+                } else if recent_rate >= 0.8 {
+                    println!("  · harness is healthy — keep approving solid auto-skills");
+                }
+            }
             Ok(())
         }
         HarnessCmd::History {
