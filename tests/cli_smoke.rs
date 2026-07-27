@@ -379,3 +379,57 @@ fn skills_list_approve_ignore_round_trip() {
     let ignore_out = String::from_utf8_lossy(&ignore.stdout);
     assert!(ignore_out.contains("ignored"), "{ignore_out}");
 }
+
+#[test]
+fn project_set_show_list_forget_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+
+    let empty = run(&cfg, &["project", "show"]);
+    assert!(empty.status.success());
+    let empty_out = String::from_utf8_lossy(&empty.stdout);
+    assert!(
+        empty_out.contains("no project profile"),
+        "unexpected: {empty_out}"
+    );
+
+    let set = run(
+        &cfg,
+        &[
+            "project",
+            "set",
+            "-t",
+            "localmind",
+            "Rust CLI with SQLite memory and an Ollama harness.",
+        ],
+    );
+    assert!(
+        set.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let show = run(&cfg, &["project", "show"]);
+    assert!(show.status.success());
+    let show_out = String::from_utf8_lossy(&show.stdout);
+    assert!(show_out.contains("localmind"), "{show_out}");
+    assert!(show_out.contains("SQLite memory"), "{show_out}");
+
+    let list = run(&cfg, &["project", "list"]);
+    assert!(list.status.success());
+    let list_out = String::from_utf8_lossy(&list.stdout);
+    assert!(list_out.contains("localmind"), "{list_out}");
+
+    let forget = run(&cfg, &["project", "forget"]);
+    assert!(forget.status.success());
+    let forget_out = String::from_utf8_lossy(&forget.stdout);
+    assert!(forget_out.contains("ignored"), "{forget_out}");
+
+    let show2 = run(&cfg, &["project", "show"]);
+    assert!(show2.status.success());
+    let show2_out = String::from_utf8_lossy(&show2.stdout);
+    assert!(
+        show2_out.contains("no project profile"),
+        "forgotten profile should not show: {show2_out}"
+    );
+}
