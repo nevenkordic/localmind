@@ -249,8 +249,10 @@ cp config/config.example.toml config/local.toml
 
 | key                 | effect                                                   |
 |---------------------|----------------------------------------------------------|
-| `chat_model`        | capable model — used for code / tools / long prompts     |
-| `fast_model`        | optional small model for short turns + auxiliary calls   |
+| `chat_model`        | capable model — hard work + auto-escalate target         |
+| `fast_model`        | optional small model for cascade + auxiliary calls       |
+| `prefer_fast`       | start most turns on `fast_model` (default false)         |
+| `auto_escalate`     | retry weak fast replies on `chat_model` (default true)   |
 | `vision_model`      | used when a turn includes image input                    |
 | `embed_model`       | used by the memory index                                 |
 | `num_ctx`           | per-reply token budget                                   |
@@ -308,15 +310,24 @@ Env vars override: `LOCALMIND_CHAT_MODEL`, `LOCALMIND_DB_PATH`,
 
 Biggest wins, in order:
 
-1. Set `[ollama].fast_model` to a small model (e.g. `qwen2.5:1.5b`) — short
-   turns and auxiliaries skip the big chat model.
+1. Set `[ollama].fast_model` to a small model (e.g. `qwen2.5:1.5b`) and
+   `chat_model` to a bigger one (e.g. `qwen2.5-coder:7b` or larger). For
+   “small by default, big when hard”:
+   ```toml
+   prefer_fast = true
+   auto_escalate = true
+   ```
+   Most turns start on `fast_model`. Clearly hard prompts go straight to
+   `chat_model`. Weak fast replies (low confidence, tool failure, struggle
+   phrases) automatically retry on `chat_model`. Only Ollama model names
+   matter — nothing is pinned to GPU/VRAM/hardware.
 2. `[memory].vector_search = false` — BM25-only recall, no embed round-trip.
 3. Keep `expansion_variants = 0`, leave `rerank_model` / `graph_search` /
    `contextual_embed` / `entity_extraction` off unless you need them.
 4. Lower `num_ctx` (e.g. 4096) if you don't paste huge files.
 5. `[agent].confidence_verify = false` — skips the optional verifier call.
-6. Use a smaller `chat_model`, and keep `keep_alive = "30m"` so Ollama
-   doesn't cold-load between turns.
+6. Keep `keep_alive = "30m"` so Ollama doesn't cold-load between turns.
+   Manual override: `/retry-big` re-runs the last turn on `chat_model`.
 
 ### Permission modes
 

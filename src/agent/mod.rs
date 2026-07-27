@@ -416,10 +416,10 @@ impl AgentRun {
 
     /// Decide which model this turn should use. Precedence:
     ///   1. An explicit `force_model` set by the REPL (slash commands).
-    ///   2. No routing if `fast_model` is empty / equals `chat_model` — the
-    ///      user hasn't opted into cascading.
-    ///   3. Heuristic: trivial / short / conversational → fast_model;
-    ///      code / long / tool-implicit → chat_model.
+    ///   2. No routing if `fast_model` is empty / equals `chat_model`.
+    ///   3. `prefer_fast`: capable only when input is clearly hard;
+    ///      otherwise start on the small model (auto_escalate may promote).
+    ///   4. Default: trivial → fast_model; everything else → chat_model.
     fn route_turn(&self, input: &str) -> String {
         if let Some(m) = &self.force_model {
             return m.clone();
@@ -429,11 +429,25 @@ impl AgentRun {
         if fast.is_empty() || fast == main {
             return main.clone();
         }
-        if should_use_fast(input) {
+        if self.ctx.cfg.ollama.prefer_fast {
+            if needs_capable_model(input) {
+                main.clone()
+            } else {
+                fast.to_string()
+            }
+        } else if should_use_fast(input) {
             fast.to_string()
         } else {
             main.clone()
         }
+    }
+
+    /// True when this model name is the configured fast path (and a distinct
+    /// capable model exists to escalate to).
+    fn is_fast_model(&self, model: &str) -> bool {
+        let fast = self.ctx.cfg.ollama.fast_model.trim();
+        let main = self.ctx.cfg.ollama.chat_model.trim();
+        !fast.is_empty() && fast != main && model == fast
     }
 
     /// Rough token estimate — char count / 4 plus a flat per-message
@@ -705,11 +719,31 @@ impl AgentRun {
 
         self.messages
             .push(ChatMessage::user(user_input.to_string()));
+        let user_idx = self.messages.len() - 1;
         let model = self.route_turn(user_input);
         // Consume any force_model so the next turn re-routes normally.
         self.force_model = None;
-        let reply = self.loop_tools(&model).await?;
-        let reply = self.maybe_confidence_verify(user_input, reply).await;
+        let mut reply = self.loop_tools(&model).await?;
+        // Capture confidence before the verify gate strips the tag.
+        let conf_score = parse_confidence(&reply);
+        reply = self.maybe_confidence_verify(user_input, reply).await;
+
+        // Automatic escalate: weak fast_model reply → retry on chat_model.
+        if self.ctx.cfg.ollama.auto_escalate
+            && self.is_fast_model(&model)
+            && should_escalate_reply(&reply, conf_score, self.ctx.cfg.agent.confidence_min)
+        {
+            let big = self.ctx.cfg.ollama.chat_model.clone();
+            eprintln!("  · escalating to {big} (challenging task)");
+            // Drop this turn's assistant/tool trail; keep the user message.
+            self.messages.truncate(user_idx + 1);
+            if self.persisted_up_to > self.messages.len() {
+                self.persisted_up_to = self.messages.len();
+            }
+            reply = self.loop_tools(&big).await?;
+            reply = self.maybe_confidence_verify(user_input, reply).await;
+        }
+
         self.maybe_auto_persist(user_input, turn_mark).await;
         Ok(reply)
     }
@@ -1345,9 +1379,10 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_narrated_write, extract_facts, is_trivial_turn, parse_confidence,
-        scrub_hallucinated_tool_output, should_use_fast, strip_confidence_tag, MarkdownHighlighter,
-        StreamingConfidenceFilter, StreamingToolCallFilter,
+        detect_narrated_write, extract_facts, is_trivial_turn, needs_capable_model,
+        parse_confidence, scrub_hallucinated_tool_output, should_escalate_reply, should_use_fast,
+        strip_confidence_tag, MarkdownHighlighter, StreamingConfidenceFilter,
+        StreamingToolCallFilter,
     };
 
     #[test]
@@ -1541,6 +1576,51 @@ mod tests {
     fn router_big_for_long_prompts() {
         let long = "a ".repeat(200); // 400 chars
         assert!(!should_use_fast(&long));
+    }
+
+    #[test]
+    fn prefer_fast_only_escalates_hard_inputs() {
+        // Soft / chatty — stay on fast when prefer_fast is on.
+        assert!(!needs_capable_model("what is a mutex"));
+        assert!(!needs_capable_model("hello there friend"));
+        assert!(!needs_capable_model("tell me a joke"));
+        // Hard — go straight to chat_model even with prefer_fast.
+        assert!(needs_capable_model(
+            "fix the failing test in src/agent/mod.rs"
+        ));
+        assert!(needs_capable_model("implement a retry loop with backoff"));
+        assert!(needs_capable_model("carefully investigate this race"));
+        let long = "a ".repeat(200);
+        assert!(needs_capable_model(&long));
+    }
+
+    #[test]
+    fn escalate_on_low_confidence_and_struggle() {
+        assert!(should_escalate_reply(
+            "kinda unsure [CONFIDENCE: 1/5]",
+            Some(1),
+            3
+        ));
+        assert!(!should_escalate_reply(
+            "solid answer [CONFIDENCE: 5/5]",
+            Some(5),
+            3
+        ));
+        assert!(should_escalate_reply(
+            "Max tool iterations reached without a final answer.",
+            None,
+            3
+        ));
+        assert!(should_escalate_reply(
+            "This is too complex for me — try a larger model.",
+            None,
+            3
+        ));
+        assert!(!should_escalate_reply(
+            "Here is the definition of a mutex.",
+            None,
+            3
+        ));
     }
 
     #[test]
@@ -2731,26 +2811,8 @@ fn hallucination_error(flag: &str) -> String {
     )
 }
 
-/// Cascade router heuristic: true if this turn should run on `fast_model`.
-/// Intentionally loose — the goal is to route the easy 80% to the small
-/// model. Wrong calls are recoverable via `/retry-big`.
-///
-/// Fast path when ALL of:
-///   - Trimmed input is ≤ 300 chars (longer prompts almost always want
-///     the capable model).
-///   - No code-ish tokens (triple backticks, file extensions, path
-///     separators, the `::` / `=>` / `->` / `()` sigils).
-///   - No tool-implicit verbs ("fix", "refactor", "debug", "fetch",
-///     "run", "implement", "build", "search web", etc.).
-/// Trivial turns ("hi", "ok", "thanks") trivially qualify.
-/// Cascade-router classifier. Default is `false` — route to `chat_model`.
-///
-/// Returns `true` (→ `fast_model`) only on POSITIVE evidence of
-/// triviality: a bare interjection, or a short lookup / question with
-/// no side-effect verbs. This "safe default" inverts the previous
-/// "fast unless we spotted a tool verb" logic, which leaked any
-/// unclassified substantive request to a small model that can't
-/// reliably tool-call.
+/// Cascade router heuristic: true if this turn should run on `fast_model`
+/// when `prefer_fast` is false (safe default — capable unless clearly trivial).
 pub(crate) fn should_use_fast(input: &str) -> bool {
     let t = input.trim();
 
@@ -2759,131 +2821,12 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
         return true;
     }
 
-    // From here on, only route to fast on short positive lookups /
-    // questions. Everything else stays on chat_model.
-
-    if t.chars().count() > 120 {
+    // Hard work always stays on the capable model.
+    if needs_capable_model(t) {
         return false;
     }
 
     let lower = t.to_lowercase();
-
-    // Any whiff of a side-effect or file-ish token kills the fast path,
-    // regardless of length. This is the safety net — if we ever add
-    // more routing heuristics above, a stray action verb still forces
-    // chat_model.
-    const SIDE_EFFECT_MARKERS: &[&str] = &[
-        // file / io
-        "create ",
-        "write ",
-        "save ",
-        "edit ",
-        "modify ",
-        "delete ",
-        "remove ",
-        "rename ",
-        "append ",
-        "mkdir",
-        "touch ",
-        "chmod",
-        "chown",
-        "upload",
-        "download",
-        "zip",
-        "extract",
-        "archive",
-        // code
-        "fix ",
-        "refactor",
-        "debug",
-        "implement",
-        "build",
-        "compile",
-        "install",
-        "uninstall",
-        "upgrade",
-        "update ",
-        "lint",
-        "format ",
-        "test ",
-        "tests",
-        "benchmark",
-        "profile",
-        "patch ",
-        "diff ",
-        "generate",
-        "render ",
-        "convert",
-        "translate ",
-        "parse ",
-        "review",
-        // shell / web / network
-        "run ",
-        "execute",
-        "shell ",
-        "fetch ",
-        "scrape",
-        "curl ",
-        "wget",
-        "http",
-        "search web",
-        "look up",
-        "google",
-        "deploy",
-        "commit",
-        " push ",
-        " pull ",
-        "merge ",
-        "rebase",
-        "branch",
-        "checkout",
-        "clone ",
-        "fork ",
-        // content creation
-        "website",
-        "webpage",
-        "web page",
-        "html",
-        "css ",
-        "javascript",
-        "typescript",
-        "json ",
-        "yaml",
-        "markdown",
-        "script ",
-        "readme",
-        "documentation",
-        "pdf",
-        "docx",
-        "xlsx",
-        // code markers
-        "```",
-        ".rs",
-        ".py",
-        ".ts",
-        ".tsx",
-        ".js",
-        ".jsx",
-        ".go",
-        ".java",
-        ".rb",
-        ".cpp",
-        "::",
-        "=>",
-        "->",
-        "()",
-        "{}",
-        "[]",
-        "&&",
-        "||",
-    ];
-    if SIDE_EFFECT_MARKERS.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-    // Path-like token (`/Users/...`, `src/agent/mod.rs`) → chat_model.
-    if t.contains('/') && t.split_whitespace().any(|w| w.contains('/') && w.len() > 3) {
-        return false;
-    }
 
     // Positive triviality signals — short, pure lookup / question.
     const TRIVIAL_LEADERS: &[&str] = &[
@@ -2932,21 +2875,208 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
         "good afternoon",
         "good evening",
         "good night",
+        "nice to meet",
+        "pleased to meet",
         "thank you",
+        "thanks a lot",
+        "thanks!",
         "thanks for",
-        "you there",
+        "cheers",
+        "bye",
+        "goodbye",
+        "see you",
         "got it",
-        "nice one",
+        "sounds good",
+        "makes sense",
+        "cool",
+        "great",
+        "awesome",
+        "perfect",
+        "okay",
+        "ok.",
+        "ok!",
+        "sure",
+        "yep",
+        "yeah",
+        "yes",
+        "no",
+        "nope",
         "hello ",
         "hey ",
         "hi there",
     ];
-    if FILLER.iter().any(|p| lower.contains(p)) {
+    if FILLER.iter().any(|p| lower == *p || lower.starts_with(p)) {
         return true;
     }
 
-    // Default: chat_model. Better to over-invest than to break the turn.
     false
+}
+
+/// True when the input clearly needs the capable model (code, tools, long
+/// prompts, side effects). Used by `prefer_fast` routing and as the hard
+/// gate inside `should_use_fast`.
+pub(crate) fn needs_capable_model(input: &str) -> bool {
+    let t = input.trim();
+    if t.chars().count() > 120 {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    const SIDE_EFFECT_MARKERS: &[&str] = &[
+        "create ",
+        "write ",
+        "save ",
+        "edit ",
+        "modify ",
+        "delete ",
+        "remove ",
+        "rename ",
+        "append ",
+        "mkdir",
+        "touch ",
+        "chmod",
+        "chown",
+        "upload",
+        "download",
+        "zip",
+        "extract",
+        "archive",
+        "fix ",
+        "refactor",
+        "debug",
+        "implement",
+        "build",
+        "compile",
+        "install",
+        "uninstall",
+        "upgrade",
+        "update ",
+        "lint",
+        "format ",
+        "test ",
+        "tests",
+        "benchmark",
+        "profile",
+        "patch ",
+        "diff ",
+        "generate",
+        "render ",
+        "convert",
+        "translate ",
+        "parse ",
+        "review",
+        "run ",
+        "execute",
+        "shell ",
+        "fetch ",
+        "scrape",
+        "curl ",
+        "wget",
+        "http",
+        "search web",
+        "look up",
+        "google",
+        "deploy",
+        "commit",
+        " push ",
+        " pull ",
+        "merge ",
+        "rebase",
+        "branch",
+        "checkout",
+        "clone ",
+        "fork ",
+        "website",
+        "webpage",
+        "web page",
+        "html",
+        "css ",
+        "javascript",
+        "typescript",
+        "json ",
+        "yaml",
+        "markdown",
+        "script ",
+        "readme",
+        "documentation",
+        "pdf",
+        "docx",
+        "xlsx",
+        "```",
+        ".rs",
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".go",
+        ".java",
+        ".rb",
+        ".cpp",
+        "::",
+        "=>",
+        "->",
+        "()",
+        "{}",
+        "[]",
+        "&&",
+        "||",
+        "challenge",
+        "complex",
+        "architect",
+        "design a",
+        "plan a",
+        "multi-step",
+        "multi step",
+        "carefully",
+        "thorough",
+        "analyse",
+        "analyze",
+        "investigate",
+    ];
+    if SIDE_EFFECT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    if t.contains('/') && t.split_whitespace().any(|w| w.contains('/') && w.len() > 3) {
+        return true;
+    }
+    false
+}
+
+/// Decide whether a fast_model reply is too weak and should be retried on
+/// chat_model. Purely content-based — no hardware / VRAM checks.
+pub(crate) fn should_escalate_reply(
+    reply: &str,
+    confidence: Option<u8>,
+    confidence_min: u8,
+) -> bool {
+    if let Some(c) = confidence {
+        if c < confidence_min.max(1) {
+            return true;
+        }
+    }
+    if detect_narrated_write(reply).is_some() {
+        return true;
+    }
+    let lower = reply.to_lowercase();
+    const STRUGGLE: &[&str] = &[
+        "max tool iterations reached",
+        "instead of actually calling a tool",
+        "too small for reliable tool use",
+        "fake `",
+        "i'm not sure how",
+        "i am not sure how",
+        "i don't know how to",
+        "i do not know how to",
+        "cannot complete this",
+        "can't complete this",
+        "unable to complete",
+        "need a more capable",
+        "try a larger model",
+        "beyond my",
+        "too complex for me",
+        "i can't help with that reliably",
+    ];
+    STRUGGLE.iter().any(|s| lower.contains(s))
 }
 
 /// Skip memory recall for interjection-only turns. Recall against "hi" or

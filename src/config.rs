@@ -34,14 +34,23 @@ pub struct OllamaConfig {
     pub chat_model: String,
     pub vision_model: String,
     pub embed_model: String,
-    /// Optional fast-path model. When set, the agent routes trivial / short /
-    /// conversational turns here and only escalates to `chat_model` for code,
-    /// long prompts, or explicit tool-implicit requests. Empty string means
-    /// "no cascading — always use chat_model" (keeps existing behaviour for
-    /// users who don't care). Users can also force either direction with
-    /// `/fast <msg>` / `/big <msg>` / `/retry-big` in the REPL.
+    /// Optional fast-path model. When set AND different from `chat_model`,
+    /// the cascade router can send turns here. See `prefer_fast` /
+    /// `auto_escalate`. Empty = always use `chat_model`.
     #[serde(default)]
     pub fast_model: String,
+    /// When true (and `fast_model` is set), most turns start on the small
+    /// model; only clearly hard inputs (code, tools, long prompts) go
+    /// straight to `chat_model`. Pair with `auto_escalate` so a weak fast
+    /// reply is retried on the capable model automatically.
+    #[serde(default)]
+    pub prefer_fast: bool,
+    /// After a `fast_model` turn, if the reply looks weak (low confidence,
+    /// narrated writes, tool-loop failure, struggle phrases), automatically
+    /// retry the same turn on `chat_model`. Hardware-agnostic — only model
+    /// names matter. No-op when `fast_model` is unset.
+    #[serde(default = "default_true")]
+    pub auto_escalate: bool,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     #[serde(default = "default_ctx")]

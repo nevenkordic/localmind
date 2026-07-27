@@ -4,16 +4,21 @@
 [ollama]
 # URL of your local Ollama server.
 host = "http://127.0.0.1:11434"
-# Primary chat model. The installer pulls a small-but-capable default.
+# Primary capable model — used for hard work and as the auto-escalate target.
 # Swap to a larger variant for better reasoning at the cost of speed:
 # `llm models --chat <name>` after pulling it with Ollama.
 chat_model = "qwen2.5-coder:3b"
-# Optional fast-path model for the cascade router. When set AND different
-# from chat_model, the agent routes trivial / short / chatty turns here
-# AND auxiliary calls (query expansion, etc.). chat_model still handles
-# real work: code changes, long prompts, explicit-tool requests. Leave
-# blank to disable cascading — every turn will go to chat_model.
+# Optional small/fast model for the cascade router. When set AND different
+# from chat_model, short/chatty turns (or most turns if prefer_fast=true)
+# run here. Leave blank to disable cascading — every turn uses chat_model.
 fast_model = ""
+# Prefer the small model by default (speed). Hard inputs still go straight
+# to chat_model; weak fast replies auto-retry on chat_model when
+# auto_escalate is on. Hardware-agnostic — just Ollama model names.
+prefer_fast = false
+# Automatically retry on chat_model when a fast_model reply looks weak
+# (low confidence, tool failure, narrated write, struggle phrases).
+auto_escalate = true
 # Secondary model used for vision-capable turns (image inputs). Pick
 # something that supports image tokens; otherwise leave equal to
 # chat_model to fall back to text-only.
