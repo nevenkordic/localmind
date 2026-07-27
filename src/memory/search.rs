@@ -129,17 +129,20 @@ pub async fn hybrid_search(
         }
     }
 
-    // 3. Convert accumulators to final Hits. Apply temporal decay and
-    //    importance multipliers on top of the RRF score.
+    // 3. Convert accumulators to final Hits. Apply temporal decay,
+    //    importance, and trust/outcome boosts on top of the RRF score.
+    //    Ignored memories are dropped so demoted skills never resurface.
     let now = util::now_ts();
     let half_life = cfg.memory.temporal_half_life_days.max(1.0);
     let mut hits: Vec<Hit> = by_id
         .into_values()
+        .filter(|a| a.memory.trust_tier != "ignored")
         .map(|a| {
             let age_days = ((now - a.memory.updated_at).max(0) as f32) / 86400.0;
             let decay = util::temporal_decay(age_days, half_life);
             let imp = a.memory.importance.clamp(0.0, 1.0);
-            let score = a.rrf * (0.7 + 0.3 * imp) * decay;
+            let boost = trust_outcome_boost(&a.memory);
+            let score = a.rrf * (0.7 + 0.3 * imp) * decay * boost;
             Hit {
                 memory: a.memory,
                 score,
@@ -447,6 +450,22 @@ fn personalized_pagerank(
     scores
 }
 
+/// Trust-tier + outcome multiplier for recall. Verified/user skills rise;
+/// repeated failures sink. Returns 0 for ignored (caller should filter).
+pub(crate) fn trust_outcome_boost(m: &StoredMemory) -> f32 {
+    if m.trust_tier == "ignored" {
+        return 0.0;
+    }
+    let tier = match m.trust_tier.as_str() {
+        "user" => 1.35,
+        "verified" => 1.2,
+        _ => 1.0,
+    };
+    let delta = (m.success_count - m.fail_count) as f32;
+    let outcome = (1.0 + 0.05 * delta).clamp(0.7, 1.4);
+    tier * outcome
+}
+
 /// Collapse entity-level PPR scores onto the memories they came from.
 /// An entity that appears in multiple memories contributes its score to
 /// each of them — the "graph cue → documents" fan-out step.
@@ -493,6 +512,38 @@ mod tests {
             success_count: 0,
             fail_count: 0,
         }
+    }
+
+    #[test]
+    fn trust_outcome_boost_prefers_verified_and_success() {
+        let mut auto = mem("a", 1.0, 0);
+        auto.trust_tier = "auto".into();
+        auto.success_count = 0;
+        auto.fail_count = 0;
+
+        let mut verified = mem("v", 1.0, 0);
+        verified.kind = "skill".into();
+        verified.trust_tier = "verified".into();
+        verified.success_count = 4;
+        verified.fail_count = 0;
+
+        let mut failing = mem("f", 1.0, 0);
+        failing.trust_tier = "auto".into();
+        failing.success_count = 0;
+        failing.fail_count = 5;
+
+        let mut ignored = mem("i", 1.0, 0);
+        ignored.trust_tier = "ignored".into();
+
+        assert!(
+            trust_outcome_boost(&verified) > trust_outcome_boost(&auto),
+            "verified+success should beat plain auto"
+        );
+        assert!(
+            trust_outcome_boost(&auto) > trust_outcome_boost(&failing),
+            "failures should sink ranking"
+        );
+        assert_eq!(trust_outcome_boost(&ignored), 0.0);
     }
 
     #[test]

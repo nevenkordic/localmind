@@ -45,6 +45,10 @@ pub struct AgentRun {
     /// How many of `messages` have been flushed to the session store.
     /// Only the delta past this index is written on each flush.
     persisted_up_to: usize,
+    /// Skill memory ids primed on the most recent turn — used by the
+    /// harness to attribute promote/demote to skills that were actually
+    /// in context during act (not just plan).
+    last_primed_skill_ids: Vec<String>,
 }
 
 impl AgentRun {
@@ -98,6 +102,7 @@ impl AgentRun {
             force_model: None,
             session_id: None,
             persisted_up_to: 1, // system prompt never needs persisting
+            last_primed_skill_ids: Vec::new(),
         })
     }
 
@@ -137,6 +142,12 @@ impl AgentRun {
         self.messages.truncate(1);
         self.messages.extend(loaded);
         self.persisted_up_to = self.messages.len();
+    }
+
+    /// Skill ids primed on the last turn. Consumed by the harness so
+    /// promote/demote tracks what act actually saw.
+    pub fn take_primed_skill_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.last_primed_skill_ids)
     }
 
     /// Flush any newly-pushed messages to the session store. Safe to call
@@ -686,11 +697,12 @@ impl AgentRun {
     /// `[memory].vector_search`: when enabled, uses hybrid_search for
     /// semantic match; when disabled, falls back to BM25 (BM25 also fires
     /// when the query is too short for hybrid search to be meaningful).
-    async fn build_primers(&self, user_input: &str) -> (Option<String>, Option<String>) {
+    async fn build_primers(&mut self, user_input: &str) -> (Option<String>, Option<String>) {
         const MAX_SKILLS: usize = 2;
         const MAX_MEMORIES: usize = 3;
         const CONTENT_CAP: usize = 500;
 
+        self.last_primed_skill_ids.clear();
         let recent = self.build_recent_context_primer().await;
 
         if is_trivial_turn(user_input) {
@@ -739,6 +751,8 @@ impl AgentRun {
             .filter(|(m, _)| m.kind != "skill" && m.trust_tier != "ignored")
             .take(MAX_MEMORIES)
             .collect();
+
+        self.last_primed_skill_ids = skills.iter().map(|(m, _)| m.id.clone()).collect();
 
         let skill_primer = if skills.is_empty() {
             None

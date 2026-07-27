@@ -789,13 +789,9 @@ async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
                     println!(
                         "  · pass rate is low — raise [harness].max_retries or add a test_command"
                     );
-                    println!(
-                        "  · review: llm harness history --failed && llm skills list"
-                    );
+                    println!("  · review: llm harness history --failed && llm skills list");
                 } else if recent_avg_attempts > 1.5 {
-                    println!(
-                        "  · retries are common — strengthen plan scout memory / skills"
-                    );
+                    println!("  · retries are common — strengthen plan scout memory / skills");
                 } else if recent_rate >= 0.8 {
                     println!("  · harness is healthy — keep approving solid auto-skills");
                 }

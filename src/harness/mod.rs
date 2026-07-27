@@ -156,7 +156,7 @@ pub async fn run(
 
     let client = OllamaClient::new(&cfg.ollama);
     let policy = QuorumPolicy::parse(&cfg.harness.quorum_policy);
-    let max_retries = formula
+    let mut max_retries = formula
         .formula
         .max_verify_retries
         .max(cfg.harness.max_retries);
@@ -168,6 +168,36 @@ pub async fn run(
         .to_string();
     let verifiers = verifier_models(&cfg);
 
+    // Adaptive retries from recent harness_runs — low pass rate → one more try.
+    if cfg.harness.adaptive_retries {
+        if let Ok(recent) = store.list_harness_runs(10, false, None).await {
+            if recent.len() >= 3 {
+                let pass_n = recent.iter().filter(|r| r.passed).count();
+                let rate = pass_n as f64 / recent.len() as f64;
+                if rate < 0.5 {
+                    let bumped = (max_retries + 1).min(5);
+                    if bumped > max_retries {
+                        eprintln!(
+                            "  · adaptive: recent pass rate {:.0}% → max_retries {max_retries}→{bumped}",
+                            rate * 100.0
+                        );
+                        max_retries = bumped;
+                    }
+                }
+            }
+        }
+    }
+
+    if cfg.harness.require_distinct_models && verifiers.len() < cfg.harness.quorum_min {
+        anyhow::bail!(
+            "quorum requires {} distinct verifier models, only {} available ({:?}). \
+             Set [harness].verify_models, lower quorum_min, or set require_distinct_models=false",
+            cfg.harness.quorum_min,
+            verifiers.len(),
+            verifiers
+        );
+    }
+
     eprintln!(
         "· harness `{}` — plan → review → act → verify (quorum {}, max {} retries)",
         formula.formula.name, cfg.harness.quorum_min, max_retries
@@ -176,8 +206,15 @@ pub async fn run(
     let (memory_primer, primed_skill_ids) = build_memory_primer(&store, &client, &cfg, task).await;
     let mut plan_verdicts: Vec<VerdictVote> = Vec::new();
     let mut verify_verdicts: Vec<VerdictVote> = Vec::new();
-    // Track skills that were in context so we can credit/debit them.
+    // Skills seen during plan; act-primed ids replace this for attribution.
     let mut outcome_skill_ids = primed_skill_ids;
+    let mut distilled_this_run: Vec<String> = Vec::new();
+
+    let check_opts = checks::CheckOptions {
+        test_command: test_command.clone(),
+        require_tool_use: cfg.harness.require_tool_use,
+        check_paths: cfg.harness.check_paths.clone(),
+    };
 
     // ---- PLAN SCOUT (read-only tools) ---------------------------------
     eprintln!("  · plan scout (read-only)");
@@ -309,9 +346,14 @@ pub async fn run(
         eprintln!("  · act attempt {attempts} ({})", cfg.ollama.chat_model);
         result = act_agent.turn(&act_prompt).await.context("act stage")?;
         act_agent.persist_new_messages().await;
+        // Prefer skills the act agent actually primed over plan-only hits.
+        let act_skills = act_agent.take_primed_skill_ids();
+        if !act_skills.is_empty() {
+            outcome_skill_ids = act_skills;
+        }
 
         let audit_tail = checks::read_audit_tail(audit.path(), 40).unwrap_or_default();
-        let check_report = checks::run_checks(&test_command, &audit_tail).await;
+        let check_report = checks::run_checks(&check_opts, &audit_tail).await;
         checks_passed = check_report.all_passed();
         checks_json = serde_json::to_string(&check_report.results).unwrap_or_else(|_| "[]".into());
         eprintln!(
@@ -422,9 +464,7 @@ pub async fn run(
                     {
                         Ok(id) => {
                             skills_stored += 1;
-                            if !outcome_skill_ids.contains(&id) {
-                                outcome_skill_ids.push(id);
-                            }
+                            distilled_this_run.push(id);
                             eprintln!("  · skill recorded: {title}");
                         }
                         Err(e) => tracing::warn!("skill store failed: {e}"),
@@ -462,7 +502,12 @@ pub async fn run(
             .await;
     }
 
+    // Attribute outcomes to skills that were in act context. Skip skills
+    // distilled on this same run — they need a later successful use to promote.
     for id in &outcome_skill_ids {
+        if distilled_this_run.iter().any(|d| d == id) {
+            continue;
+        }
         let _ = store
             .record_skill_outcome(
                 id,

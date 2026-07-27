@@ -175,3 +175,9 @@ skill_promote_after = 2
 # Demote skills to ignored (hidden from primers) after N harness failures
 # while they were in context. 0 = never demote.
 skill_demote_after = 3
+# Fail if act stage makes no tool calls (honest ground check).
+require_tool_use = false
+# Paths that must exist after act. Example: ["hello.txt"]
+check_paths = []
+# Bump max_retries when recent harness pass rate is low.
+adaptive_retries = true

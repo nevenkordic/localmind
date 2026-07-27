@@ -316,6 +316,15 @@ pub struct HarnessConfig {
     /// harness failures while they were in context. 0 disables demotion.
     #[serde(default = "default_skill_demote")]
     pub skill_demote_after: usize,
+    /// Fail ground checks when act produces no tool calls.
+    #[serde(default)]
+    pub require_tool_use: bool,
+    /// Paths that must exist after act (relative or absolute).
+    #[serde(default)]
+    pub check_paths: Vec<String>,
+    /// When recent pass rate is low, bump max_retries (capped).
+    #[serde(default = "default_true")]
+    pub adaptive_retries: bool,
 }
 fn default_quorum_min() -> usize {
     2
@@ -346,6 +355,9 @@ impl Default for HarnessConfig {
             auto_skill: true,
             skill_promote_after: 2,
             skill_demote_after: 3,
+            require_tool_use: false,
+            check_paths: Vec::new(),
+            adaptive_retries: true,
         }
     }
 }

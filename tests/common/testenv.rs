@@ -33,6 +33,9 @@ vector_search = false
 quorum_min = 1
 plan_review = false
 test_command = ""
+require_distinct_models = false
+require_tool_use = false
+adaptive_retries = false
 
 [tools]
 workspace_root = ""

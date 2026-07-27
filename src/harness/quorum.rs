@@ -65,12 +65,13 @@ pub fn quorum_met(
     pool_size: usize,
 ) -> (bool, String) {
     let min = cfg.harness.quorum_min.max(1);
-    let effective_min = min.min(pool_size.max(1));
     if cfg.harness.require_distinct_models && pool_size < min {
-        eprintln!(
-            "  ! quorum: only {pool_size} distinct verifier model(s); using effective_min={effective_min}"
+        return (
+            false,
+            format!("quorum not met: need {min} distinct verifier models, have {pool_size}"),
         );
     }
+    let effective_min = min.min(pool_size.max(1));
     if votes.is_empty() {
         return (false, "quorum not met: no verifier votes".into());
     }

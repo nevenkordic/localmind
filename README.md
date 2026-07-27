@@ -94,11 +94,12 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   and LTM work notes (auto-persist, harness runs, compact summaries).
 - **Verify harness.** `llm run "<task>"` runs plan scout (read-only tools) →
   plan → review → act → verify with verifier quorum, optional ground-truth
-  checks (`test_command`), and skill promotion (`auto` → `verified`) /
-  demotion (`ignored` after repeated failures). Failed runs store avoidance
-  notes. Approve skills with `llm skills approve` / `/approve`.
-  `llm harness stats` / `history` inspect learning metrics. Shared SQLite
-  memory only — no markdown memory files.
+  checks (`test_command`, `require_tool_use`, `check_paths`), adaptive
+  retries from recent pass rate, and skill promotion / demotion.
+  Failed runs store avoidance notes. Approve skills with
+  `llm skills approve` / `/approve`. Recall ranks verified/user skills
+  above failing ones. `llm harness stats` / `history` inspect learning
+  metrics. Shared SQLite memory only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
