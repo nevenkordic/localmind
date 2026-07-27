@@ -248,6 +248,7 @@ async fn handle_slash(
             println!("  /help                - this message");
             println!("  /quit                - exit the REPL");
             println!("  /init                - scan the current directory and store a project profile in memory");
+            println!("  /project             - show the stored project profile for this directory");
             println!("  /stats               - memory database stats");
             println!("  /health              - DB + embedder outbox + Ollama reachability");
             println!(
@@ -278,6 +279,25 @@ async fn handle_slash(
         "init" => {
             if let Err(e) = run_init(agent).await {
                 eprintln!("! /init failed: {e}");
+            }
+            SlashAction::Continue
+        }
+        "project" => {
+            let cwd = crate::memory::Store::current_scope_key();
+            match agent.ctx.store.latest_project_memory_for_cwd().await {
+                Ok(Some(m)) => {
+                    println!("cwd:   {cwd}");
+                    println!("id:    {}", m.id);
+                    println!("title: {}", m.title);
+                    println!("when:  {}", crate::util::format_ts(m.updated_at));
+                    println!();
+                    println!("{}", m.content.trim());
+                }
+                Ok(None) => {
+                    println!("(no project profile for {cwd})");
+                    println!("hint: /init to scan and store one");
+                }
+                Err(e) => eprintln!("{e}"),
             }
             SlashAction::Continue
         }

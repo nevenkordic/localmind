@@ -96,6 +96,11 @@ enum Command {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+    /// Show or manage the cwd-scoped project profile.
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Print the effective configuration and exit.
     ConfigShow,
     /// Initialise the memory database and verify connectivity.
@@ -226,6 +231,30 @@ enum SkillsCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProjectCmd {
+    /// Show the project profile for the current working directory.
+    Show,
+    /// List project profiles (current cwd by default).
+    List {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Include profiles from other directories.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Store or refresh a project profile for the current working directory.
+    Set {
+        /// Short project name / title.
+        #[arg(short = 't', long)]
+        title: String,
+        /// Profile body. Omit to read from stdin.
+        content: Option<String>,
+    },
+    /// Hide the current cwd profile from primers (trust_tier → ignored).
+    Forget,
+}
+
 fn parse_mode_flag(s: Option<&str>) -> Result<Option<tools::permissions::PermissionMode>> {
     match s {
         None => Ok(None),
@@ -350,6 +379,7 @@ async fn main() -> Result<()> {
         Command::Memory { cmd } => memory_cmd(cmd, &cfg, &store).await,
         Command::Harness { cmd } => harness_cmd(cmd, &store).await,
         Command::Skills { cmd } => skills_cmd(cmd, &store).await,
+        Command::Project { cmd } => project_cmd(cmd, &store).await,
         Command::ConfigShow => {
             println!("{}", cfg.pretty()?);
             Ok(())
@@ -866,6 +896,98 @@ async fn skills_cmd(cmd: SkillsCmd, store: &memory::Store) -> Result<()> {
         }
         SkillsCmd::Approve { id } => resolve_and_set_tier(store, &id, "user").await,
         SkillsCmd::Ignore { id } => resolve_and_set_tier(store, &id, "ignored").await,
+    }
+}
+
+async fn project_cmd(cmd: ProjectCmd, store: &memory::Store) -> Result<()> {
+    match cmd {
+        ProjectCmd::Show => {
+            let cwd = memory::Store::current_scope_key();
+            match store.latest_project_memory_for_cwd().await? {
+                Some(m) => {
+                    println!("cwd:   {cwd}");
+                    println!("id:    {}", m.id);
+                    println!("title: {}", m.title);
+                    println!("when:  {}", util::format_ts(m.updated_at));
+                    println!("tier:  {}", m.trust_tier);
+                    println!();
+                    println!("{}", m.content.trim());
+                }
+                None => {
+                    println!("(no project profile for {cwd})");
+                    println!("hint: run `/init` in the REPL, or `llm project set -t <name> \"…\"`");
+                }
+            }
+            Ok(())
+        }
+        ProjectCmd::List { limit, all } => {
+            let rows = store.list_projects(limit, !all).await?;
+            if rows.is_empty() {
+                if all {
+                    println!("(no project profiles yet)");
+                } else {
+                    println!("(no project profile for this directory)");
+                }
+                return Ok(());
+            }
+            for m in rows {
+                let id_short: String = m.id.chars().take(8).collect();
+                let scope = if m.cwd.is_empty() {
+                    "(global)".to_string()
+                } else {
+                    util::truncate(&m.cwd, 60)
+                };
+                println!(
+                    "{id_short}  {}  {}  {}",
+                    util::format_ts(m.updated_at),
+                    scope,
+                    m.title
+                );
+            }
+            Ok(())
+        }
+        ProjectCmd::Set { title, content } => {
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf
+                }
+            };
+            if content.trim().is_empty() {
+                anyhow::bail!("project profile content is empty");
+            }
+            // Hide any prior active profile for this cwd so show/list stay unique.
+            if let Some(prev) = store.latest_project_memory_for_cwd().await? {
+                let _ = store.set_trust_tier(&prev.id, "ignored").await;
+            }
+            let id = store
+                .insert_memory(&memory::NewMemory {
+                    kind: "project".into(),
+                    title,
+                    content,
+                    source: "cli".into(),
+                    tags: vec!["project-profile".into(), "init".into()],
+                    importance: 0.9,
+                    trust_tier: Some("user".into()),
+                    cwd: Some(memory::Store::current_scope_key()),
+                })
+                .await?;
+            println!("stored project profile {id}");
+            Ok(())
+        }
+        ProjectCmd::Forget => {
+            match store.latest_project_memory_for_cwd().await? {
+                Some(m) => {
+                    store.set_trust_tier(&m.id, "ignored").await?;
+                    println!("{} → ignored  ({})", &m.id[..8.min(m.id.len())], m.title);
+                }
+                None => println!("(no active project profile for this directory)"),
+            }
+            Ok(())
+        }
     }
 }
 

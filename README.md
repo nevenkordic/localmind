@@ -92,7 +92,9 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   current repository / working directory above unrelated projects. Query
   intent also steers ranking — procedural turns prefer skills, decision
   turns prefer the ledger, failure talk surfaces harness-fail notes, and
-  project questions prefer `/init` profiles.
+  project questions prefer `/init` profiles. Manage the cwd profile with
+  `llm project show|set|list|forget` or `/project` in the REPL (`/init`
+  scans and stores one via the agent).
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
 - **Action history.** `list_recent_actions` surfaces audit-log tool calls
@@ -201,6 +203,10 @@ llm harness history --failed     # only failed runs
 llm skills list                  # taught skills + trust tiers
 llm skills approve <id>          # mark a skill authoritative (user trust)
 llm skills ignore <id>           # hide a skill from primers
+llm project show                 # cwd-scoped project profile
+llm project set -t name "…"      # store/refresh profile for this directory
+llm project list                 # profiles for this cwd (add --all for others)
+llm project forget               # hide current cwd profile from primers
 llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)

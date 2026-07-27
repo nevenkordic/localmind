@@ -488,7 +488,7 @@ impl Store {
                 &format!(
                     r#"SELECT {MEMORY_COLS}
                        FROM memories
-                       WHERE kind = 'project' AND cwd = ?1
+                       WHERE kind = 'project' AND cwd = ?1 AND trust_tier != 'ignored'
                        ORDER BY updated_at DESC
                        LIMIT 1"#
                 ),
@@ -497,6 +497,43 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+        })
+        .await?
+    }
+
+    /// Project profiles, newest first. When `cwd_only` is true, restrict to
+    /// the current working directory.
+    pub async fn list_projects(&self, limit: usize, cwd_only: bool) -> Result<Vec<StoredMemory>> {
+        let inner = self.inner.clone();
+        let limit = limit.max(1) as i64;
+        let cwd = Self::current_scope_key();
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
+            let conn = inner.lock().unwrap();
+            let mut out = Vec::new();
+            if cwd_only {
+                let mut stmt = conn.prepare(&format!(
+                    r#"SELECT {MEMORY_COLS}
+                       FROM memories
+                       WHERE kind = 'project' AND cwd = ?1 AND trust_tier != 'ignored'
+                       ORDER BY updated_at DESC
+                       LIMIT ?2"#
+                ))?;
+                for r in stmt.query_map(params![cwd, limit], map_memory_row)? {
+                    out.push(r?);
+                }
+            } else {
+                let mut stmt = conn.prepare(&format!(
+                    r#"SELECT {MEMORY_COLS}
+                       FROM memories
+                       WHERE kind = 'project' AND trust_tier != 'ignored'
+                       ORDER BY updated_at DESC
+                       LIMIT ?1"#
+                ))?;
+                for r in stmt.query_map(params![limit], map_memory_row)? {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
         })
         .await?
     }
