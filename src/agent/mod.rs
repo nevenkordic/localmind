@@ -387,6 +387,7 @@ impl AgentRun {
                 tags: vec!["compact".into(), "stm".into()],
                 importance: 0.55,
                 trust_tier: Some("auto".into()),
+                cwd: Some(Store::current_scope_key()),
             })
             .await
         {
@@ -410,6 +411,7 @@ impl AgentRun {
                                 tags: vec!["auto-skill".into()],
                                 importance: 0.85,
                                 trust_tier: Some("auto".into()),
+                                cwd: Some(Store::current_scope_key()),
                             })
                             .await;
                     }
@@ -517,6 +519,7 @@ impl AgentRun {
                     tags: vec!["user".into()],
                     importance,
                     trust_tier: None,
+                    cwd: Some(Store::current_scope_key()),
                 })
                 .await;
             eprintln!("  · {label}: {}", content);
@@ -632,6 +635,7 @@ impl AgentRun {
                 tags: vec!["stm".into(), "action".into()],
                 importance: if actions.is_empty() { 0.45 } else { 0.65 },
                 trust_tier: Some("auto".into()),
+                cwd: Some(Store::current_scope_key()),
             })
             .await
         {
@@ -654,6 +658,16 @@ impl AgentRun {
                     "• [preference] {}: {}",
                     m.title,
                     crate::util::truncate(m.content.trim(), CONTENT_CAP)
+                ));
+            }
+        }
+        if let Ok(Some(project)) = self.ctx.store.latest_project_memory_for_cwd().await {
+            if seen_ids.insert(project.id.clone()) {
+                lines.push(format!(
+                    "• [project @ {}] {}: {}",
+                    crate::util::format_ts(project.updated_at),
+                    project.title,
+                    crate::util::truncate(project.content.trim(), CONTENT_CAP)
                 ));
             }
         }

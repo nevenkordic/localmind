@@ -7,7 +7,7 @@
 use crate::config::Config;
 use crate::util;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,8 @@ pub struct NewMemory {
     pub importance: f32,
     /// `user` | `verified` | `auto`. When None, inferred from `source`.
     pub trust_tier: Option<String>,
+    /// Optional project scope. When None, defaults to current working directory.
+    pub cwd: Option<String>,
 }
 
 /// Trust tier for recalled memories. `user` and `verified` are treated as
@@ -44,7 +46,7 @@ pub fn normalize_for_dedup(s: &str) -> String {
 }
 
 const MEMORY_COLS: &str = "id, kind, title, content, source, tags_json, importance, \
-    created_at, updated_at, accessed_at, access_count, trust_tier, success_count, fail_count";
+    created_at, updated_at, accessed_at, access_count, trust_tier, success_count, fail_count, cwd";
 
 fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemory> {
     let tags_json: String = row.get(5)?;
@@ -63,6 +65,7 @@ fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemory> {
         trust_tier: row.get(11)?,
         success_count: row.get(12)?,
         fail_count: row.get(13)?,
+        cwd: row.get(14)?,
     })
 }
 
@@ -82,6 +85,7 @@ pub struct StoredMemory {
     pub trust_tier: String,
     pub success_count: i64,
     pub fail_count: i64,
+    pub cwd: String,
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +186,7 @@ impl Store {
                 .context("applying 003_decisions.sql")?;
             conn.execute_batch(include_str!("../../migrations/004_harness_learning.sql"))
                 .context("applying 004_harness_learning.sql")?;
+            let _ = conn.execute_batch(include_str!("../../migrations/005_memory_scope.sql"));
             Self::ensure_memory_trust_columns(&conn)?;
             Ok(())
         })
@@ -214,7 +219,19 @@ impl Store {
                 [],
             )?;
         }
+        if !cols.iter().any(|c| c == "cwd") {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN cwd TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(())
+    }
+
+    pub fn current_scope_key() -> String {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
     }
 
     pub async fn insert_memory(&self, new: &NewMemory) -> Result<String> {
@@ -231,6 +248,7 @@ impl Store {
         let content = new.content.clone();
         let source = new.source.clone();
         let importance = new.importance.clamp(0.0, 1.0);
+        let cwd = new.cwd.clone().unwrap_or_default();
         let trust_tier = new
             .trust_tier
             .clone()
@@ -265,11 +283,11 @@ impl Store {
                 r#"INSERT OR IGNORE INTO memories
                    (id, kind, title, content, source, tags_json, importance,
                     created_at, updated_at, accessed_at, access_count, content_hash,
-                    trust_tier, success_count, fail_count)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, 0, 0)"#,
+                    trust_tier, success_count, fail_count, cwd)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, 0, 0, ?11)"#,
                 params![
                     id_out, kind, title, content, source, tags_json, importance, now, hash,
-                    trust_tier
+                    trust_tier, cwd
                 ],
             )?;
             if changed == 0 {
@@ -438,6 +456,7 @@ impl Store {
     pub async fn list_recent_work(&self, limit: usize) -> Result<Vec<StoredMemory>> {
         let inner = self.inner.clone();
         let limit = limit.max(1) as i64;
+        let cwd = Self::current_scope_key();
         tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
             let conn = inner.lock().unwrap();
             let mut stmt = conn.prepare(&format!(
@@ -445,15 +464,37 @@ impl Store {
                    FROM memories
                    WHERE source IN ('auto-persist', 'harness', 'harness-fail', 'compact', 'decision-ledger')
                       OR kind = 'decision'
-                   ORDER BY created_at DESC
-                   LIMIT ?1"#
+                   ORDER BY CASE WHEN cwd = ?1 THEN 0 ELSE 1 END, created_at DESC
+                   LIMIT ?2"#
             ))?;
-            let rows = stmt.query_map(params![limit], map_memory_row)?;
+            let rows = stmt.query_map(params![cwd, limit], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
             }
             Ok(out)
+        })
+        .await?
+    }
+
+    pub async fn latest_project_memory_for_cwd(&self) -> Result<Option<StoredMemory>> {
+        let inner = self.inner.clone();
+        let cwd = Self::current_scope_key();
+        tokio::task::spawn_blocking(move || -> Result<Option<StoredMemory>> {
+            let conn = inner.lock().unwrap();
+            conn.query_row(
+                &format!(
+                    r#"SELECT {MEMORY_COLS}
+                       FROM memories
+                       WHERE kind = 'project' AND cwd = ?1
+                       ORDER BY updated_at DESC
+                       LIMIT 1"#
+                ),
+                params![cwd],
+                map_memory_row,
+            )
+            .optional()
+            .map_err(Into::into)
         })
         .await?
     }
@@ -490,14 +531,14 @@ impl Store {
                 r#"SELECT m.id, m.kind, m.title, m.content, m.source, m.tags_json,
                           m.importance, m.created_at, m.updated_at, m.accessed_at,
                           m.access_count, m.trust_tier, m.success_count, m.fail_count,
-                          bm25(memories_fts) AS rank
+                          m.cwd, bm25(memories_fts) AS rank
                    FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
                    WHERE memories_fts MATCH ?1
                    ORDER BY rank
                    LIMIT ?2"#,
             )?;
             let rows = stmt.query_map(params![q, limit as i64], |row| {
-                let rank: f64 = row.get(14)?;
+                let rank: f64 = row.get(15)?;
                 Ok((map_memory_row(row)?, rank as f32))
             })?;
             let mut out = Vec::new();
@@ -523,13 +564,13 @@ impl Store {
                 r#"SELECT m.id, m.kind, m.title, m.content, m.source, m.tags_json,
                           m.importance, m.created_at, m.updated_at, m.accessed_at,
                           m.access_count, m.trust_tier, m.success_count, m.fail_count,
-                          v.distance
+                          m.cwd, v.distance
                    FROM memory_vec v JOIN memories m ON m.id = v.memory_id
                    WHERE v.embedding MATCH ?1 AND k = ?2
                    ORDER BY v.distance"#,
             )?;
             let rows = stmt.query_map(params![blob, limit as i64], |row| {
-                let dist: f64 = row.get(14)?;
+                let dist: f64 = row.get(15)?;
                 Ok((map_memory_row(row)?, dist as f32))
             })?;
             let mut out = Vec::new();

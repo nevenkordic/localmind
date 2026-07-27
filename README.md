@@ -87,7 +87,9 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   working directory (STM). Compaction and `auto_persist` write turn
   summaries / tool actions into searchable SQLite LTM with timestamps so
   later sessions know what was done, when, and how — without the user
-  repeating themselves. Preferences and recent decisions are always primed.
+  repeating themselves. Preferences, the current project profile, and
+  same-cwd work history are always primed; recall boosts memories from the
+  current repository / working directory above unrelated projects.
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
 - **Action history.** `list_recent_actions` surfaces audit-log tool calls

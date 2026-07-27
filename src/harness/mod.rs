@@ -439,6 +439,7 @@ pub async fn run(
             ],
             importance: if passed { 0.8 } else { 0.55 },
             trust_tier: Some("auto".into()),
+            cwd: Some(Store::current_scope_key()),
         })
         .await;
 
@@ -459,6 +460,7 @@ pub async fn run(
                             tags: vec!["auto-skill".into(), formula.formula.name.clone()],
                             importance: 0.85,
                             trust_tier: Some("auto".into()),
+                            cwd: Some(Store::current_scope_key()),
                         })
                         .await
                     {
@@ -498,6 +500,7 @@ pub async fn run(
                 ],
                 importance: 0.75,
                 trust_tier: Some("auto".into()),
+                cwd: Some(Store::current_scope_key()),
             })
             .await;
     }

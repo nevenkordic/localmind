@@ -1,7 +1,7 @@
 //! Memory tools the model can call directly.
 
 use crate::llm::ollama::OllamaClient as Ollama;
-use crate::memory::{search::hybrid_search, NewMemory};
+use crate::memory::{search::hybrid_search, NewMemory, Store};
 use crate::tools::registry::ToolContext;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -71,6 +71,7 @@ pub async fn store_memory(ctx: &ToolContext, args: &Value) -> Result<String> {
             tags,
             importance,
             trust_tier: None,
+            cwd: Some(Store::current_scope_key()),
         })
         .await?;
     Ok(format!("stored memory {id}"))
@@ -104,6 +105,7 @@ pub async fn log_decision(ctx: &ToolContext, args: &Value) -> Result<String> {
             tags: vec!["decision".into()],
             importance: 0.75,
             trust_tier: Some("auto".into()),
+            cwd: Some(Store::current_scope_key()),
         })
         .await;
     Ok(format!("logged decision {id}"))
