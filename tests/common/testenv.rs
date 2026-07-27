@@ -37,6 +37,9 @@ require_distinct_models = false
 require_tool_use = false
 adaptive_retries = false
 
+[agent]
+confidence_verify = false
+
 [tools]
 workspace_root = ""
 deny_globs = []

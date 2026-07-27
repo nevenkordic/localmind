@@ -1,0 +1,39 @@
+# Example broodlink-shaped formula. Stage prompts override the built-in
+# plan/act templates when present. Run with:
+#   llm run "add a hello world binary" --formula formulas/coding-lite.toml
+
+[formula]
+name = "coding-lite"
+description = "Understand → plan → act with explicit prompt templates"
+max_verify_retries = 2
+
+[[stages]]
+name = "plan"
+role = "planner"
+prompt = """Create a concrete implementation plan for:
+
+TASK:
+{{task}}
+
+CONTEXT (memory / scout):
+{{memory}}
+
+List files to touch, ordered steps, and risks. Max 200 words."""
+output = "plan"
+
+[[stages]]
+name = "act"
+role = "worker"
+prompt = """Execute this plan with tools. Summarise what you changed.
+
+TASK:
+{{task}}
+
+PLAN:
+{{plan}}
+
+VERIFIER FEEDBACK (may be empty):
+{{feedback}}"""
+input = "plan"
+output = "result"
+when = "plan.exists"

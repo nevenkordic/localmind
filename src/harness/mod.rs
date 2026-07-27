@@ -2,7 +2,10 @@
 //! ground-truth checks, and continuous skill learning.
 
 mod checks;
+mod formula;
 mod quorum;
+
+pub use formula::{evaluate_condition, render_prompt, StageInput};
 
 use crate::agent::AgentRun;
 use crate::config::Config;
@@ -29,8 +32,13 @@ pub struct RunOptions {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Formula {
     pub formula: FormulaMeta,
-    #[serde(default)]
+    /// Stages (localmind name). Broodlink formulas use `steps` — accepted
+    /// as an alias so the same TOML shape can be shared.
+    #[serde(default, alias = "steps")]
     pub stages: Vec<Stage>,
+    /// Optional recovery stage when the run fails (broodlink `on_failure`).
+    #[serde(default)]
+    pub on_failure: Option<Stage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,11 +56,39 @@ fn default_retries() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stage {
     pub name: String,
-    #[serde(default = "default_role")]
+    /// Role used for model selection. Broodlink uses `agent_role`.
+    #[serde(default = "default_role", alias = "agent_role")]
     pub role: String,
+    /// Optional prompt template with `{{task}}`, `{{plan}}`, `{{memory}}`, …
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Prior stage output key(s) to inject into the prompt context.
+    #[serde(default)]
+    pub input: Option<StageInput>,
+    /// Name under which this stage's result is stored for later stages.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Fail-closed skip condition (see `formula::evaluate_condition`).
+    #[serde(default)]
+    pub when: Option<String>,
+    /// Parallel group id — same id runs concurrently in a future formula
+    /// runner. Reserved; the default verify pipeline is sequential.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub group: Option<u32>,
+    /// Few-shot examples appended to the stage prompt when present.
+    #[serde(default)]
+    pub examples: Option<String>,
 }
 fn default_role() -> String {
     "worker".into()
+}
+
+impl Formula {
+    /// Look up a stage by name (plan / act / verify / …).
+    pub fn stage(&self, name: &str) -> Option<&Stage> {
+        self.stages.iter().find(|s| s.name == name)
+    }
 }
 
 #[derive(Debug)]
@@ -259,13 +295,62 @@ pub async fn run(
         "  · plan ({})",
         plan_model.as_deref().unwrap_or(&cfg.ollama.chat_model)
     );
-    let plan = client
-        .plan_task(task, &enriched_primer, plan_model.as_deref())
-        .await
-        .context("plan stage")?;
+    let mut step_results = serde_json::Map::new();
+    step_results.insert("task".into(), serde_json::Value::String(task.to_string()));
+    step_results.insert(
+        "memory".into(),
+        serde_json::Value::String(enriched_primer.clone()),
+    );
+    step_results.insert(
+        "scout".into(),
+        serde_json::Value::String(scout_findings.clone()),
+    );
+
+    let plan = if let Some(tmpl) = formula
+        .stage("plan")
+        .and_then(|s| s.prompt.as_deref())
+        .filter(|t| !t.trim().is_empty())
+    {
+        let params = serde_json::Value::Object(step_results.clone());
+        let mut user = render_prompt(tmpl, &params);
+        if let Some(ex) = formula.stage("plan").and_then(|s| s.examples.as_deref()) {
+            user.push_str("\n\nEXAMPLES:\n");
+            user.push_str(ex);
+        }
+        let msgs = vec![
+            crate::llm::types::ChatMessage::system(
+                "You are the planner stage of a local multi-model harness. \
+                 Follow the user instructions. Bulleted steps, max 250 words.",
+            ),
+            crate::llm::types::ChatMessage::user(user),
+        ];
+        client
+            .chat_on(&msgs, None, false, plan_model.as_deref())
+            .await
+            .context("plan stage")?
+            .content
+            .trim()
+            .to_string()
+    } else {
+        client
+            .plan_task(task, &enriched_primer, plan_model.as_deref())
+            .await
+            .context("plan stage")?
+    };
+    let plan_key = formula
+        .stage("plan")
+        .and_then(|s| s.output.clone())
+        .unwrap_or_else(|| "plan".into());
+    step_results.insert(plan_key, serde_json::Value::String(plan.clone()));
+    step_results.insert("plan".into(), serde_json::Value::String(plan.clone()));
 
     // ---- PLAN REVIEW QUORUM --------------------------------------------
-    if plan_review {
+    let review_when_ok = formula
+        .stage("plan_review")
+        .and_then(|s| s.when.as_deref())
+        .map(|expr| evaluate_condition(expr, &serde_json::Value::Object(step_results.clone())))
+        .unwrap_or(true);
+    if plan_review && review_when_ok {
         eprintln!("  · plan review quorum ({} models)", verifiers.len());
         let primer = enriched_primer.clone();
         let task_owned = task.to_string();
@@ -327,7 +412,43 @@ pub async fn run(
 
     for attempt in 0..=max_retries {
         attempts = attempt + 1;
-        let act_prompt = if feedback.is_empty() {
+        step_results.insert(
+            "feedback".into(),
+            serde_json::Value::String(feedback.clone()),
+        );
+        // Honour act.when — skip (treat as failed attempt) when false.
+        if let Some(expr) = formula.stage("act").and_then(|s| s.when.as_deref()) {
+            if !evaluate_condition(expr, &serde_json::Value::Object(step_results.clone())) {
+                feedback = format!("act stage skipped: when `{expr}` was false");
+                eprintln!("  · act skipped ({feedback})");
+                break;
+            }
+        }
+        // Inject declared inputs into the step map under short aliases.
+        if let Some(inp) = formula.stage("act").and_then(|s| s.input.as_ref()) {
+            let keys: Vec<String> = match inp {
+                StageInput::Single(k) => vec![k.clone()],
+                StageInput::Multiple(ks) => ks.clone(),
+            };
+            for k in keys {
+                if let Some(v) = step_results.get(&k).cloned() {
+                    step_results.insert(format!("input_{k}"), v);
+                }
+            }
+        }
+        let act_prompt = if let Some(tmpl) = formula
+            .stage("act")
+            .and_then(|s| s.prompt.as_deref())
+            .filter(|t| !t.trim().is_empty())
+        {
+            let params = serde_json::Value::Object(step_results.clone());
+            let mut p = render_prompt(tmpl, &params);
+            if let Some(ex) = formula.stage("act").and_then(|s| s.examples.as_deref()) {
+                p.push_str("\n\nEXAMPLES:\n");
+                p.push_str(ex);
+            }
+            p
+        } else if feedback.is_empty() {
             format!(
                 "You are the ACT stage of a verified local harness.\n\
                  Follow the PLAN. Use tools as needed. When done, summarise \
@@ -346,6 +467,12 @@ pub async fn run(
         eprintln!("  · act attempt {attempts} ({})", cfg.ollama.chat_model);
         result = act_agent.turn(&act_prompt).await.context("act stage")?;
         act_agent.persist_new_messages().await;
+        let act_key = formula
+            .stage("act")
+            .and_then(|s| s.output.clone())
+            .unwrap_or_else(|| "result".into());
+        step_results.insert(act_key, serde_json::Value::String(result.clone()));
+        step_results.insert("result".into(), serde_json::Value::String(result.clone()));
         // Prefer skills the act agent actually primed over plan-only hits.
         let act_skills = act_agent.take_primed_skill_ids();
         if !act_skills.is_empty() {
@@ -480,12 +607,24 @@ pub async fn run(
     // On failure, store a dedicated note so future plans can avoid repeating
     // the same mistake (higher importance than a generic harness decision).
     if !passed {
+        let mut fail_extra = String::new();
+        if let Some(fail_stage) = &formula.on_failure {
+            if let Some(tmpl) = fail_stage.prompt.as_deref() {
+                let params = serde_json::Value::Object(step_results.clone());
+                fail_extra = render_prompt(tmpl, &params);
+            }
+        }
         let fail_title = format!("harness fail: {}", crate::util::truncate(task, 60));
         let fail_content = format!(
-            "When: {when}\nFAILED TASK: {task}\nPlan:\n{}\nResult:\n{}\nAttempts: {attempts}\nChecks passed: {checks_passed}\nVerifier feedback:\n{}\n\nAvoid repeating this approach unless the feedback is addressed.",
+            "When: {when}\nFAILED TASK: {task}\nPlan:\n{}\nResult:\n{}\nAttempts: {attempts}\nChecks passed: {checks_passed}\nVerifier feedback:\n{}\n{}\n\nAvoid repeating this approach unless the feedback is addressed.",
             crate::util::truncate(&plan, 1200),
             crate::util::truncate(&result, 1200),
             crate::util::truncate(&feedback, 800),
+            if fail_extra.is_empty() {
+                String::new()
+            } else {
+                format!("On-failure notes:\n{}", crate::util::truncate(&fail_extra, 800))
+            },
         );
         let _ = store
             .insert_memory(&NewMemory {
@@ -621,5 +760,45 @@ mod tests {
 name = ""
 "#;
         assert!(Formula::parse(raw).is_err());
+    }
+
+    #[test]
+    fn accepts_broodlink_style_aliases() {
+        let raw = r#"
+[formula]
+name = "custom"
+description = "broodlink-shaped"
+
+[[steps]]
+name = "plan"
+agent_role = "planner"
+prompt = "Plan {{task}}"
+output = "plan"
+
+[[steps]]
+name = "act"
+agent_role = "worker"
+prompt = "Do {{plan}}"
+input = "plan"
+output = "result"
+when = "plan.exists"
+"#;
+        let f = Formula::parse(raw).expect("parse");
+        assert_eq!(f.stages.len(), 2);
+        assert_eq!(f.stage("plan").unwrap().role, "planner");
+        assert!(f
+            .stage("plan")
+            .unwrap()
+            .prompt
+            .as_deref()
+            .unwrap()
+            .contains("{{task}}"));
+        assert_eq!(f.stage("act").unwrap().when.as_deref(), Some("plan.exists"));
+        let ctx = serde_json::json!({"plan": "x"});
+        assert!(evaluate_condition("plan.exists", &ctx));
+        assert_eq!(
+            render_prompt("Plan {{task}}", &serde_json::json!({"task": "hi"})),
+            "Plan hi"
+        );
     }
 }

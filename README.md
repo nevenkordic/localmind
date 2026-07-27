@@ -107,7 +107,14 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   `llm skills approve` / `/approve`. Recall ranks verified/user skills
   above failing ones. Each run records which skills were primed, credited,
   or distilled; `llm harness stats` shows top credited skills.
-  Shared SQLite memory only — no markdown memory files.
+  Formulas accept broodlink-compatible stage fields (`prompt`,
+  `when`, `input`/`output`, `steps`/`agent_role` aliases) — see
+  `formulas/coding-lite.toml`. Shared SQLite memory only — no markdown
+  memory files.
+- **Confidence gate.** Chat / ask replies end with `[CONFIDENCE: N/5]`.
+  Scores below `[agent].confidence_min` are fact-checked by a fast
+  verifier against memory and may be corrected before persist (broodlink
+  verify-then-respond pattern). Disable with `confidence_verify = false`.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
@@ -197,6 +204,7 @@ cd localmind
 llm                          # interactive REPL, resumes last session for cwd
 llm ask "fix the failing test"
 llm run "fix the failing test"  # plan → act → verify harness; records skills
+llm run "…" --formula formulas/coding-lite.toml  # custom stage prompts
 llm harness stats                # pass rate, attempts, skills from prior runs
 llm harness history              # recent harness runs (what/when)
 llm harness history --failed     # only failed runs

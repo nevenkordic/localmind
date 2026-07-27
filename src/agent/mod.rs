@@ -19,6 +19,53 @@ use std::sync::Arc;
 /// sees the answer materialise instead of a long spinner-then-dump wait.
 pub type TokenSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Outcome of the broodlink-style confidence → verify gate.
+#[derive(Debug, Clone)]
+pub enum ConfidenceVerify {
+    Verified,
+    Corrected(String),
+}
+
+/// Extract `[CONFIDENCE: N/5]` from a model reply (broodlink a2a-gateway).
+pub fn parse_confidence(text: &str) -> Option<u8> {
+    if let Some(start) = text.find("[CONFIDENCE: ") {
+        let rest = &text[start + 13..];
+        if let Some(slash) = rest.find('/') {
+            if let Ok(n) = rest[..slash].trim().parse::<u8>() {
+                return Some(n.min(5));
+            }
+        }
+    }
+    None
+}
+
+/// Strip the confidence tag for clean display / persistence.
+pub fn strip_confidence_tag(text: &str) -> String {
+    if let Some(start) = text.find("[CONFIDENCE: ") {
+        if let Some(end) = text[start..].find(']') {
+            let before = text[..start].trim_end();
+            let after = text[start + end + 1..].trim_start();
+            if after.is_empty() {
+                return before.to_string();
+            }
+            return format!("{before} {after}");
+        }
+    }
+    text.to_string()
+}
+
+fn confidence_verifier_model(cfg: &Config) -> String {
+    let verify = cfg.harness.verify_model.trim();
+    if !verify.is_empty() {
+        return verify.to_string();
+    }
+    let fast = cfg.ollama.fast_model.trim();
+    if !fast.is_empty() {
+        return fast.to_string();
+    }
+    cfg.ollama.chat_model.clone()
+}
+
 pub struct AgentRun {
     pub ctx: Arc<ToolContext>,
     pub client: Ollama,
@@ -94,7 +141,9 @@ impl AgentRun {
         Ok(Self {
             ctx,
             client,
-            messages: vec![ChatMessage::system(system_prompt::render())],
+            messages: vec![ChatMessage::system(system_prompt::render_opts(
+                cfg.agent.confidence_verify,
+            ))],
             max_tool_iterations: 12,
             last_primer: None,
             last_memory_primer: None,
@@ -551,8 +600,66 @@ impl AgentRun {
         // Consume any force_model so the next turn re-routes normally.
         self.force_model = None;
         let reply = self.loop_tools(&model).await?;
+        let reply = self.maybe_confidence_verify(user_input, reply).await;
         self.maybe_auto_persist(user_input, turn_mark).await;
         Ok(reply)
+    }
+
+    /// Broodlink-style confidence gate: parse `[CONFIDENCE: N/5]`, strip it
+    /// from the user-visible reply, and when N is below threshold ask a
+    /// fast verifier to confirm or correct against memory context.
+    async fn maybe_confidence_verify(&mut self, user_input: &str, reply: String) -> String {
+        if !self.ctx.cfg.agent.confidence_verify {
+            return reply;
+        }
+        let confidence = parse_confidence(&reply);
+        let clean = strip_confidence_tag(&reply);
+        // Keep history free of the tag even when we skip verification.
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == "assistant" {
+                last.content = clean.clone();
+            }
+        }
+        let min = self.ctx.cfg.agent.confidence_min.max(1).min(5);
+        let score = confidence.unwrap_or(min);
+        if score >= min {
+            return clean;
+        }
+        let verifier = confidence_verifier_model(&self.ctx.cfg);
+        let memory_ctx = self
+            .last_memory_primer
+            .clone()
+            .or_else(|| self.last_primer.clone())
+            .unwrap_or_default();
+        eprintln!("  · confidence {score}/5 < {min} — verifying with {verifier}");
+        match self
+            .client
+            .verify_confidence_response(user_input, &clean, &memory_ctx, Some(&verifier))
+            .await
+        {
+            Ok(ConfidenceVerify::Verified) => {
+                eprintln!("  · verified");
+                clean
+            }
+            Ok(ConfidenceVerify::Corrected(corrected)) => {
+                eprintln!("  · corrected by verifier");
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == "assistant" {
+                        last.content = corrected.clone();
+                    }
+                }
+                // Surface the correction after any streamed original.
+                if self.token_sink.is_some() {
+                    eprintln!();
+                    println!("{corrected}");
+                }
+                corrected
+            }
+            Err(e) => {
+                tracing::warn!("confidence verify failed: {e}");
+                clean
+            }
+        }
     }
 
     fn trust_rank(tier: &str) -> u8 {
@@ -1102,9 +1209,35 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_narrated_write, extract_facts, is_trivial_turn, scrub_hallucinated_tool_output,
-        should_use_fast, MarkdownHighlighter, StreamingToolCallFilter,
+        detect_narrated_write, extract_facts, is_trivial_turn, parse_confidence,
+        scrub_hallucinated_tool_output, should_use_fast, strip_confidence_tag, MarkdownHighlighter,
+        StreamingToolCallFilter,
     };
+
+    #[test]
+    fn parse_confidence_present_and_absent() {
+        assert_eq!(parse_confidence("Some answer [CONFIDENCE: 5/5]"), Some(5));
+        assert_eq!(parse_confidence("Result [CONFIDENCE: 1/5]"), Some(1));
+        assert_eq!(
+            parse_confidence("Text [CONFIDENCE: 3/5] more text"),
+            Some(3)
+        );
+        assert_eq!(parse_confidence("No confidence tag here"), None);
+        assert_eq!(parse_confidence("[CONFIDENCE: X/5]"), None);
+    }
+
+    #[test]
+    fn strip_confidence_tag_cleans_display() {
+        assert_eq!(
+            strip_confidence_tag("Answer text [CONFIDENCE: 4/5]"),
+            "Answer text"
+        );
+        assert_eq!(strip_confidence_tag("No tag here"), "No tag here");
+        assert_eq!(
+            strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
+            "Before after"
+        );
+    }
 
     fn first(input: &str) -> Option<(String, String, String)> {
         extract_facts(input).into_iter().next()

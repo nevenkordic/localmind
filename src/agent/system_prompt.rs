@@ -2,9 +2,27 @@
 //! code + networking + security + admin, running locally, no cloud.
 
 pub fn render() -> String {
+    render_opts(false)
+}
+
+/// Render the system prompt. When `confidence_verify` is on, append the
+/// broodlink-style confidence tag instruction so low-certainty answers
+/// can be gated by a verifier.
+pub fn render_opts(confidence_verify: bool) -> String {
     let env_block = environment_block();
     let body = BODY;
-    format!("{env_block}\n{body}")
+    if confidence_verify {
+        format!(
+            "{env_block}\n{body}\n\n\
+             CONFIDENCE GATE\n\
+             End every final reply with a single trailing tag on its own line:\n\
+               [CONFIDENCE: N/5]\n\
+             where 1 = guess / uncertain, 5 = certain from tools or memory.\n\
+             Do NOT explain the rating. Put the tag after the answer, never inside code."
+        )
+    } else {
+        format!("{env_block}\n{body}")
+    }
 }
 
 /// Dynamic ENVIRONMENT section prepended to the static prompt body. Gives
