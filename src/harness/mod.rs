@@ -1,7 +1,7 @@
 //! Multi-model verify harness — plan → review → act → verify with quorum,
 //! ground-truth checks, and continuous skill learning.
 
-mod checks;
+pub mod checks;
 mod formula;
 mod quorum;
 

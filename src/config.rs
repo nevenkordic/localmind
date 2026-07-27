@@ -386,15 +386,36 @@ pub struct AgentConfig {
     /// `verify_response` runs against memory context.
     #[serde(default = "default_confidence_min")]
     pub confidence_min: u8,
+    /// For actionable tasks (code, tools, writes), keep working across
+    /// outer continuations until ground checks pass and the reply no longer
+    /// looks incomplete. Uses `[harness]` test_command / check_paths when set.
+    #[serde(default = "default_true")]
+    pub persist_until_success: bool,
+    /// Max outer continuations per user turn when `persist_until_success`
+    /// is on. Each continuation is a fresh tool loop with corrective feedback.
+    #[serde(default = "default_max_task_attempts")]
+    pub max_task_attempts: usize,
+    /// Tool-call rounds allowed inside each attempt (inner loop).
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
 }
 fn default_confidence_min() -> u8 {
     3
+}
+fn default_max_task_attempts() -> usize {
+    5
+}
+fn default_max_tool_iterations() -> usize {
+    12
 }
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             confidence_verify: true,
             confidence_min: 3,
+            persist_until_success: true,
+            max_task_attempts: default_max_task_attempts(),
+            max_tool_iterations: default_max_tool_iterations(),
         }
     }
 }

@@ -194,3 +194,11 @@ adaptive_retries = true
 # Set confidence_verify = false to skip the extra verifier round-trip.
 confidence_verify = true
 confidence_min = 3
+# Stay on actionable tasks (code/tools/writes) until done. When
+# [harness].test_command or check_paths are set, they define success;
+# otherwise incomplete replies trigger automatic continuations.
+persist_until_success = true
+# Outer continuations per turn before returning to the user anyway.
+max_task_attempts = 5
+# Inner tool-call rounds per continuation (raise for long multi-tool work).
+max_tool_iterations = 12

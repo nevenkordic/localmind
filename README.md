@@ -302,6 +302,11 @@ cp config/config.example.toml config/local.toml
 |---------------------|----------------------------------------------------------------|
 | `confidence_verify` | fact-check low-confidence replies (tag is hidden from display) |
 | `confidence_min`    | scores below this trigger the verifier (1–5, default 3)        |
+| `persist_until_success` | keep working actionable tasks until checks pass (default true) |
+| `max_task_attempts` | outer continuations per turn before giving up (default 5)    |
+| `max_tool_iterations` | inner tool-call rounds per continuation (default 12)     |
+
+Set `[harness].test_command` (e.g. `cargo test`) for objective success on coding tasks.
 
 Env vars override: `LOCALMIND_CHAT_MODEL`, `LOCALMIND_DB_PATH`,
 `BRAVE_API_KEY`, `LOCALMIND_NO_UPDATE_CHECK`, etc.

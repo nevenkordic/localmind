@@ -3,6 +3,7 @@
 pub mod system_prompt;
 
 use crate::config::Config;
+use crate::harness::checks::{run_checks, CheckOptions};
 use crate::llm::ollama::OllamaClient as Ollama;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::memory::{NewMemory, Store};
@@ -253,7 +254,7 @@ impl AgentRun {
             messages: vec![ChatMessage::system(system_prompt::render_opts(
                 cfg.agent.confidence_verify,
             ))],
-            max_tool_iterations: 12,
+            max_tool_iterations: cfg.agent.max_tool_iterations.max(1),
             last_primer: None,
             last_memory_primer: None,
             token_sink: None,
@@ -720,32 +721,103 @@ impl AgentRun {
         self.messages
             .push(ChatMessage::user(user_input.to_string()));
         let user_idx = self.messages.len() - 1;
-        let model = self.route_turn(user_input);
+        let mut model = self.route_turn(user_input);
         // Consume any force_model so the next turn re-routes normally.
         self.force_model = None;
-        let mut reply = self.loop_tools(&model).await?;
-        // Capture confidence before the verify gate strips the tag.
-        let conf_score = parse_confidence(&reply);
-        reply = self.maybe_confidence_verify(user_input, reply).await;
+        let actionable = is_actionable_task(user_input);
+        let persist = self.ctx.cfg.agent.persist_until_success && actionable;
+        let max_continuations = self.ctx.cfg.agent.max_task_attempts.max(1);
+        let mut continuations = 0usize;
+        let mut escalated = false;
+        let mut reply = String::new();
 
-        // Automatic escalate: weak fast_model reply → retry on chat_model.
-        if self.ctx.cfg.ollama.auto_escalate
-            && self.is_fast_model(&model)
-            && should_escalate_reply(&reply, conf_score, self.ctx.cfg.agent.confidence_min)
-        {
-            let big = self.ctx.cfg.ollama.chat_model.clone();
-            eprintln!("  · escalating to {big} (challenging task)");
-            // Drop this turn's assistant/tool trail; keep the user message.
-            self.messages.truncate(user_idx + 1);
-            if self.persisted_up_to > self.messages.len() {
-                self.persisted_up_to = self.messages.len();
-            }
-            reply = self.loop_tools(&big).await?;
+        loop {
+            reply = self.loop_tools(&model).await?;
+            let mut conf_score = parse_confidence(&reply);
             reply = self.maybe_confidence_verify(user_input, reply).await;
+            conf_score = parse_confidence(&reply);
+
+            // Automatic escalate: weak fast_model reply → retry on chat_model.
+            if !escalated
+                && self.ctx.cfg.ollama.auto_escalate
+                && self.is_fast_model(&model)
+                && should_escalate_reply(&reply, conf_score, self.ctx.cfg.agent.confidence_min)
+            {
+                let big = self.ctx.cfg.ollama.chat_model.clone();
+                eprintln!("  · escalating to {big} (challenging task)");
+                self.messages.truncate(user_idx + 1);
+                if self.persisted_up_to > self.messages.len() {
+                    self.persisted_up_to = self.messages.len();
+                }
+                model = big;
+                escalated = true;
+                continue;
+            }
+
+            if !persist {
+                break;
+            }
+
+            match self.task_completion_feedback(&reply, conf_score).await {
+                None => break,
+                Some(feedback) => {
+                    continuations += 1;
+                    if continuations >= max_continuations {
+                        eprintln!(
+                            "  · task persistence cap reached ({max_continuations} continuation(s))"
+                        );
+                        break;
+                    }
+                    eprintln!(
+                        "  · continuing task ({continuations}/{max_continuations}): not complete yet"
+                    );
+                    self.messages.push(ChatMessage::user(format!(
+                        "The task is not finished yet. Continue from where you left off and \
+                         complete it successfully. Use tools as needed — do not hand work back \
+                         to the user or stop until the objective is done.\n\nFEEDBACK:\n{feedback}"
+                    )));
+                }
+            }
         }
 
         self.maybe_auto_persist(user_input, turn_mark).await;
         Ok(reply)
+    }
+
+    /// Ground-truth + heuristic completion check for actionable tasks.
+    /// `None` = success; `Some(feedback)` = keep working.
+    async fn task_completion_feedback(
+        &self,
+        reply: &str,
+        confidence: Option<u8>,
+    ) -> Option<String> {
+        if task_reply_looks_incomplete(reply, confidence, self.ctx.cfg.agent.confidence_min) {
+            return Some("Assistant reply indicates the work is not finished yet.".into());
+        }
+
+        let harness = &self.ctx.cfg.harness;
+        let has_ground = !harness.test_command.trim().is_empty()
+            || harness.require_tool_use
+            || harness.check_paths.iter().any(|p| !p.trim().is_empty());
+        if !has_ground {
+            return None;
+        }
+
+        let audit_tail = self.ctx.audit.read_tail(40).unwrap_or_default();
+        let report = run_checks(
+            &CheckOptions {
+                test_command: harness.test_command.clone(),
+                require_tool_use: harness.require_tool_use,
+                check_paths: harness.check_paths.clone(),
+            },
+            &audit_tail,
+        )
+        .await;
+        if report.all_passed() {
+            None
+        } else {
+            Some(report.summary())
+        }
     }
 
     /// Broodlink-style confidence gate: parse `[CONFIDENCE: N/5]`, strip it
@@ -1379,10 +1451,10 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_narrated_write, extract_facts, is_trivial_turn, needs_capable_model,
-        parse_confidence, scrub_hallucinated_tool_output, should_escalate_reply, should_use_fast,
-        strip_confidence_tag, MarkdownHighlighter, StreamingConfidenceFilter,
-        StreamingToolCallFilter,
+        detect_narrated_write, extract_facts, is_actionable_task, is_trivial_turn,
+        needs_capable_model, parse_confidence, scrub_hallucinated_tool_output,
+        should_escalate_reply, should_use_fast, strip_confidence_tag, task_reply_looks_incomplete,
+        MarkdownHighlighter, StreamingConfidenceFilter, StreamingToolCallFilter,
     };
 
     #[test]
@@ -1619,6 +1691,33 @@ mod tests {
         assert!(!should_escalate_reply(
             "Here is the definition of a mutex.",
             None,
+            3
+        ));
+    }
+
+    #[test]
+    fn actionable_task_detection() {
+        assert!(!is_actionable_task("hi"));
+        assert!(!is_actionable_task("what is a mutex"));
+        assert!(is_actionable_task("fix the failing test in src/lib.rs"));
+        assert!(is_actionable_task("implement retry with backoff"));
+    }
+
+    #[test]
+    fn incomplete_reply_heuristics() {
+        assert!(task_reply_looks_incomplete(
+            "Max tool iterations reached",
+            None,
+            3
+        ));
+        assert!(task_reply_looks_incomplete(
+            "I'll need to update the tests next.",
+            None,
+            3
+        ));
+        assert!(!task_reply_looks_incomplete(
+            "Fixed the bug and all tests pass.",
+            Some(5),
             3
         ));
     }
@@ -3040,6 +3139,48 @@ pub(crate) fn needs_capable_model(input: &str) -> bool {
         return true;
     }
     false
+}
+
+/// True when the user message is a substantive work request (not chat).
+pub(crate) fn is_actionable_task(input: &str) -> bool {
+    !is_trivial_turn(input) && needs_capable_model(input)
+}
+
+/// Heuristic: assistant stopped early or admitted failure.
+pub(crate) fn task_reply_looks_incomplete(
+    reply: &str,
+    confidence: Option<u8>,
+    confidence_min: u8,
+) -> bool {
+    if should_escalate_reply(reply, confidence, confidence_min) {
+        return true;
+    }
+    let lower = reply.to_lowercase();
+    const INCOMPLETE: &[&str] = &[
+        "max tool iterations reached",
+        "i'll need to",
+        "i will need to",
+        "next, i",
+        "next step",
+        "still need to",
+        "not yet complete",
+        "not finished",
+        "not done yet",
+        "partially complete",
+        "partially done",
+        "couldn't finish",
+        "could not finish",
+        "in progress",
+        "let me know if you want me to continue",
+        "would you like me to continue",
+        "should i continue",
+        "want me to continue",
+        "i haven't finished",
+        "i have not finished",
+        "remaining work",
+        "left to do",
+    ];
+    INCOMPLETE.iter().any(|s| lower.contains(s))
 }
 
 /// Decide whether a fast_model reply is too weak and should be retried on
