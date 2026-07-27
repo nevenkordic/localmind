@@ -91,6 +91,11 @@ enum Command {
         #[command(subcommand)]
         cmd: HarnessCmd,
     },
+    /// List and approve/ignore taught skills.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
     /// Print the effective configuration and exit.
     ConfigShow,
     /// Initialise the memory database and verify connectivity.
@@ -199,6 +204,25 @@ enum HarnessCmd {
         /// Filter by formula name (e.g. verify).
         #[arg(long)]
         formula: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsCmd {
+    /// List taught skills with trust tiers.
+    List {
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Approve a skill (trust_tier → user; primed as authoritative).
+    Approve {
+        /// Full id or unique prefix (from `llm skills list`).
+        id: String,
+    },
+    /// Ignore a skill (trust_tier → ignored; hidden from primers).
+    Ignore {
+        /// Full id or unique prefix.
+        id: String,
     },
 }
 
@@ -325,6 +349,7 @@ async fn main() -> Result<()> {
         }
         Command::Memory { cmd } => memory_cmd(cmd, &cfg, &store).await,
         Command::Harness { cmd } => harness_cmd(cmd, &store).await,
+        Command::Skills { cmd } => skills_cmd(cmd, &store).await,
         Command::ConfigShow => {
             println!("{}", cfg.pretty()?);
             Ok(())
@@ -769,6 +794,59 @@ async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
                 );
             }
             Ok(())
+        }
+    }
+}
+
+async fn skills_cmd(cmd: SkillsCmd, store: &memory::Store) -> Result<()> {
+    match cmd {
+        SkillsCmd::List { limit } => {
+            let skills = store.list_by_kind("skill", limit).await?;
+            if skills.is_empty() {
+                println!("(no skills yet)");
+                return Ok(());
+            }
+            for s in skills {
+                let id_short: String = s.id.chars().take(8).collect();
+                println!(
+                    "{id_short}  [{:8}]  [{:.2}]  {}",
+                    s.trust_tier, s.importance, s.title
+                );
+            }
+            Ok(())
+        }
+        SkillsCmd::Approve { id } => resolve_and_set_tier(store, &id, "user").await,
+        SkillsCmd::Ignore { id } => resolve_and_set_tier(store, &id, "ignored").await,
+    }
+}
+
+async fn resolve_and_set_tier(store: &memory::Store, prefix: &str, tier: &str) -> Result<()> {
+    if prefix.len() < 4 {
+        anyhow::bail!("id prefix too short — use at least 4 characters");
+    }
+    let matches = store.find_by_id_prefix(prefix, 5).await?;
+    match matches.len() {
+        0 => anyhow::bail!("no memory matches id prefix '{prefix}'"),
+        1 => {
+            let m = &matches[0];
+            if m.kind != "skill" {
+                anyhow::bail!(
+                    "id {} is kind={} (expected skill)",
+                    &m.id[..8.min(m.id.len())],
+                    m.kind
+                );
+            }
+            store.set_trust_tier(&m.id, tier).await?;
+            println!("{} → {}  ({})", &m.id[..8.min(m.id.len())], tier, m.title);
+            Ok(())
+        }
+        n => {
+            eprintln!("ambiguous: {n} matches for '{prefix}' — be more specific");
+            for m in matches {
+                let id_short: String = m.id.chars().take(12).collect();
+                eprintln!("  {id_short}  [{}]  {}", m.kind, m.title);
+            }
+            anyhow::bail!("ambiguous id prefix");
         }
     }
 }
