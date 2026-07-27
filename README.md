@@ -83,8 +83,15 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   The verify harness (`llm run`) and conversation compaction also distill
   reusable procedures into skills so the agent does not rediscover the
   same fix next time.
+- **Short-term + long-term memory.** Conversation history is resumed per
+  working directory (STM). Compaction and `auto_persist` write turn
+  summaries / tool actions into searchable SQLite LTM with timestamps so
+  later sessions know what was done, when, and how — without the user
+  repeating themselves. Preferences and recent decisions are always primed.
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
+- **Action history.** `list_recent_actions` surfaces audit-log tool calls
+  and LTM work notes (auto-persist, harness runs, compact summaries).
 - **Verify harness.** `llm run "<task>"` runs plan → review → act → verify with
   verifier quorum, optional ground-truth checks (`test_command`), and skill
   promotion (`auto` → `verified` after repeated successes). Shared SQLite

@@ -304,6 +304,36 @@ pub async fn run(
         .await
         .ok();
 
+    // Mirror into searchable LTM so future sessions recall what the harness
+    // did, when, and how — not only via distilled skills.
+    let when = crate::util::format_ts(crate::util::now_ts());
+    let harness_title = format!(
+        "harness {}: {}",
+        formula.formula.name,
+        crate::util::truncate(task, 60)
+    );
+    let harness_content = format!(
+        "When: {when}\nTask: {task}\nPlan:\n{}\nResult:\n{}\nOutcome: {outcome} after {attempts} attempt(s); checks_passed={checks_passed}\nFeedback: {}",
+        crate::util::truncate(&plan, 1500),
+        crate::util::truncate(&result, 1500),
+        crate::util::truncate(&feedback, 500),
+    );
+    let _ = store
+        .insert_memory(&NewMemory {
+            kind: "decision".into(),
+            title: harness_title,
+            content: harness_content,
+            source: "harness".into(),
+            tags: vec![
+                "harness".into(),
+                formula.formula.name.clone(),
+                outcome.into(),
+            ],
+            importance: if passed { 0.8 } else { 0.55 },
+            trust_tier: Some("auto".into()),
+        })
+        .await;
+
     let mut skills_stored = 0usize;
     if passed && cfg.harness.auto_skill {
         let transcript = format!(

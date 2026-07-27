@@ -40,6 +40,7 @@ impl Registry {
             store_memory_spec(),
             log_decision_spec(),
             list_decisions_spec(),
+            list_recent_actions_spec(),
             kg_link_spec(),
             // Networking / admin tools — always advertised; the permission
             // layer decides whether each individual call is allowed.
@@ -162,6 +163,9 @@ impl Registry {
             "store_memory" => crate::tools::memory_tools::store_memory(ctx, args).await,
             "log_decision" => crate::tools::memory_tools::log_decision(ctx, args).await,
             "list_decisions" => crate::tools::memory_tools::list_decisions(ctx, args).await,
+            "list_recent_actions" => {
+                crate::tools::memory_tools::list_recent_actions(ctx, args).await
+            }
             "kg_link" => crate::tools::memory_tools::kg_link(ctx, args).await,
             "web_search" => crate::tools::web::web_search(ctx, args).await,
             "web_fetch" => crate::tools::web::web_fetch(ctx, args).await,
@@ -795,6 +799,20 @@ fn list_decisions_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "default": 10}
+            }
+        }),
+    )
+}
+fn list_recent_actions_spec() -> ToolSpec {
+    spec(
+        "list_recent_actions",
+        "List what you (the agent) recently did — tool calls with timestamps from the audit log, \
+         plus long-term work notes (auto-persisted turns, harness runs, compact summaries). \
+         Call this when the user asks what you did, how something was fixed, or when a change happened.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 20}
             }
         }),
     )

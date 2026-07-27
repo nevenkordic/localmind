@@ -118,13 +118,72 @@ pub async fn list_decisions(ctx: &ToolContext, args: &Value) -> Result<String> {
     let mut out = String::new();
     for (i, d) in rows.iter().enumerate() {
         out.push_str(&format!(
-            "[#{} id={}]\n{}\n  reasoning: {}\n  outcome: {}\n\n",
+            "[#{} id={} @ {}]\n{}\n  reasoning: {}\n  outcome: {}\n\n",
             i + 1,
             &d.id[..8.min(d.id.len())],
+            crate::util::format_ts(d.created_at),
             d.decision,
             crate::util::truncate(&d.reasoning, 200),
             crate::util::truncate(&d.outcome, 120),
         ));
+    }
+    Ok(out)
+}
+
+/// What the agent did recently — audit log (when/how tool calls) plus
+/// recent auto-persist / harness LTM notes. Use when the user asks
+/// "what did you do?", "how did we fix X?", or similar.
+pub async fn list_recent_actions(ctx: &ToolContext, args: &Value) -> Result<String> {
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let limit = limit.clamp(1, 100);
+    let mut out = String::new();
+
+    let audit_path = ctx.audit.path();
+    match ctx.audit.read_tail(limit) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            out.push_str("## Recent tool calls (audit log)\n");
+            for line in raw.lines() {
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    let ts = v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0);
+                    let tool = v.get("tool").and_then(|t| t.as_str()).unwrap_or("?");
+                    let decision = v.get("decision").and_then(|t| t.as_str()).unwrap_or("?");
+                    let summary = v
+                        .get("result_summary")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let args_s = v
+                        .get("args")
+                        .map(|a| crate::util::truncate(&a.to_string(), 160))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "- [{}] {tool} ({decision}) args={args_s} → {}\n",
+                        crate::util::format_ts(ts),
+                        crate::util::truncate(summary, 160)
+                    ));
+                } else {
+                    out.push_str(&format!("- {line}\n"));
+                }
+            }
+            out.push('\n');
+        }
+        _ => out.push_str("## Recent tool calls (audit log)\n(no audit entries yet)\n\n"),
+    }
+
+    match ctx.store.list_recent_work(limit.min(15)).await {
+        Ok(rows) if !rows.is_empty() => {
+            out.push_str("## Recent work notes (long-term memory)\n");
+            for m in rows {
+                out.push_str(&format!(
+                    "- [{} @ {} | {}] {}: {}\n",
+                    m.kind,
+                    crate::util::format_ts(m.created_at),
+                    m.source,
+                    m.title,
+                    crate::util::truncate(m.content.trim(), 280)
+                ));
+            }
+        }
+        _ => out.push_str("## Recent work notes (long-term memory)\n(none yet)\n"),
     }
     Ok(out)
 }

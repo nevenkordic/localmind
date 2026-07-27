@@ -416,4 +416,110 @@ async fn harness_plan_act_verify_records_skill() {
         search_out.contains("greeting") || search_out.contains("hello.txt"),
         "skill not in memory search:\n{search_out}"
     );
+
+    // Harness outcomes must also land as searchable LTM decisions so later
+    // sessions can recall what/when/how — not only distilled skills.
+    let harness_search = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["memory", "search", "harness", "--bm25"])
+        .output()
+        .await
+        .expect("harness search");
+    assert!(harness_search.status.success());
+    let harness_out = String::from_utf8_lossy(&harness_search.stdout);
+    assert!(
+        harness_out.contains("harness") || harness_out.contains("greeting"),
+        "harness run not mirrored to LTM:\n{harness_out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_persist_records_turn_actions_for_next_session() {
+    // With auto_persist=true, a tool-using turn must write an LTM note of
+    // what/when/how so the next session's recent-context primer surfaces it.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mock1 = MockOllama::start(vec![
+        MockReply::chat_tool_call(
+            "search_memory",
+            serde_json::json!({"query": "deploy staging"}),
+        ),
+        MockReply::chat_text(
+            "I checked memory for the staging deploy procedure and found nothing yet.",
+        ),
+    ])
+    .await;
+    let cfg1 = common::testenv::write_config_opts(dir.path(), &mock1.url, true);
+    let out = run_ask(&cfg1, "look up how we deploy to staging").await;
+    assert!(
+        out.status.success(),
+        "session 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(mock1);
+
+    let mock2 = MockOllama::start(vec![MockReply::chat_text("ack")]).await;
+    let cfg2 = common::testenv::write_config_opts(dir.path(), &mock2.url, true);
+    let out = run_ask(&cfg2, "what did you do about staging deploy").await;
+    assert!(
+        out.status.success(),
+        "session 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let chats: Vec<_> = mock2
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/api/chat"))
+        .collect();
+    assert_eq!(chats.len(), 1);
+    assert!(
+        chats[0].body.contains("search_memory")
+            || chats[0].body.contains("auto-persist")
+            || chats[0].body.contains("How (actions)")
+            || chats[0].body.contains("Recent context"),
+        "recent-context primer missing auto-persisted actions:\n{}",
+        chats[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_context_primes_preferences_without_query_match() {
+    // Preferences must appear in the always-on recent-context primer even
+    // when the user's question wouldn't BM25-match the preference title.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mock1 = MockOllama::start(vec![MockReply::chat_text("Nice to meet you!")]).await;
+    let cfg1 = common::testenv::write_config(dir.path(), &mock1.url);
+    let out = run_ask(&cfg1, "my name is ContextPrimeUser").await;
+    assert!(
+        out.status.success(),
+        "session 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(mock1);
+
+    // "hi" is trivial — still injects recent preferences so the model
+    // already knows the user without a matching recall query.
+    let mock2 = MockOllama::start(vec![MockReply::chat_text("hello back")]).await;
+    let cfg2 = common::testenv::write_config(dir.path(), &mock2.url);
+    let out = run_ask(&cfg2, "hi").await;
+    assert!(
+        out.status.success(),
+        "session 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let chats: Vec<_> = mock2
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/api/chat"))
+        .collect();
+    assert_eq!(chats.len(), 1);
+    assert!(
+        chats[0].body.contains("ContextPrimeUser"),
+        "recent-context primer didn't surface preference on trivial turn:\n{}",
+        chats[0].body
+    );
 }

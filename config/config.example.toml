@@ -48,7 +48,7 @@ compact_keep_tail = 8
 # How many messages to pull from the previous session on launch (per
 # cwd). Small values keep short-term continuity without letting stale
 # prior-session style anchor the model. Set to 0 to disable auto-resume.
-resume_messages = 8
+resume_messages = 16
 
 [memory]
 # Path to the SQLite memory database. %DATA% expands to the OS data dir.
@@ -61,7 +61,8 @@ bm25_weight = 0.4
 vector_weight = 0.6
 # How aggressively older memories decay in ranking (half-life in days).
 temporal_half_life_days = 30.0
-# Auto-summarise and persist conversation turns as memories.
+# Auto-summarise turns into searchable LTM notes (what/when/how), including
+# tool actions. Keeps later sessions from forcing the user to repeat themselves.
 auto_persist = true
 # Query expansion — ask the LLM for N paraphrasings before searching.
 # Each variant costs one extra Ollama round-trip; default 0 keeps recall fast.

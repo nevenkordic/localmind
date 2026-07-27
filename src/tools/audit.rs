@@ -1,7 +1,7 @@
 //! Append-only JSONL audit log of every tool call.
 //! Intentionally plain-text so your IT team can `tail -f` it.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -65,6 +65,18 @@ impl AuditLog {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// Last `max_lines` of the JSONL audit log (newest at the end).
+    pub fn read_tail(&self, max_lines: usize) -> Result<String> {
+        let raw = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading audit log {}", self.path.display()))?;
+        let lines: Vec<&str> = raw.lines().collect();
+        if lines.is_empty() {
+            return Ok(String::new());
+        }
+        let start = lines.len().saturating_sub(max_lines.max(1));
+        Ok(lines[start..].join("\n"))
+    }
 }
 
 /// Walk the args JSON and truncate any large string field — the agent could
@@ -125,5 +137,18 @@ mod tests {
     fn leaves_small_payload_alone() {
         let v = serde_json::json!({ "command": "ls -la", "cwd": "/tmp" });
         assert_eq!(redact_args(&v), v);
+    }
+
+    #[test]
+    fn read_tail_returns_last_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let log = AuditLog {
+            path,
+            inner: Mutex::new(()),
+        };
+        let tail = log.read_tail(2).unwrap();
+        assert_eq!(tail, "line2\nline3");
     }
 }
