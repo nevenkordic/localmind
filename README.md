@@ -377,15 +377,13 @@ bash scripts/preflight.sh  # full pre-ship verification
 cargo build --release      # binary at target/release/llm
 ```
 
-### Releases (manual only)
+### Releases
 
-The **Release** GitHub Action does **not** run on push or merge. Publish a
-build only when you want one:
+The **Release** workflow builds multi-arch binaries and publishes a GitHub
+Release. It does **not** run on ordinary pushes or PR merges. Trigger it by:
 
-1. Actions → **Release** → **Run workflow**
-2. Enter a version tag like `v0.1.11` (optional: draft)
-3. The workflow builds multi-arch binaries, creates the tag if missing, and
-   attaches assets to a GitHub Release
+1. Pushing a version tag (`git tag v2.0.0 && git push origin v2.0.0`), or
+2. Actions → **Release** → **Run workflow** with a version like `v2.0.0`
 
 CI (`fmt` / `clippy` / `tests`) still runs on PRs and pushes to `main`.
 
