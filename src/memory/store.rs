@@ -20,6 +20,41 @@ pub struct NewMemory {
     pub source: String,
     pub tags: Vec<String>,
     pub importance: f32,
+    /// `user` | `verified` | `auto`. When None, inferred from `source`.
+    pub trust_tier: Option<String>,
+}
+
+/// Trust tier for recalled memories. `user` and `verified` are treated as
+/// authoritative; `auto` is advisory only.
+pub fn infer_trust_tier(source: &str) -> &'static str {
+    match source {
+        "user" | "/remember" | "auto-extract" => "user",
+        "harness-distill" | "compact-distill" | "decision-ledger" => "auto",
+        _ => "auto",
+    }
+}
+
+const MEMORY_COLS: &str = "id, kind, title, content, source, tags_json, importance, \
+    created_at, updated_at, accessed_at, access_count, trust_tier, success_count, fail_count";
+
+fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemory> {
+    let tags_json: String = row.get(5)?;
+    Ok(StoredMemory {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        content: row.get(3)?,
+        source: row.get(4)?,
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        importance: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        accessed_at: row.get(9)?,
+        access_count: row.get(10)?,
+        trust_tier: row.get(11)?,
+        success_count: row.get(12)?,
+        fail_count: row.get(13)?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +70,9 @@ pub struct StoredMemory {
     pub updated_at: i64,
     pub accessed_at: i64,
     pub access_count: i64,
+    pub trust_tier: String,
+    pub success_count: i64,
+    pub fail_count: i64,
 }
 
 #[derive(Debug, Default)]
@@ -133,9 +171,40 @@ impl Store {
                 .context("applying 002_vector_index.sql")?;
             conn.execute_batch(include_str!("../../migrations/003_decisions.sql"))
                 .context("applying 003_decisions.sql")?;
+            conn.execute_batch(include_str!("../../migrations/004_harness_learning.sql"))
+                .context("applying 004_harness_learning.sql")?;
+            Self::ensure_memory_trust_columns(&conn)?;
             Ok(())
         })
         .await??;
+        Ok(())
+    }
+
+    /// Idempotent column adds for memories trust/outcome fields (004).
+    fn ensure_memory_trust_columns(conn: &Connection) -> Result<()> {
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memories)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "trust_tier") {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN trust_tier TEXT NOT NULL DEFAULT 'auto'",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "success_count") {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "fail_count") {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -151,6 +220,10 @@ impl Store {
         let content = new.content.clone();
         let source = new.source.clone();
         let importance = new.importance.clamp(0.0, 1.0);
+        let trust_tier = new
+            .trust_tier
+            .clone()
+            .unwrap_or_else(|| infer_trust_tier(&source).to_string());
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = inner.lock().unwrap();
@@ -159,9 +232,13 @@ impl Store {
             let changed = conn.execute(
                 r#"INSERT OR IGNORE INTO memories
                    (id, kind, title, content, source, tags_json, importance,
-                    created_at, updated_at, accessed_at, access_count, content_hash)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9)"#,
-                params![id_out, kind, title, content, source, tags_json, importance, now, hash],
+                    created_at, updated_at, accessed_at, access_count, content_hash,
+                    trust_tier, success_count, fail_count)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, 0, 0)"#,
+                params![
+                    id_out, kind, title, content, source, tags_json, importance, now, hash,
+                    trust_tier
+                ],
             )?;
             if changed == 0 {
                 // Duplicate content — update access stats on the existing row.
@@ -205,30 +282,11 @@ impl Store {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
-                "SELECT id, kind, title, content, source, tags_json, importance,
-                        created_at, updated_at, accessed_at, access_count
-                 FROM memories WHERE id IN ({placeholders})"
-            );
+            let sql = format!("SELECT {MEMORY_COLS} FROM memories WHERE id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql)?;
             let bound: Vec<&dyn rusqlite::ToSql> =
                 ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            let rows = stmt.query_map(&bound[..], |row| {
-                let tags_json: String = row.get(5)?;
-                Ok(StoredMemory {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    title: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    accessed_at: row.get(9)?,
-                    access_count: row.get(10)?,
-                })
-            })?;
+            let rows = stmt.query_map(&bound[..], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -244,27 +302,11 @@ impl Store {
         let id = id.to_string();
         tokio::task::spawn_blocking(move || -> Result<Option<StoredMemory>> {
             let conn = inner.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT id, kind, title, content, source, tags_json, importance,
-                        created_at, updated_at, accessed_at, access_count
-                 FROM memories WHERE id = ?1",
-            )?;
+            let mut stmt =
+                conn.prepare(&format!("SELECT {MEMORY_COLS} FROM memories WHERE id = ?1"))?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
-                let tags_json: String = row.get(5)?;
-                Ok(Some(StoredMemory {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    title: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    accessed_at: row.get(9)?,
-                    access_count: row.get(10)?,
-                }))
+                Ok(Some(map_memory_row(&row)?))
             } else {
                 Ok(None)
             }
@@ -296,29 +338,13 @@ impl Store {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
             let conn = inner.lock().unwrap();
-            let mut stmt = conn.prepare(
-                r#"SELECT id, kind, title, content, source, tags_json, importance,
-                          created_at, updated_at, accessed_at, access_count
+            let mut stmt = conn.prepare(&format!(
+                r#"SELECT {MEMORY_COLS}
                    FROM memories
                    ORDER BY updated_at DESC
-                   LIMIT ?1"#,
-            )?;
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                let tags_json: String = row.get(5)?;
-                Ok(StoredMemory {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    title: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    accessed_at: row.get(9)?,
-                    access_count: row.get(10)?,
-                })
-            })?;
+                   LIMIT ?1"#
+            ))?;
+            let rows = stmt.query_map(params![limit as i64], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -333,29 +359,13 @@ impl Store {
         let kind = kind.to_string();
         tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
             let conn = inner.lock().unwrap();
-            let mut stmt = conn.prepare(
-                r#"SELECT id, kind, title, content, source, tags_json, importance,
-                          created_at, updated_at, accessed_at, access_count
+            let mut stmt = conn.prepare(&format!(
+                r#"SELECT {MEMORY_COLS}
                    FROM memories WHERE kind = ?1
                    ORDER BY importance DESC, updated_at DESC
-                   LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(params![kind, limit as i64], |row| {
-                let tags_json: String = row.get(5)?;
-                Ok(StoredMemory {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    title: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    accessed_at: row.get(9)?,
-                    access_count: row.get(10)?,
-                })
-            })?;
+                   LIMIT ?2"#
+            ))?;
+            let rows = stmt.query_map(params![kind, limit as i64], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -372,29 +382,13 @@ impl Store {
         let pattern = format!("{prefix}%");
         tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
             let conn = inner.lock().unwrap();
-            let mut stmt = conn.prepare(
-                r#"SELECT id, kind, title, content, source, tags_json, importance,
-                          created_at, updated_at, accessed_at, access_count
+            let mut stmt = conn.prepare(&format!(
+                r#"SELECT {MEMORY_COLS}
                    FROM memories WHERE id LIKE ?1
                    ORDER BY updated_at DESC
-                   LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-                let tags_json: String = row.get(5)?;
-                Ok(StoredMemory {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    title: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    importance: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    accessed_at: row.get(9)?,
-                    access_count: row.get(10)?,
-                })
-            })?;
+                   LIMIT ?2"#
+            ))?;
+            let rows = stmt.query_map(params![pattern, limit as i64], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -412,32 +406,16 @@ impl Store {
             let mut stmt = conn.prepare(
                 r#"SELECT m.id, m.kind, m.title, m.content, m.source, m.tags_json,
                           m.importance, m.created_at, m.updated_at, m.accessed_at,
-                          m.access_count, bm25(memories_fts) AS rank
+                          m.access_count, m.trust_tier, m.success_count, m.fail_count,
+                          bm25(memories_fts) AS rank
                    FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
                    WHERE memories_fts MATCH ?1
                    ORDER BY rank
                    LIMIT ?2"#,
             )?;
             let rows = stmt.query_map(params![q, limit as i64], |row| {
-                let tags_json: String = row.get(5)?;
-                let rank: f64 = row.get(11)?;
-                // bm25() returns a negative-ish score; smaller = better. Invert.
-                Ok((
-                    StoredMemory {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        title: row.get(2)?,
-                        content: row.get(3)?,
-                        source: row.get(4)?,
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        importance: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        accessed_at: row.get(9)?,
-                        access_count: row.get(10)?,
-                    },
-                    rank as f32,
-                ))
+                let rank: f64 = row.get(14)?;
+                Ok((map_memory_row(row)?, rank as f32))
             })?;
             let mut out = Vec::new();
             for r in rows {
@@ -461,30 +439,15 @@ impl Store {
             let mut stmt = conn.prepare(
                 r#"SELECT m.id, m.kind, m.title, m.content, m.source, m.tags_json,
                           m.importance, m.created_at, m.updated_at, m.accessed_at,
-                          m.access_count, v.distance
+                          m.access_count, m.trust_tier, m.success_count, m.fail_count,
+                          v.distance
                    FROM memory_vec v JOIN memories m ON m.id = v.memory_id
                    WHERE v.embedding MATCH ?1 AND k = ?2
                    ORDER BY v.distance"#,
             )?;
             let rows = stmt.query_map(params![blob, limit as i64], |row| {
-                let tags_json: String = row.get(5)?;
-                let dist: f64 = row.get(11)?;
-                Ok((
-                    StoredMemory {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        title: row.get(2)?,
-                        content: row.get(3)?,
-                        source: row.get(4)?,
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        importance: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        accessed_at: row.get(9)?,
-                        access_count: row.get(10)?,
-                    },
-                    dist as f32,
-                ))
+                let dist: f64 = row.get(14)?;
+                Ok((map_memory_row(row)?, dist as f32))
             })?;
             let mut out = Vec::new();
             for r in rows {
@@ -891,6 +854,123 @@ impl Store {
             Ok(out)
         })
         .await?
+    }
+
+    /// Record a harness run for continuous improvement metrics.
+    pub async fn insert_harness_run(
+        &self,
+        formula_name: &str,
+        task: &str,
+        plan: &str,
+        result: &str,
+        passed: bool,
+        attempts: usize,
+        checks_passed: bool,
+        checks_json: &str,
+        skills_stored: usize,
+        decision_id: Option<&str>,
+    ) -> Result<String> {
+        let id = util::new_uuid();
+        let now = util::now_ts();
+        let inner = self.inner.clone();
+        let id_out = id.clone();
+        let formula_name = formula_name.to_string();
+        let task = task.to_string();
+        let plan = plan.to_string();
+        let result = result.to_string();
+        let checks_json = checks_json.to_string();
+        let decision_id = decision_id.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO harness_runs
+                   (id, formula_name, task, plan, result, passed, attempts,
+                    checks_passed, checks_json, skills_stored, decision_id, created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
+                params![
+                    id_out,
+                    formula_name,
+                    task,
+                    plan,
+                    result,
+                    passed as i32,
+                    attempts as i64,
+                    checks_passed as i32,
+                    checks_json,
+                    skills_stored as i64,
+                    decision_id,
+                    now
+                ],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(id)
+    }
+
+    pub async fn insert_harness_verdict(
+        &self,
+        run_id: &str,
+        stage: &str,
+        model: &str,
+        passed: bool,
+        feedback: &str,
+    ) -> Result<()> {
+        let id = util::new_uuid();
+        let now = util::now_ts();
+        let inner = self.inner.clone();
+        let run_id = run_id.to_string();
+        let stage = stage.to_string();
+        let model = model.to_string();
+        let feedback = feedback.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO harness_verdicts(id, run_id, stage, model, passed, feedback, created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7)"#,
+                params![id, run_id, stage, model, passed as i32, feedback, now],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Bump skill outcome counters; promote to `verified` after enough successes.
+    pub async fn record_skill_outcome(
+        &self,
+        memory_id: &str,
+        passed: bool,
+        promote_after: usize,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let memory_id = memory_id.to_string();
+        let promote_after = promote_after.max(1) as i64;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            if passed {
+                conn.execute(
+                    "UPDATE memories SET success_count = success_count + 1, updated_at = ?1 WHERE id = ?2",
+                    params![util::now_ts(), memory_id],
+                )?;
+                conn.execute(
+                    r#"UPDATE memories
+                       SET trust_tier = 'verified',
+                           importance = CASE WHEN importance < 0.9 THEN 0.9 ELSE importance END,
+                           updated_at = ?1
+                       WHERE id = ?2 AND success_count >= ?3 AND trust_tier = 'auto'"#,
+                    params![util::now_ts(), memory_id, promote_after],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE memories SET fail_count = fail_count + 1, updated_at = ?1 WHERE id = ?2",
+                    params![util::now_ts(), memory_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 }
 

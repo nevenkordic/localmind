@@ -25,6 +25,11 @@ auto_persist = false
 expansion_variants = 0
 vector_search = false
 
+[harness]
+quorum_min = 1
+plan_review = false
+test_command = ""
+
 [tools]
 workspace_root = ""
 deny_globs = []

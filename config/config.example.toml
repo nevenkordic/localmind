@@ -158,12 +158,16 @@ check_interval_hours = 24
 
 [harness]
 # Multi-model plan → act → verify harness (`llm run <task>`).
-# Optional dedicated verifier model. Empty = use fast_model when set and
-# distinct from chat_model, otherwise chat_model.
 verify_model = ""
-# Cap on act→verify retries after a failed verification.
+# Explicit verifier pool for quorum (distinct). Empty = derive from models above.
+verify_models = []
+quorum_min = 2
+quorum_policy = "majority"
+plan_review = true
+require_distinct_models = true
+# Ground-truth check after act (empty = skip). Example: "cargo test --locked"
+test_command = ""
 max_retries = 2
-# Distill reusable procedures into kind=skill memories after a successful
-# harness run and when conversation history is compacted — so the agent
-# does not rediscover the same fix next time.
 auto_skill = true
+# Promote auto-skills to verified trust after N successful harness runs.
+skill_promote_after = 2

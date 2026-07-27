@@ -1,19 +1,30 @@
-//! Multi-model verify harness — plan → act → verify with shared SQLite
-//! memory. Local models consult each other; learnings are recorded as
-//! skills so the next run does not rediscover the same procedure.
+//! Multi-model verify harness — plan → review → act → verify with quorum,
+//! ground-truth checks, and continuous skill learning.
+
+mod checks;
+mod quorum;
 
 use crate::agent::AgentRun;
 use crate::config::Config;
 use crate::llm::ollama::OllamaClient;
 use crate::memory::{NewMemory, Store};
+use crate::tools::audit::AuditLog;
 use crate::tools::permissions::PermissionMode;
 use anyhow::{Context, Result};
+use quorum::{quorum_met, verifier_models, QuorumPolicy, VerdictVote};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
 /// Built-in default formula used by `llm run` when no --formula is given.
 pub const DEFAULT_FORMULA: &str = include_str!("../../formulas/verify.toml");
+
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub test_command: Option<String>,
+    pub plan_review: Option<bool>,
+    pub quorum_min: Option<usize>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Formula {
@@ -37,7 +48,6 @@ fn default_retries() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stage {
     pub name: String,
-    /// planner | worker | verifier — picks which Ollama model to use.
     #[serde(default = "default_role")]
     pub role: String,
 }
@@ -47,10 +57,12 @@ fn default_role() -> String {
 
 #[derive(Debug)]
 pub struct HarnessResult {
+    pub run_id: String,
     pub plan: String,
     pub result: String,
     pub passed: bool,
     pub attempts: usize,
+    pub checks_passed: bool,
     pub skills_stored: usize,
     pub decision_id: Option<String>,
 }
@@ -75,7 +87,6 @@ impl Formula {
     }
 }
 
-/// Resolve which model a stage role should call.
 fn model_for_role(cfg: &Config, role: &str) -> Option<String> {
     let fast = cfg.ollama.fast_model.trim();
     let chat = cfg.ollama.chat_model.trim();
@@ -85,48 +96,86 @@ fn model_for_role(cfg: &Config, role: &str) -> Option<String> {
             if !fast.is_empty() {
                 Some(fast.to_string())
             } else {
-                None // chat_model default
+                None
             }
         }
         "verifier" => {
             if !verify.is_empty() {
                 Some(verify.to_string())
             } else if !fast.is_empty() && fast != chat {
-                // Prefer a distinct fast model for verify so worker and
-                // verifier are not the same weights when possible.
                 Some(fast.to_string())
             } else {
                 None
             }
         }
-        _ => None, // worker → chat_model
+        _ => None,
     }
 }
 
-/// Run plan → act → verify. On verify failure, re-run act with feedback
-/// up to `max_verify_retries`. On success, log a decision and distill
-/// reusable skills into SQLite.
+async fn run_quorum<F, Fut>(
+    cfg: &Config,
+    models: &[String],
+    policy: QuorumPolicy,
+    stage: &str,
+    mut call: F,
+) -> Result<(bool, String, Vec<VerdictVote>)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(bool, String)>>,
+{
+    let mut votes = Vec::new();
+    for model in models {
+        let m = model.clone();
+        let (ok, fb) = call(m.clone()).await?;
+        votes.push(VerdictVote {
+            model: m,
+            passed: ok,
+            feedback: fb,
+        });
+    }
+    let (passed, summary) = quorum_met(cfg, &votes, policy, models.len());
+    eprintln!("  · {stage} quorum: {summary}");
+    Ok((passed, summary, votes))
+}
+
+/// Run plan → review → act → verify with quorum and ground-truth checks.
 pub async fn run(
     cfg: Config,
     store: Store,
     formula: Formula,
     task: &str,
     mode: Option<PermissionMode>,
+    opts: RunOptions,
 ) -> Result<HarnessResult> {
     let cfg = Arc::new(cfg);
+    let mut cfg_mut = (*cfg).clone();
+    if let Some(n) = opts.quorum_min {
+        cfg_mut.harness.quorum_min = n;
+    }
+    let cfg = Arc::new(cfg_mut);
+
     let client = OllamaClient::new(&cfg.ollama);
+    let policy = QuorumPolicy::parse(&cfg.harness.quorum_policy);
     let max_retries = formula
         .formula
         .max_verify_retries
         .max(cfg.harness.max_retries);
+    let plan_review = opts.plan_review.unwrap_or(cfg.harness.plan_review);
+    let test_command = opts
+        .test_command
+        .as_deref()
+        .unwrap_or(cfg.harness.test_command.as_str())
+        .to_string();
+    let verifiers = verifier_models(&cfg);
 
     eprintln!(
-        "· harness `{}` — plan → act → verify (max {} retries)",
-        formula.formula.name, max_retries
+        "· harness `{}` — plan → review → act → verify (quorum {}, max {} retries)",
+        formula.formula.name, cfg.harness.quorum_min, max_retries
     );
 
-    // Shared memory primer so every stage sees the same skills/facts.
     let memory_primer = build_memory_primer(&store, &client, &cfg, task).await;
+    let mut plan_verdicts: Vec<VerdictVote> = Vec::new();
+    let mut verify_verdicts: Vec<VerdictVote> = Vec::new();
 
     // ---- PLAN ----------------------------------------------------------
     let plan_model = model_for_role(&cfg, "planner");
@@ -139,11 +188,38 @@ pub async fn run(
         .await
         .context("plan stage")?;
 
+    // ---- PLAN REVIEW QUORUM --------------------------------------------
+    if plan_review {
+        eprintln!("  · plan review quorum ({} models)", verifiers.len());
+        let primer = memory_primer.clone();
+        let task_owned = task.to_string();
+        let (ok, feedback, votes) = run_quorum(&cfg, &verifiers, policy, "plan_review", |model| {
+            let client = client.clone();
+            let plan = plan.clone();
+            let primer = primer.clone();
+            let task = task_owned.clone();
+            async move {
+                client
+                    .review_plan(&task, &plan, &primer, Some(model.as_str()))
+                    .await
+            }
+        })
+        .await?;
+        plan_verdicts = votes;
+        if !ok {
+            anyhow::bail!("plan review quorum failed: {feedback}");
+        }
+    }
+
     // ---- ACT / VERIFY loop --------------------------------------------
+    let audit = AuditLog::open()?;
     let mut feedback = String::new();
     let mut result = String::new();
     let mut passed = false;
+    let mut checks_passed = false;
     let mut attempts = 0usize;
+    let mut checks_json = "[]".to_string();
+    let mut stored_skill_ids: Vec<String> = Vec::new();
 
     for attempt in 0..=max_retries {
         attempts = attempt + 1;
@@ -168,35 +244,61 @@ pub async fn run(
             AgentRun::new_with_mode(cfg.clone(), store.clone(), mode, true, true, true)?;
         result = agent.turn(&act_prompt).await.context("act stage")?;
 
-        let verify_model = model_for_role(&cfg, "verifier");
+        let audit_tail = checks::read_audit_tail(audit.path(), 40).unwrap_or_default();
+        let check_report = checks::run_checks(&test_command, &audit_tail).await;
+        checks_passed = check_report.all_passed();
+        checks_json = serde_json::to_string(&check_report.results).unwrap_or_else(|_| "[]".into());
         eprintln!(
-            "  · verify ({})",
-            verify_model.as_deref().unwrap_or(&cfg.ollama.chat_model)
+            "  · ground checks: {}",
+            if checks_passed { "PASS" } else { "FAIL" }
         );
-        let (ok, fb) = client
-            .verify_stage(task, &plan, &result, verify_model.as_deref())
-            .await
-            .context("verify stage")?;
+        if !checks_passed {
+            feedback = check_report.summary();
+            if attempt == max_retries {
+                break;
+            }
+            continue;
+        }
+
+        let evidence = format!(
+            "{}\n\nAUDIT TAIL:\n{}",
+            check_report.summary(),
+            crate::util::truncate(&audit_tail, 3000)
+        );
+        let task_owned = task.to_string();
+        let plan_owned = plan.clone();
+        let result_owned = result.clone();
+        let (ok, summary, votes) = run_quorum(&cfg, &verifiers, policy, "verify", |model| {
+            let client = client.clone();
+            let task = task_owned.clone();
+            let plan = plan_owned.clone();
+            let result = result_owned.clone();
+            let evidence = evidence.clone();
+            async move {
+                client
+                    .verify_stage(&task, &plan, &result, &evidence, Some(model.as_str()))
+                    .await
+            }
+        })
+        .await?;
+        verify_verdicts = votes;
         if ok {
             passed = true;
-            eprintln!("  · verify PASS");
             break;
         }
-        feedback = fb;
-        eprintln!("  · verify FAIL: {}", crate::util::truncate(&feedback, 160));
+        feedback = summary;
         if attempt == max_retries {
             break;
         }
     }
 
-    // ---- DECISION + SKILLS --------------------------------------------
     let outcome = if passed { "passed" } else { "failed" };
     let decision_id = store
         .insert_decision(
             &format!("{}: {task}", formula.formula.name),
             &format!("plan:\n{plan}"),
             &feedback,
-            &format!("{outcome} after {attempts} attempt(s)"),
+            &format!("{outcome} after {attempts} attempt(s); checks_passed={checks_passed}"),
             "harness",
         )
         .await
@@ -218,11 +320,13 @@ pub async fn run(
                             source: "harness-distill".into(),
                             tags: vec!["auto-skill".into(), formula.formula.name.clone()],
                             importance: 0.85,
+                            trust_tier: Some("auto".into()),
                         })
                         .await
                     {
-                        Ok(_) => {
+                        Ok(id) => {
                             skills_stored += 1;
+                            stored_skill_ids.push(id);
                             eprintln!("  · skill recorded: {title}");
                         }
                         Err(e) => tracing::warn!("skill store failed: {e}"),
@@ -233,11 +337,45 @@ pub async fn run(
         }
     }
 
+    for id in &stored_skill_ids {
+        let _ = store
+            .record_skill_outcome(id, passed, cfg.harness.skill_promote_after)
+            .await;
+    }
+
+    let run_id = store
+        .insert_harness_run(
+            &formula.formula.name,
+            task,
+            &plan,
+            &result,
+            passed,
+            attempts,
+            checks_passed,
+            &checks_json,
+            skills_stored,
+            decision_id.as_deref(),
+        )
+        .await?;
+
+    for v in plan_verdicts {
+        let _ = store
+            .insert_harness_verdict(&run_id, "plan_review", &v.model, v.passed, &v.feedback)
+            .await;
+    }
+    for v in verify_verdicts {
+        let _ = store
+            .insert_harness_verdict(&run_id, "verify", &v.model, v.passed, &v.feedback)
+            .await;
+    }
+
     Ok(HarnessResult {
+        run_id,
         plan,
         result,
         passed,
         attempts,
+        checks_passed,
         skills_stored,
         decision_id,
     })
@@ -253,8 +391,14 @@ async fn build_memory_primer(
         Ok(hits) if !hits.is_empty() => {
             let mut out = String::new();
             for h in hits.iter().take(8) {
+                let tier = &h.memory.trust_tier;
+                let label = match tier.as_str() {
+                    "user" => "USER",
+                    "verified" => "VERIFIED",
+                    _ => "AUTO",
+                };
                 out.push_str(&format!(
-                    "- [{}] {}: {}\n",
+                    "- [{label} {}] {}: {}\n",
                     h.memory.kind, h.memory.title, h.memory.content
                 ));
             }

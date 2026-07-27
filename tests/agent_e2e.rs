@@ -381,6 +381,7 @@ async fn harness_plan_act_verify_records_skill() {
         .arg(&cfg)
         .arg("run")
         .arg("write a greeting file")
+        .arg("--no-plan-review")
         .arg("--mode")
         .arg("workspace-write")
         .output()
