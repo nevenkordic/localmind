@@ -172,3 +172,6 @@ max_retries = 2
 auto_skill = true
 # Promote auto-skills to verified trust after N successful harness runs.
 skill_promote_after = 2
+# Demote skills to ignored (hidden from primers) after N harness failures
+# while they were in context. 0 = never demote.
+skill_demote_after = 3

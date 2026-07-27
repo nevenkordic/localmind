@@ -173,9 +173,11 @@ pub async fn run(
         formula.formula.name, cfg.harness.quorum_min, max_retries
     );
 
-    let memory_primer = build_memory_primer(&store, &client, &cfg, task).await;
+    let (memory_primer, primed_skill_ids) = build_memory_primer(&store, &client, &cfg, task).await;
     let mut plan_verdicts: Vec<VerdictVote> = Vec::new();
     let mut verify_verdicts: Vec<VerdictVote> = Vec::new();
+    // Track skills that were in context so we can credit/debit them.
+    let mut outcome_skill_ids = primed_skill_ids;
 
     // ---- PLAN ----------------------------------------------------------
     let plan_model = model_for_role(&cfg, "planner");
@@ -219,7 +221,6 @@ pub async fn run(
     let mut checks_passed = false;
     let mut attempts = 0usize;
     let mut checks_json = "[]".to_string();
-    let mut stored_skill_ids: Vec<String> = Vec::new();
 
     for attempt in 0..=max_retries {
         attempts = attempt + 1;
@@ -356,7 +357,9 @@ pub async fn run(
                     {
                         Ok(id) => {
                             skills_stored += 1;
-                            stored_skill_ids.push(id);
+                            if !outcome_skill_ids.contains(&id) {
+                                outcome_skill_ids.push(id);
+                            }
                             eprintln!("  · skill recorded: {title}");
                         }
                         Err(e) => tracing::warn!("skill store failed: {e}"),
@@ -367,9 +370,41 @@ pub async fn run(
         }
     }
 
-    for id in &stored_skill_ids {
+    // On failure, store a dedicated note so future plans can avoid repeating
+    // the same mistake (higher importance than a generic harness decision).
+    if !passed {
+        let fail_title = format!("harness fail: {}", crate::util::truncate(task, 60));
+        let fail_content = format!(
+            "When: {when}\nFAILED TASK: {task}\nPlan:\n{}\nResult:\n{}\nAttempts: {attempts}\nChecks passed: {checks_passed}\nVerifier feedback:\n{}\n\nAvoid repeating this approach unless the feedback is addressed.",
+            crate::util::truncate(&plan, 1200),
+            crate::util::truncate(&result, 1200),
+            crate::util::truncate(&feedback, 800),
+        );
         let _ = store
-            .record_skill_outcome(id, passed, cfg.harness.skill_promote_after)
+            .insert_memory(&NewMemory {
+                kind: "note".into(),
+                title: fail_title,
+                content: fail_content,
+                source: "harness-fail".into(),
+                tags: vec![
+                    "harness".into(),
+                    "fail".into(),
+                    formula.formula.name.clone(),
+                ],
+                importance: 0.75,
+                trust_tier: Some("auto".into()),
+            })
+            .await;
+    }
+
+    for id in &outcome_skill_ids {
+        let _ = store
+            .record_skill_outcome(
+                id,
+                passed,
+                cfg.harness.skill_promote_after,
+                cfg.harness.skill_demote_after,
+            )
             .await;
     }
 
@@ -416,25 +451,32 @@ async fn build_memory_primer(
     client: &OllamaClient,
     cfg: &Config,
     task: &str,
-) -> String {
+) -> (String, Vec<String>) {
     match crate::memory::search::hybrid_search(store, client, cfg, task, cfg.memory.top_k).await {
         Ok(hits) if !hits.is_empty() => {
             let mut out = String::new();
+            let mut skill_ids = Vec::new();
             for h in hits.iter().take(8) {
+                if h.memory.trust_tier == "ignored" {
+                    continue;
+                }
                 let tier = &h.memory.trust_tier;
                 let label = match tier.as_str() {
                     "user" => "USER",
                     "verified" => "VERIFIED",
                     _ => "AUTO",
                 };
+                if h.memory.kind == "skill" {
+                    skill_ids.push(h.memory.id.clone());
+                }
                 out.push_str(&format!(
                     "- [{label} {}] {}: {}\n",
                     h.memory.kind, h.memory.title, h.memory.content
                 ));
             }
-            out
+            (out, skill_ids)
         }
-        _ => String::new(),
+        _ => (String::new(), Vec::new()),
     }
 }
 

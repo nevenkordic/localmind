@@ -312,6 +312,10 @@ pub struct HarnessConfig {
     /// Promote auto-skills to `verified` trust after this many harness passes.
     #[serde(default = "default_skill_promote")]
     pub skill_promote_after: usize,
+    /// Demote skills to `ignored` (excluded from primers) after this many
+    /// harness failures while they were in context. 0 disables demotion.
+    #[serde(default = "default_skill_demote")]
+    pub skill_demote_after: usize,
 }
 fn default_quorum_min() -> usize {
     2
@@ -321,6 +325,9 @@ fn default_quorum_policy() -> String {
 }
 fn default_skill_promote() -> usize {
     2
+}
+fn default_skill_demote() -> usize {
+    3
 }
 fn default_harness_retries() -> usize {
     2
@@ -338,6 +345,7 @@ impl Default for HarnessConfig {
             max_retries: 2,
             auto_skill: true,
             skill_promote_after: 2,
+            skill_demote_after: 3,
         }
     }
 }

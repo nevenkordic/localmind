@@ -252,3 +252,74 @@ fn memory_dedup_via_content_hash() {
         "expected dedup, got {count} memories\nfull output:\n{stdout}"
     );
 }
+
+#[test]
+fn memory_near_dedup_collapses_whitespace_variants() {
+    // Normalized content_hash should treat whitespace-only differences as
+    // the same memory.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+
+    let out1 = run(
+        &cfg,
+        &[
+            "memory",
+            "add",
+            "-t",
+            "ws-a",
+            "--kind",
+            "note",
+            "hello   world\n\nfrom near-dedup",
+        ],
+    );
+    assert!(out1.status.success());
+    let out2 = run(
+        &cfg,
+        &[
+            "memory",
+            "add",
+            "-t",
+            "ws-b",
+            "--kind",
+            "note",
+            "hello world from near-dedup",
+        ],
+    );
+    assert!(out2.status.success());
+
+    let out = run(&cfg, &["memory", "stats"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let count: i64 = stdout
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("memories:")
+                .map(|s| s.trim().parse().unwrap_or(-1))
+        })
+        .unwrap_or(-1);
+    assert_eq!(count, 1, "whitespace variants should collapse\n{stdout}");
+}
+
+#[test]
+fn harness_stats_on_fresh_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+    let out = run(&cfg, &["harness", "stats"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("runs:"), "{stdout}");
+    assert!(stdout.contains("pass rate:"), "{stdout}");
+}
+
+#[test]
+fn harness_history_empty_on_fresh_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+    let out = run(&cfg, &["harness", "history"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no harness runs"), "unexpected: {stdout}");
+}

@@ -6,7 +6,9 @@ pub mod search;
 pub mod store;
 
 #[allow(unused_imports)]
-pub use store::{NewMemory, Stats, Store, StoredDecision, StoredMemory};
+pub use store::{
+    HarnessStats, NewMemory, Stats, Store, StoredDecision, StoredHarnessRun, StoredMemory,
+};
 
 /// Statically register the sqlite-vec extension with every connection the
 /// process opens. Called once, early in main(), BEFORE any Connection::open.
