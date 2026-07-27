@@ -489,6 +489,9 @@ mod tests {
             updated_at: util::now_ts() - age_secs,
             accessed_at: 0,
             access_count: 0,
+            trust_tier: "auto".into(),
+            success_count: 0,
+            fail_count: 0,
         }
     }
 

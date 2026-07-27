@@ -70,6 +70,7 @@ pub async fn store_memory(ctx: &ToolContext, args: &Value) -> Result<String> {
             source: "agent".into(),
             tags,
             importance,
+            trust_tier: None,
         })
         .await?;
     Ok(format!("stored memory {id}"))
@@ -102,6 +103,7 @@ pub async fn log_decision(ctx: &ToolContext, args: &Value) -> Result<String> {
             source: "decision-ledger".into(),
             tags: vec!["decision".into()],
             importance: 0.75,
+            trust_tier: Some("auto".into()),
         })
         .await;
     Ok(format!("logged decision {id}"))

@@ -375,6 +375,7 @@ impl AgentRun {
                 source: "compact".into(),
                 tags: vec!["compact".into(), "stm".into()],
                 importance: 0.55,
+                trust_tier: Some("auto".into()),
             })
             .await
         {
@@ -397,6 +398,7 @@ impl AgentRun {
                                 source: "compact-distill".into(),
                                 tags: vec!["auto-skill".into()],
                                 importance: 0.85,
+                                trust_tier: Some("auto".into()),
                             })
                             .await;
                     }
@@ -469,6 +471,7 @@ impl AgentRun {
                     source: "auto-extract".into(),
                     tags: vec!["user".into()],
                     importance,
+                    trust_tier: None,
                 })
                 .await;
             eprintln!("  · {label}: {}", content);
@@ -499,6 +502,14 @@ impl AgentRun {
         // Consume any force_model so the next turn re-routes normally.
         self.force_model = None;
         self.loop_tools(&model).await
+    }
+
+    fn trust_rank(tier: &str) -> u8 {
+        match tier {
+            "user" => 3,
+            "verified" => 2,
+            _ => 1,
+        }
     }
 
     /// Build skill + memory primers from a single recall query. Honours
@@ -549,6 +560,10 @@ impl AgentRun {
             .filter(|(m, _)| m.kind == "skill")
             .take(MAX_SKILLS)
             .collect();
+        let mut skills = skills;
+        skills.sort_by(|(a, _), (b, _)| {
+            Self::trust_rank(&b.trust_tier).cmp(&Self::trust_rank(&a.trust_tier))
+        });
         let memories: Vec<_> = hits
             .iter()
             .filter(|(m, _)| m.kind != "skill")
@@ -562,7 +577,11 @@ impl AgentRun {
                 "Relevant skills you have been taught — follow them where applicable:\n\n",
             );
             for (m, _) in &skills {
-                out.push_str(&format!("• {}\n{}\n\n", m.title, m.content.trim()));
+                let prefix = match m.trust_tier.as_str() {
+                    "user" | "verified" => "",
+                    _ => "[AUTO — verify before following] ",
+                };
+                out.push_str(&format!("• {prefix}{}\n{}\n\n", m.title, m.content.trim()));
             }
             Some(out)
         };

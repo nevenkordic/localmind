@@ -85,9 +85,10 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   same fix next time.
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
-- **Verify harness.** `llm run "<task>"` runs plan → act → verify across
-  local models; failed verifies retry the act stage. Shared SQLite memory
-  only — no markdown memory files.
+- **Verify harness.** `llm run "<task>"` runs plan → review → act → verify with
+  verifier quorum, optional ground-truth checks (`test_command`), and skill
+  promotion (`auto` → `verified` after repeated successes). Shared SQLite
+  memory only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.

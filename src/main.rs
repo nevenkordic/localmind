@@ -71,6 +71,15 @@ enum Command {
         /// Permission mode: read-only | workspace-write | unrestricted.
         #[arg(long)]
         mode: Option<String>,
+        /// Ground-truth shell check after act (overrides config).
+        #[arg(long)]
+        test_command: Option<String>,
+        /// Skip plan-review quorum before act.
+        #[arg(long)]
+        no_plan_review: bool,
+        /// Minimum verifier models for quorum (overrides config).
+        #[arg(long)]
+        quorum: Option<usize>,
     },
     /// Memory management.
     Memory {
@@ -261,13 +270,21 @@ async fn main() -> Result<()> {
             task,
             formula,
             mode,
+            test_command,
+            no_plan_review,
+            quorum,
         } => {
             let m = parse_mode_flag(mode.as_deref())?;
             let f = match formula {
                 Some(p) => harness::Formula::load_path(&p)?,
                 None => harness::Formula::default_verify()?,
             };
-            let out = harness::run(cfg.clone(), store.clone(), f, &task, m).await?;
+            let opts = harness::RunOptions {
+                test_command,
+                plan_review: if no_plan_review { Some(false) } else { None },
+                quorum_min: quorum,
+            };
+            let out = harness::run(cfg.clone(), store.clone(), f, &task, m, opts).await?;
             println!("{}", out.result);
             if out.passed {
                 eprintln!(
@@ -552,6 +569,7 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
                     source: "cli".into(),
                     tags: vec![],
                     importance,
+                    trust_tier: None,
                 })
                 .await?;
             println!("stored {id}");

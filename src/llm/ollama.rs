@@ -558,19 +558,43 @@ impl OllamaClient {
         task: &str,
         plan: &str,
         result: &str,
+        evidence: &str,
         model_override: Option<&str>,
     ) -> Result<(bool, String)> {
         let sys = "You are a strict verifier for a multi-stage local agent. \
-                   Decide if the ACT result fully satisfies the TASK given the PLAN. \
-                   Output ONLY JSON: {\"pass\": true|false, \"feedback\": \"...\"}. \
-                   pass=true only when the work is complete and correct. \
-                   feedback must be concrete and actionable when pass=false. \
+                   Decide if the ACT result fully satisfies the TASK given the PLAN \
+                   AND the objective CHECK EVIDENCE (tests, audit log). \
+                   If checks failed, you MUST return pass=false even if the prose \
+                   summary sounds good. Output ONLY JSON: \
+                   {\"pass\": true|false, \"feedback\": \"...\"}. \
                    No prose, no fences.";
-        let user = format!("TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}");
+        let user = format!(
+            "TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}\n\nCHECK EVIDENCE:\n{evidence}"
+        );
         let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
         let reply = self.chat_on(&msgs, None, false, model_override).await?;
-        let raw = reply
-            .content
+        Self::parse_verdict_json(&reply.content)
+    }
+
+    /// Plan-review quorum stage — approve or reject before tools run.
+    pub async fn review_plan(
+        &self,
+        task: &str,
+        plan: &str,
+        memory_primer: &str,
+        model_override: Option<&str>,
+    ) -> Result<(bool, String)> {
+        let sys = "You review a PLAN before any tools execute. Reject unsafe, \
+                   incomplete, or off-task plans. Output ONLY JSON: \
+                   {\"pass\": true|false, \"feedback\": \"...\"}. No prose, no fences.";
+        let user = format!("TASK:\n{task}\n\nMEMORY/SKILLS:\n{memory_primer}\n\nPLAN:\n{plan}");
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
+        Self::parse_verdict_json(&reply.content)
+    }
+
+    fn parse_verdict_json(raw_content: &str) -> Result<(bool, String)> {
+        let raw = raw_content
             .trim()
             .trim_start_matches("```json")
             .trim_start_matches("```")
