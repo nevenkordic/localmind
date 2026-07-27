@@ -89,6 +89,13 @@ pub async fn report(cfg: &Config, store: &Store) -> String {
                     "NO — embeddings will fail"
                 }
             ));
+            if chat_present && looks_small_chat_model(&cfg.ollama.chat_model) {
+                out.push_str(
+                    "  warning:           chat_model looks small (≤3B params) — \
+                     agent tool-use (write_file / shell) is often unreliable. \
+                     Prefer a 7B+ chat model (`llm models --chat …`).\n",
+                );
+            }
         }
         Err(e) => {
             out.push_str(&format!("  reachable:         NO ({e})\n"));
@@ -107,6 +114,23 @@ pub async fn report(cfg: &Config, store: &Store) -> String {
         cfg.memory.vector_search
     ));
     out
+}
+
+/// Heuristic: model tags like `:0.5b`, `:1b`, `:1.5b`, `:2b`, `:3b` are too
+/// small for reliable structured tool calling in the agent loop.
+pub fn looks_small_chat_model(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // Match `:Nb` or `:N.Nb` parameter tags under or equal to 3B.
+    let re = regex::Regex::new(r":([0-9]+(?:\.[0-9]+)?)b\b").ok();
+    let Some(re) = re else {
+        return false;
+    };
+    if let Some(caps) = re.captures(&lower) {
+        if let Ok(n) = caps[1].parse::<f32>() {
+            return n > 0.0 && n <= 3.0;
+        }
+    }
+    false
 }
 
 fn pct(num: i64, denom: i64) -> f64 {
@@ -160,5 +184,16 @@ mod tests {
     #[test]
     fn empty_needle_is_installed() {
         assert!(model_is_installed(&[], ""));
+    }
+
+    #[test]
+    fn small_chat_model_heuristic() {
+        assert!(looks_small_chat_model("qwen2.5-coder:3b"));
+        assert!(looks_small_chat_model("tinyllama:1.1b"));
+        assert!(looks_small_chat_model("gemma2:2b"));
+        assert!(!looks_small_chat_model("phi3:3.8b")); // > 3B
+        assert!(!looks_small_chat_model("qwen2.5-coder:7b"));
+        assert!(!looks_small_chat_model("qwen2.5-coder:32b"));
+        assert!(!looks_small_chat_model("nomic-embed-text")); // no :Nb tag
     }
 }

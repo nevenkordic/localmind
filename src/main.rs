@@ -65,7 +65,9 @@ enum Command {
     Run {
         /// The task for the harness to complete.
         task: String,
-        /// Optional formula TOML path. Defaults to the built-in verify formula.
+        /// Optional formula TOML path. When omitted, auto-selects from the
+        /// task (e.g. build+serve → site-serve; otherwise the default verify
+        /// formula). Pass this only to force a specific formula.
         #[arg(long)]
         formula: Option<PathBuf>,
         /// Permission mode: read-only | workspace-write | unrestricted.
@@ -351,10 +353,8 @@ async fn main() -> Result<()> {
             quorum,
         } => {
             let m = parse_mode_flag(mode.as_deref())?;
-            let f = match formula {
-                Some(p) => harness::Formula::load_path(&p)?,
-                None => harness::Formula::default_verify()?,
-            };
+            let (f, formula_label) = harness::resolve_formula(&task, formula.as_deref())?;
+            eprintln!("· formula: {formula_label}");
             let opts = harness::RunOptions {
                 test_command,
                 plan_review: if no_plan_review { Some(false) } else { None },

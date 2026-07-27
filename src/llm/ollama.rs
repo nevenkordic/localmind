@@ -31,14 +31,9 @@ pub struct ExtractedEdge {
     pub relation: String,
 }
 
-/// First-response watchdog. Bounds how long a `/api/chat` call can sit with
-/// no reply before we treat it as a hung / corrupt model and surface an
-/// actionable error. Kept as a constant rather than a config knob because
-/// the failure it catches (0 bytes after 120s on a local loopback call) is
-/// never what anyone wants — users who need longer total generation time
-/// should raise `[ollama] timeout_secs` instead, which bounds the reqwest
-/// client itself.
-const CHAT_WATCHDOG: Duration = Duration::from_secs(120);
+/// Floor for the chat watchdog. Below this, cold-load + first token on a
+/// mid-size coder is routinely false-flagged as hung.
+const CHAT_WATCHDOG_FLOOR: Duration = Duration::from_secs(180);
 
 #[derive(Clone)]
 pub struct OllamaClient {
@@ -52,6 +47,11 @@ pub struct OllamaClient {
     keep_alive: String,
     temperature: f32,
     top_p: f32,
+    /// Bounds a single `/api/chat` call (and TTFB on the streaming path).
+    /// Taken from `[ollama] timeout_secs` — previously a hard 120s watchdog
+    /// killed legitimate 32B tool generations that emit large write_file
+    /// bodies, despite the reqwest client allowing 600s.
+    timeout_secs: u64,
     /// Embedding cache. Sized for ~768KB at the default 256-entry cap with
     /// 768-dim float vectors. Shared across clones of the client so the
     /// agent loop and CLI commands hit the same warm cache when run in the
@@ -94,6 +94,11 @@ impl EmbedCache {
 }
 
 impl OllamaClient {
+    /// Effective chat watchdog: `timeout_secs`, never below the floor.
+    fn chat_watchdog(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.max(CHAT_WATCHDOG_FLOOR.as_secs()))
+    }
+
     pub fn new(cfg: &OllamaConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -104,17 +109,25 @@ impl OllamaClient {
             ))
             .build()
             .expect("reqwest client");
+        // Empty / omitted vision_model → reuse chat_model so partial
+        // configs (and older files missing the key) still load cleanly.
+        let vision_model = if cfg.vision_model.trim().is_empty() {
+            cfg.chat_model.clone()
+        } else {
+            cfg.vision_model.clone()
+        };
         Self {
             http,
             host: cfg.host.trim_end_matches('/').to_string(),
             chat_model: cfg.chat_model.clone(),
             fast_model: cfg.fast_model.clone(),
             embed_model: cfg.embed_model.clone(),
-            vision_model: cfg.vision_model.clone(),
+            vision_model,
             num_ctx: cfg.num_ctx,
             keep_alive: cfg.keep_alive.clone(),
             temperature: cfg.temperature,
             top_p: cfg.top_p,
+            timeout_secs: cfg.timeout_secs,
             embed_cache: Arc::new(Mutex::new(EmbedCache::new(256))),
         }
     }
@@ -204,12 +217,10 @@ impl OllamaClient {
             },
             keep_alive: &self.keep_alive,
         };
-        // Watchdog. If Ollama goes unresponsive (corrupt model, hung worker),
-        // the non-streaming request would otherwise sit on the reqwest
-        // timeout (600s by default) — long enough to look like a lockup in
-        // the REPL. A 120s bound catches real hangs while still leaving
-        // plenty of room for legitimate cold-load + first response on 7B
-        // and even 30B-class models on modern hardware.
+        // Watchdog honours `[ollama] timeout_secs` (floor 180s). Non-streaming
+        // tool turns that emit large write_file bodies on 32B routinely need
+        // several minutes — a hard 120s cap was false-flagging those as hung.
+        let watchdog = self.chat_watchdog();
         let call = async {
             let resp = self
                 .http
@@ -226,7 +237,7 @@ impl OllamaClient {
             let parsed: Resp = resp.json().await.context("parsing chat response")?;
             Ok::<Resp, anyhow::Error>(parsed)
         };
-        let parsed = match tokio::time::timeout(CHAT_WATCHDOG, call).await {
+        let parsed = match tokio::time::timeout(watchdog, call).await {
             Ok(r) => r?,
             Err(_) => {
                 return Err(anyhow!(
@@ -234,7 +245,7 @@ impl OllamaClient {
                      Try:\n    ollama ps                       # is a worker stuck?\n    \
                      ollama rm {model} && ollama pull {model}\n  \
                      (Or raise [ollama] timeout_secs if you expect legitimately slow generations.)",
-                    CHAT_WATCHDOG.as_secs()
+                    watchdog.as_secs()
                 ));
             }
         };
@@ -323,11 +334,12 @@ impl OllamaClient {
             keep_alive: &self.keep_alive,
         };
 
-        // Same watchdog as the non-streaming path, but it bounds the TTFB
-        // (time to first byte) — once streaming starts, the reqwest-level
-        // timeout keeps guard for the rest.
+        // TTFB watchdog — once streaming starts, reqwest timeout_secs guards
+        // the rest. Cold-load of a 32B weights file can exceed a few minutes
+        // when VRAM is contended, so this tracks `[ollama] timeout_secs`.
+        let watchdog = self.chat_watchdog();
         let resp = match tokio::time::timeout(
-            CHAT_WATCHDOG,
+            watchdog,
             self.http.post(&url).json(&body).send(),
         )
         .await
@@ -336,8 +348,9 @@ impl OllamaClient {
             Err(_) => {
                 return Err(anyhow!(
                     "no response from Ollama after {}s — model '{model}' may be hung or corrupt.\n  \
-                     Try: ollama ps ; ollama rm {model} && ollama pull {model}",
-                    CHAT_WATCHDOG.as_secs()
+                     Try: ollama ps ; ollama rm {model} && ollama pull {model}\n  \
+                     (Or raise [ollama] timeout_secs for slow cold-loads.)",
+                    watchdog.as_secs()
                 ));
             }
         };
@@ -561,12 +574,19 @@ impl OllamaClient {
         evidence: &str,
         model_override: Option<&str>,
     ) -> Result<(bool, String)> {
-        let sys = "You are a strict verifier for a multi-stage local agent. \
-                   Decide if the ACT result fully satisfies the TASK given the PLAN \
-                   AND the objective CHECK EVIDENCE (tests, audit log). \
-                   If checks failed, you MUST return pass=false even if the prose \
-                   summary sounds good. Output ONLY JSON: \
-                   {\"pass\": true|false, \"feedback\": \"...\"}. \
+        let sys = "You are a strict quality verifier for a multi-stage local agent. \
+                   Decide if the ACT result fully and accurately satisfies the TASK \
+                   given the PLAN AND the objective CHECK EVIDENCE (tests, audit log, \
+                   ports, file sizes). Domain-agnostic: code, sites, scripts, research, \
+                   admin — same bar. \
+                   FAIL (pass=false) when: checks failed; work is a stub/placeholder; \
+                   claimed success without tools when tools were required; result is \
+                   incomplete, inaccurate, or off-task; deliverable is toy-quality when \
+                   the task asked for real usable output. \
+                   PASS only when checks are clean AND the work looks complete and \
+                   correct enough to use. Do not fail only because prose mentions an \
+                   earlier timeout that evidence shows was later fixed. \
+                   Output ONLY JSON: {\"pass\": true|false, \"feedback\": \"...\"}. \
                    No prose, no fences.";
         let user = format!(
             "TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}\n\nCHECK EVIDENCE:\n{evidence}"
@@ -585,16 +605,18 @@ impl OllamaClient {
         memory_context: &str,
         model_override: Option<&str>,
     ) -> Result<crate::agent::ConfidenceVerify> {
-        let sys = "You are a precise fact-checker. Be concise. Do not add \
-                   unnecessary information.";
+        let sys = "You are a precise fact-checker. Prefer accuracy over polish. \
+                   Be concise. Do not invent new facts.";
         let user = format!(
-            "You are a fact-checker. The user asked: \"{user_query}\"\n\n\
-             The AI responded: \"{original_response}\"\n\n\
+            "Fact-check this answer for ANY domain (not just code).\n\n\
+             User asked: \"{user_query}\"\n\n\
+             AI responded: \"{original_response}\"\n\n\
              Known facts from memory:\n{memory_context}\n\n\
-             Check the response for factual errors, unsupported claims, or \
-             contradictions with known facts.\n\
-             If the response is accurate, respond with exactly: VERIFIED\n\
-             If there are issues, respond with: CORRECTED: <your corrected response>"
+             FAIL → CORRECTED when: contradictions with memory; invented specifics \
+             (hosts, paths, versions, numbers, APIs) not supported by memory/tools; \
+             confident tone covering up uncertainty.\n\
+             If accurate and appropriately hedged, respond with exactly: VERIFIED\n\
+             If issues, respond with: CORRECTED: <corrected response>"
         );
         let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
         let reply = self.chat_on(&msgs, None, false, model_override).await?;
@@ -862,6 +884,17 @@ fn extract_tool_calls(s: &str) -> Vec<ToolCall> {
         }
     }
 
+    // Try 4b: Python/JS-style `name(key=value, key="...", detach=True)`.
+    // qwen2.5-coder often emits this instead of structured tool_calls —
+    // especially `shell(command="python3 -m http.server 8081", cwd="...", detach=True)`.
+    if out.is_empty() {
+        for line in s.lines() {
+            if let Some(tc) = try_parse_paren_call(line) {
+                out.push(tc);
+            }
+        }
+    }
+
     // Try 5: loose CLI syntax — `<read_only_tool> <free text>`. Catches
     // "thinking out loud" like `search_memory what do you know about the user`.
     // Restricted to read-only tools with an unambiguous primary string arg so
@@ -872,6 +905,132 @@ fn extract_tool_calls(s: &str) -> Vec<ToolCall> {
                 out.push(tc);
             }
         }
+    }
+    out
+}
+
+/// Parse `tool_name(key=value, key="...", detach=True)` — the shape
+/// qwen2.5-coder emits when it "calls" tools in prose. Whole line must be
+/// the call (optional trailing `.`). Empty `tool()` is allowed for
+/// zero-arg tools like `listening_ports()`.
+fn try_parse_paren_call(line: &str) -> Option<ToolCall> {
+    let mut line = line.trim();
+    if let Some(stripped) = line.strip_suffix('.') {
+        line = stripped.trim_end();
+    }
+    if line.is_empty() {
+        return None;
+    }
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    if close != line.len() - 1 || close < open {
+        return None;
+    }
+    let name = line[..open].trim();
+    if name.len() < 2 {
+        return None;
+    }
+    // Tool names are identifiers — refuse spaces / punctuation.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let first = name.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    let inner = line[open + 1..close].trim();
+    let args = if inner.is_empty() {
+        serde_json::Map::new()
+    } else {
+        parse_paren_args(inner)?
+    };
+    Some(ToolCall {
+        id: None,
+        r#type: "function".into(),
+        function: ToolFunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::Value::Object(args),
+        },
+    })
+}
+
+/// Parse comma-separated `key=value` pairs, respecting quotes. Accepts
+/// Python `True`/`False` in addition to JSON bools.
+fn parse_paren_args(s: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+    for part in split_comma_outside_quotes(s) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let eq = part.find('=')?;
+        let key = part[..eq].trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let raw = part[eq + 1..].trim();
+        let value = match raw {
+            "True" | "true" => serde_json::Value::Bool(true),
+            "False" | "false" => serde_json::Value::Bool(false),
+            "None" | "null" => serde_json::Value::Null,
+            _ if raw.starts_with('"') || raw.starts_with('\'') => {
+                let quote = raw.as_bytes()[0];
+                if raw.len() < 2 || raw.as_bytes()[raw.len() - 1] != quote {
+                    return None;
+                }
+                let inner = &raw[1..raw.len() - 1];
+                // Unescape simple \" and \\
+                let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
+                serde_json::Value::String(unescaped)
+            }
+            _ if raw.starts_with('[') || raw.starts_with('{') => {
+                serde_json::from_str(raw).ok()?
+            }
+            _ => parse_bare_value(raw),
+        };
+        args.insert(key.to_string(), value);
+    }
+    if args.is_empty() {
+        return None;
+    }
+    Some(args)
+}
+
+fn split_comma_outside_quotes(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q && (i == 0 || bytes[i - 1] != b'\\') {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            out.push(&s[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start <= s.len() {
+        out.push(&s[start..]);
     }
     out
 }
@@ -1291,6 +1450,36 @@ mod tests {
         assert_eq!(args.get("query").unwrap(), "project details");
         assert_eq!(args.get("top_k").unwrap(), 5);
         assert!(m.content.is_empty());
+    }
+
+    #[test]
+    fn recovers_paren_shell_call_from_qwen() {
+        // Exact failure from site-serve harness: model prints Python-style
+        // shell(...) instead of a structured tool_call.
+        let m = recover_text_tool_calls(msg(
+            r#"shell(command="python3 -m http.server 8081", cwd="/Users/neven/Desktop/modern-2page", detach=True)"#,
+        ));
+        let calls = m.tool_calls.expect("paren shell should recover");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+        let args = calls[0].function.arguments.as_object().unwrap();
+        assert_eq!(
+            args.get("command").and_then(|v| v.as_str()),
+            Some("python3 -m http.server 8081")
+        );
+        assert_eq!(
+            args.get("cwd").and_then(|v| v.as_str()),
+            Some("/Users/neven/Desktop/modern-2page")
+        );
+        assert_eq!(args.get("detach"), Some(&serde_json::Value::Bool(true)));
+        assert!(m.content.is_empty());
+    }
+
+    #[test]
+    fn recovers_empty_paren_listening_ports() {
+        let m = recover_text_tool_calls(msg("listening_ports()"));
+        let calls = m.tool_calls.expect("empty paren call");
+        assert_eq!(calls[0].function.name, "listening_ports");
     }
 
     #[test]

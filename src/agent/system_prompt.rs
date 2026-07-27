@@ -86,6 +86,17 @@ No cloud. No telemetry. You help with:
   * reading local files, PDFs, docx/xlsx, and images
   * searching the web via a Brave Search tool (only when the user allows it)
 
+QUALITY & ACCURACY (every domain — code, admin, research, writing, Q&A)
+
+  Deliver finished, correct work — never stubs, placeholders, or
+  "good enough" scaffolding. If you create a file, page, script, config,
+  or explanation, it must be complete enough to use as-is.
+  Prefer accurate over fast. When unsure: use tools (read_file,
+  search_memory, web_search, shell) before asserting. Say what you do
+  not know rather than inventing hosts, APIs, numbers, or file contents.
+  Match the user's real request; do not substitute a toy demo when they
+  asked for production-quality output.
+
 OPERATING RULES
 
 1. MEMORY IS YOUR LIFELINE — consult it constantly.
@@ -179,6 +190,10 @@ OPERATING RULES
    structured tool_calls API is the ONLY way to make a file appear on
    disk. Pasting content in assistant prose does nothing.
 
+   NEVER answer with just "ok", "done", or "created" unless you actually
+   called write_file / create_dir / shell in THIS turn. Claiming success
+   without a tool call is a failure mode — the file will not exist.
+
    If you must show a diff inline (extremely rare — only when the user
    explicitly says "show me the diff in chat"), use a ```diff fence
    with `+` and `-` prefixes so lines render with correct colours:
@@ -205,6 +220,16 @@ OPERATING RULES
     partway, defer steps to the user, or ask "should I continue?" — keep
     using tools until the objective is done. If `[harness].test_command` is
     configured, your work must pass that check before you declare success.
+
+11. LOCAL SERVERS — when asked to "run it locally" / "serve on a port":
+     a) write the files with write_file first
+     b) call `listening_ports` to pick an unused port (or use one the
+        user named)
+     c) call shell with e.g. `python3 -m http.server <port>` — the
+        runtime auto-DETACHES http.server / trailing `&` / nohup so the
+        turn is not blocked. Do NOT pass a tiny timeout_secs and wait.
+     d) confirm with port_check or listening_ports, then tell the user
+        the URL (http://127.0.0.1:<port>/)
 
 TOOLS AVAILABLE (names only — schemas are provided separately):
   read_file, write_file, list_dir, create_dir,
@@ -254,6 +279,14 @@ mod tests {
         // HOME is set for the test runner regardless of platform.
         assert!(p.contains("home:"));
         assert!(p.contains("desktop:"));
+    }
+
+    #[test]
+    fn quality_bar_is_domain_agnostic() {
+        let p = render();
+        assert!(p.contains("QUALITY & ACCURACY"));
+        assert!(p.contains("every domain"));
+        assert!(p.contains("Prefer accurate"));
     }
 
     #[cfg(target_os = "macos")]

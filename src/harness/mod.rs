@@ -4,8 +4,10 @@
 pub mod checks;
 mod formula;
 mod quorum;
+mod select;
 
 pub use formula::{evaluate_condition, render_prompt, StageInput};
+pub use select::resolve as resolve_formula;
 
 use crate::agent::AgentRun;
 use crate::config::Config;
@@ -19,7 +21,8 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Built-in default formula used by `llm run` when no --formula is given.
+/// Built-in default formula used by `llm run` when no intent-specific
+/// formula matches the task (see [`resolve_formula`]).
 pub const DEFAULT_FORMULA: &str = include_str!("../../formulas/verify.toml");
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +51,32 @@ pub struct FormulaMeta {
     pub description: String,
     #[serde(default = "default_retries")]
     pub max_verify_retries: usize,
+    /// Substrings — at least one must appear in the task (case-insensitive)
+    /// for auto-selection from `./formulas/*.toml`.
+    #[serde(default)]
+    pub match_any: Vec<String>,
+    /// Substrings — all must appear for auto-selection.
+    #[serde(default)]
+    pub match_all: Vec<String>,
+    /// Tie-break boost for on-disk formula auto-selection.
+    #[serde(default)]
+    pub priority: i32,
+    /// After act, require a detached server from the audit log to be
+    /// listening (TCP). Used by site-serve. When this check passes,
+    /// LLM verify is skipped — the port is objective evidence.
+    #[serde(default)]
+    pub require_detached_server: bool,
+    /// Optional chat model override for this formula's act stage
+    /// (e.g. a larger coder). Empty = use config chat_model. If the
+    /// named model isn't pulled, harness falls back to config.
+    #[serde(default)]
+    pub chat_model: String,
+    /// Minimum bytes for each HTML file written this act (0 = skip).
+    #[serde(default)]
+    pub min_html_bytes: u64,
+    /// Minimum bytes for CSS files written this act (0 = skip).
+    #[serde(default)]
+    pub min_css_bytes: u64,
 }
 fn default_retries() -> usize {
     2
@@ -148,6 +177,236 @@ fn model_for_role(cfg: &Config, role: &str) -> Option<String> {
     }
 }
 
+/// Prefer formula.chat_model when set and installed; else optionally the
+/// largest installed chat-capable model by parameter tag (`prefer_capable_act`);
+/// else config chat_model. Family-agnostic — Qwen, Llama, Mistral, etc.
+async fn resolve_act_model(cfg: &Config, formula: &Formula) -> String {
+    let fallback = cfg.ollama.chat_model.clone();
+    let wanted = formula.formula.chat_model.trim();
+    let client = OllamaClient::new(&cfg.ollama);
+    let installed = match client.health().await {
+        Ok(m) => m,
+        Err(_) => return fallback,
+    };
+    let is_in = |name: &str| {
+        installed
+            .iter()
+            .any(|m| m == name || m == &format!("{name}:latest"))
+    };
+
+    if !wanted.is_empty() && wanted != fallback {
+        if is_in(wanted) {
+            eprintln!("  · act model override: {wanted}");
+            return wanted.to_string();
+        }
+        eprintln!(
+            "  · act model `{wanted}` not installed — falling back \
+             (ollama pull {wanted})"
+        );
+    }
+
+    if cfg.harness.prefer_capable_act {
+        let exclude = [
+            cfg.ollama.embed_model.as_str(),
+            cfg.ollama.vision_model.as_str(),
+        ];
+        if let Some(pick) = pick_capable_act_model(&installed, &fallback, &exclude) {
+            if pick != fallback {
+                eprintln!("  · act model (largest installed): {pick}");
+            }
+            return pick;
+        }
+    }
+    fallback
+}
+
+/// Parse a rough parameter score from an Ollama model name.
+/// Handles `:7b`, `:32b-instruct-q4_K_M`, and MoE tags like `:8x7b`.
+/// Returns milliparam units (7b → 7000) so integer compares stay simple.
+pub(crate) fn model_param_score(name: &str) -> u32 {
+    let lower = name.to_ascii_lowercase();
+    let mut best = 0u32;
+
+    // MoE: 8x7b ≈ 56B active-params proxy (good enough for ranking).
+    let moe = regex::Regex::new(r"([0-9]+)x([0-9]+(?:\.[0-9]+)?)b\b").ok();
+    if let Some(re) = &moe {
+        for caps in re.captures_iter(&lower) {
+            let a: u32 = caps[1].parse().unwrap_or(0);
+            let b_str = &caps[2];
+            let b_whole = b_str.split('.').next().unwrap_or("0");
+            let b: u32 = b_whole.parse().unwrap_or(0);
+            best = best.max(a.saturating_mul(b).saturating_mul(1000));
+        }
+    }
+
+    let dense = regex::Regex::new(r":([0-9]+(?:\.[0-9]+)?)b\b").ok();
+    if let Some(re) = &dense {
+        for caps in re.captures_iter(&lower) {
+            let n_str = &caps[1];
+            // Prefer whole billions; fractional (1.5b) → floor * 1000 + fraction hint.
+            if let Some((whole, frac)) = n_str.split_once('.') {
+                let w: u32 = whole.parse().unwrap_or(0);
+                let f: u32 = frac.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0);
+                best = best.max(w.saturating_mul(1000).saturating_add(f * 100));
+            } else {
+                let w: u32 = n_str.parse().unwrap_or(0);
+                best = best.max(w.saturating_mul(1000));
+            }
+        }
+    }
+
+    best
+}
+
+fn is_unlikely_chat_model(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("embed")
+        || l.contains("rerank")
+        || l.contains("minilm")
+        || l.starts_with("bge-")
+        || l.contains("nomic-embed")
+        || l.contains("mxbai-embed")
+        || l.contains("snowflake-arctic-embed")
+}
+
+/// Pick the largest installed chat-capable model that beats `fallback`.
+/// Scans every Ollama tag — not a fixed vendor list.
+fn pick_capable_act_model(
+    installed: &[String],
+    fallback: &str,
+    exclude: &[&str],
+) -> Option<String> {
+    let excluded = |name: &str| {
+        exclude.iter().any(|e| {
+            let e = e.trim();
+            if e.is_empty() {
+                return false;
+            }
+            name == e || name == format!("{e}:latest") || e == format!("{name}:latest")
+        })
+    };
+
+    let fb_score = model_param_score(fallback);
+    let mut best: Option<(u32, String)> = None;
+
+    for name in installed {
+        if is_unlikely_chat_model(name) || excluded(name) {
+            continue;
+        }
+        let score = model_param_score(name);
+        if score == 0 {
+            continue;
+        }
+        // Upgrade only when strictly larger than the configured chat model.
+        if score <= fb_score {
+            continue;
+        }
+        match &best {
+            Some((s, prev)) if *s > score || (*s == score && prev.as_str() <= name.as_str()) => {}
+            _ => best = Some((score, name.clone())),
+        }
+    }
+
+    if let Some((_, m)) = best {
+        return Some(m);
+    }
+
+    // No larger model — keep fallback when present, else largest scorable chat model.
+    let fallback_present = installed.iter().any(|m| {
+        m == fallback || m == &format!("{fallback}:latest") || fallback == &format!("{m}:latest")
+    });
+    if fallback_present {
+        return Some(fallback.to_string());
+    }
+
+    let mut largest: Option<(u32, String)> = None;
+    for name in installed {
+        if is_unlikely_chat_model(name) || excluded(name) {
+            continue;
+        }
+        let score = model_param_score(name);
+        if score == 0 {
+            continue;
+        }
+        match &largest {
+            Some((s, prev)) if *s > score || (*s == score && prev.as_str() <= name.as_str()) => {}
+            _ => largest = Some((score, name.clone())),
+        }
+    }
+    largest.map(|(_, m)| m)
+}
+
+#[cfg(test)]
+mod capable_act_tests {
+    use super::*;
+
+    #[test]
+    fn picks_any_family_larger_than_fallback() {
+        let installed = vec![
+            "qwen2.5-coder:7b".into(),
+            "llama3.3:70b".into(),
+            "nomic-embed-text".into(),
+            "mistral:7b".into(),
+        ];
+        assert_eq!(
+            pick_capable_act_model(&installed, "qwen2.5-coder:7b", &["nomic-embed-text"])
+                .as_deref(),
+            Some("llama3.3:70b")
+        );
+    }
+
+    #[test]
+    fn picks_32b_over_7b_same_or_other_family() {
+        let installed = vec![
+            "gemma2:9b".into(),
+            "qwen2.5-coder:32b".into(),
+            "nomic-embed-text".into(),
+        ];
+        assert_eq!(
+            pick_capable_act_model(&installed, "gemma2:9b", &[]).as_deref(),
+            Some("qwen2.5-coder:32b")
+        );
+    }
+
+    #[test]
+    fn ignores_embed_and_excluded_vision() {
+        let installed = vec![
+            "qwen2.5-coder:7b".into(),
+            "nomic-embed-text:latest".into(),
+            "llava:34b".into(),
+        ];
+        // llava excluded as vision → stay on 7b
+        assert_eq!(
+            pick_capable_act_model(&installed, "qwen2.5-coder:7b", &["llava:34b"]).as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+    }
+
+    #[test]
+    fn keeps_fallback_when_already_largest() {
+        let installed = vec!["mistral-small:24b".into(), "phi3:3.8b".into()];
+        assert_eq!(
+            pick_capable_act_model(&installed, "mistral-small:24b", &[]).as_deref(),
+            Some("mistral-small:24b")
+        );
+    }
+
+    #[test]
+    fn moe_tag_outranks_dense_7b() {
+        assert!(model_param_score("mixtral:8x7b") > model_param_score("qwen2.5-coder:7b"));
+        assert!(model_param_score("llama3.3:70b-instruct-q4_K_M") > model_param_score("codestral:22b"));
+    }
+
+    #[test]
+    fn no_upgrade_when_capable_missing() {
+        let installed = vec!["qwen2.5-coder:7b".into()];
+        assert_eq!(
+            pick_capable_act_model(&installed, "qwen2.5-coder:7b", &[]).as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+    }
+}
+
 async fn run_quorum<F, Fut>(
     cfg: &Config,
     models: &[String],
@@ -188,24 +447,23 @@ pub async fn run(
     if let Some(n) = opts.quorum_min {
         cfg_mut.harness.quorum_min = n;
     }
-    let cfg = Arc::new(cfg_mut);
 
-    let client = OllamaClient::new(&cfg.ollama);
-    let policy = QuorumPolicy::parse(&cfg.harness.quorum_policy);
+    let client = OllamaClient::new(&cfg_mut.ollama);
+    let policy = QuorumPolicy::parse(&cfg_mut.harness.quorum_policy);
     let mut max_retries = formula
         .formula
         .max_verify_retries
-        .max(cfg.harness.max_retries);
-    let plan_review = opts.plan_review.unwrap_or(cfg.harness.plan_review);
+        .max(cfg_mut.harness.max_retries);
+    let plan_review = opts.plan_review.unwrap_or(cfg_mut.harness.plan_review);
     let test_command = opts
         .test_command
         .as_deref()
-        .unwrap_or(cfg.harness.test_command.as_str())
+        .unwrap_or(cfg_mut.harness.test_command.as_str())
         .to_string();
-    let verifiers = verifier_models(&cfg);
+    let verifiers = verifier_models(&cfg_mut);
 
     // Adaptive retries from recent harness_runs — low pass rate → one more try.
-    if cfg.harness.adaptive_retries {
+    if cfg_mut.harness.adaptive_retries {
         if let Ok(recent) = store.list_harness_runs(10, false, None).await {
             if recent.len() >= 3 {
                 let pass_n = recent.iter().filter(|r| r.passed).count();
@@ -224,15 +482,28 @@ pub async fn run(
         }
     }
 
-    if cfg.harness.require_distinct_models && verifiers.len() < cfg.harness.quorum_min {
-        anyhow::bail!(
-            "quorum requires {} distinct verifier models, only {} available ({:?}). \
-             Set [harness].verify_models, lower quorum_min, or set require_distinct_models=false",
-            cfg.harness.quorum_min,
+    if cfg_mut.harness.require_distinct_models && verifiers.len() < cfg_mut.harness.quorum_min {
+        if verifiers.is_empty() {
+            anyhow::bail!(
+                "quorum requires {} distinct verifier models, none available. \
+                 Set [harness].verify_models or pull a chat model.",
+                cfg_mut.harness.quorum_min
+            );
+        }
+        // Single-model installs are the common case — auto-relax instead of
+        // failing the run before plan even starts.
+        eprintln!(
+            "  · quorum relaxed: only {} verifier model(s) available {:?}; \
+             wanted {} (set [harness].verify_models or quorum_min to silence)",
             verifiers.len(),
-            verifiers
+            verifiers,
+            cfg_mut.harness.quorum_min
         );
+        cfg_mut.harness.quorum_min = verifiers.len();
+        cfg_mut.harness.require_distinct_models = false;
     }
+
+    let cfg = Arc::new(cfg_mut);
 
     eprintln!(
         "· harness `{}` — plan → review → act → verify (quorum {}, max {} retries)",
@@ -250,7 +521,13 @@ pub async fn run(
         test_command: test_command.clone(),
         require_tool_use: cfg.harness.require_tool_use,
         check_paths: cfg.harness.check_paths.clone(),
+        require_detached_server: formula.formula.require_detached_server,
+        min_html_bytes: formula.formula.min_html_bytes,
+        min_css_bytes: formula.formula.min_css_bytes,
     };
+
+    // Formula may request a larger act model (e.g. site-serve → 32b).
+    let act_model = resolve_act_model(&cfg, &formula).await;
 
     // ---- PLAN SCOUT (read-only tools) ---------------------------------
     eprintln!("  · plan scout (read-only)");
@@ -320,6 +597,7 @@ pub async fn run(
         let msgs = vec![
             crate::llm::types::ChatMessage::system(
                 "You are the planner stage of a local multi-model harness. \
+                 Plan for COMPLETE, accurate, high-quality delivery — not stubs. \
                  Follow the user instructions. Bulleted steps, max 250 words.",
             ),
             crate::llm::types::ChatMessage::user(user),
@@ -381,37 +659,44 @@ pub async fn run(
     let mut attempts = 0usize;
     let mut checks_json = "[]".to_string();
 
-    // One AgentRun for all act retries, bound to the cwd session so STM
-    // (and auto_persist LTM) carry prior attempt context + tool history.
+    // One AgentRun for all act retries. Use a fresh harness-scoped session —
+    // never resume the cwd REPL history. Prior failed site-serve turns poison
+    // small models into emitting ghost calls like `listening_ports()` as prose
+    // instead of real tool_calls.
     let mut act_agent =
         AgentRun::new_with_mode(cfg.clone(), store.clone(), mode, true, true, true)?;
+    // Large site builds need many tool rounds (dir + 3 files + ports + serve).
+    act_agent.max_tool_iterations = 24;
+    // Stream so the TTFB watchdog applies (not a hard wall on the whole
+    // non-streaming generation). Large write_file bodies on 32B can take
+    // several minutes — streaming keeps those alive under timeout_secs.
+    act_agent.set_token_sink(std::sync::Arc::new(|chunk: &str| {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "{chunk}");
+        let _ = out.flush();
+    }));
     const SESSION_MAX_AGE_SECS: i64 = 7 * 86400;
-    let resume_limit = cfg.ollama.resume_messages;
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    if let Ok((session_id, created)) = store
-        .session_get_or_create(&cwd, SESSION_MAX_AGE_SECS)
+    let harness_scope = format!(
+        "harness:{}:{}",
+        formula.formula.name,
+        crate::util::now_ts()
+    );
+    if let Ok((session_id, _)) = store
+        .session_get_or_create(&harness_scope, SESSION_MAX_AGE_SECS)
         .await
     {
-        act_agent.set_session(session_id.clone());
-        if !created && resume_limit > 0 {
-            if let Ok(rows) = store.load_recent_messages(&session_id, resume_limit).await {
-                if !rows.is_empty() {
-                    let restored: Vec<_> = rows
-                        .into_iter()
-                        .map(|(role, content, tool_name, extras_json)| {
-                            AgentRun::message_from_persisted(role, content, tool_name, extras_json)
-                        })
-                        .collect();
-                    act_agent.restore_messages(restored);
-                }
-            }
-        }
+        act_agent.set_session(session_id);
     }
+
+    // Record harness start so retries can reuse earlier detached_server /
+    // file writes as evidence (TCP still up + on-disk sizes), while
+    // require_tool_use still looks at this attempt only.
+    let harness_started_ts = crate::util::now_ts();
 
     for attempt in 0..=max_retries {
         attempts = attempt + 1;
+        let act_started_ts = crate::util::now_ts();
         step_results.insert(
             "feedback".into(),
             serde_json::Value::String(feedback.clone()),
@@ -451,20 +736,24 @@ pub async fn run(
         } else if feedback.is_empty() {
             format!(
                 "You are the ACT stage of a verified local harness.\n\
-                 Follow the PLAN. Use tools as needed. When done, summarise \
+                 Produce COMPLETE, accurate, high-quality work for ANY task \
+                 type (code, config, research, admin, writing) — never stubs \
+                 or placeholders. Use real tool calls. When done, summarise \
                  what you did.\n\nTASK:\n{task}\n\nPLAN:\n{plan}"
             )
         } else {
             format!(
                 "You are the ACT stage of a verified local harness.\n\
-                 Previous attempt failed verification. Fix the issues in \
-                 the feedback, then summarise what you changed.\n\n\
+                 Previous attempt failed quality/accuracy verification. Fix \
+                 every issue in the feedback with real tools — raise quality, \
+                 do not re-ship stubs — then summarise what you changed.\n\n\
                  TASK:\n{task}\n\nPLAN:\n{plan}\n\n\
                  VERIFIER FEEDBACK:\n{feedback}"
             )
         };
 
-        eprintln!("  · act attempt {attempts} ({})", cfg.ollama.chat_model);
+        eprintln!("  · act attempt {attempts} ({act_model})");
+        act_agent.force_next_model(&act_model);
         result = act_agent.turn(&act_prompt).await.context("act stage")?;
         act_agent.persist_new_messages().await;
         let act_key = formula
@@ -479,8 +768,12 @@ pub async fn run(
             outcome_skill_ids = act_skills;
         }
 
-        let audit_tail = checks::read_audit_tail(audit.path(), 40).unwrap_or_default();
-        let check_report = checks::run_checks(&check_opts, &audit_tail).await;
+        let act_audit =
+            checks::read_audit_tail_since(audit.path(), act_started_ts, 80).unwrap_or_default();
+        let evidence_audit = checks::read_audit_tail_since(audit.path(), harness_started_ts, 200)
+            .unwrap_or_else(|_| act_audit.clone());
+        let check_report =
+            checks::run_checks_with_evidence(&check_opts, &act_audit, &evidence_audit).await;
         checks_passed = check_report.all_passed();
         checks_json = serde_json::to_string(&check_report.results).unwrap_or_else(|_| "[]".into());
         eprintln!(
@@ -488,17 +781,67 @@ pub async fn run(
             if checks_passed { "PASS" } else { "FAIL" }
         );
         if !checks_passed {
-            feedback = check_report.summary();
+            let claimed_up = result.to_ascii_lowercase().contains("site is up")
+                || result.to_ascii_lowercase().contains("http://127.0.0.1");
+            if claimed_up {
+                eprintln!(
+                    "      · note: model prose claimed success; ground checks disagree — not a pass"
+                );
+            }
+            for line in check_report.summary().lines() {
+                if !line.is_empty() {
+                    eprintln!("      {line}");
+                }
+            }
+            feedback = checks::retry_guidance(&check_report, &check_opts);
             if attempt == max_retries {
                 break;
             }
             continue;
         }
 
+        // Objective serve + substance checks already passed — don't let a
+        // chatty verifier veto a real site that is accepting TCP.
+        let server_up = check_report
+            .results
+            .iter()
+            .any(|r| r.name == "detached_server" && r.passed);
+        let substance_ok = !check_report.results.iter().any(|r| {
+            (r.name == "html_substance" || r.name == "css_substance") && !r.passed
+        });
+        if (check_opts.require_detached_server || server_up)
+            && substance_ok
+            && (check_opts.min_html_bytes == 0
+                || check_report
+                    .results
+                    .iter()
+                    .any(|r| r.name == "html_substance" && r.passed))
+        {
+            eprintln!(
+                "  · verify: PASS (detached_server + substance — skipping LLM quorum)"
+            );
+            passed = true;
+            // Prefer a clean user-facing result with the URL when the act
+            // prose was just a tool name / fragment.
+            if result.trim().len() < 80
+                || result.contains("listening_ports()")
+                || !result.to_ascii_lowercase().contains("http://")
+            {
+                if let Some(detail) = check_report
+                    .results
+                    .iter()
+                    .find(|r| r.name == "detached_server" && r.passed)
+                {
+                    result = format!("Site is up. {}", detail.detail);
+                }
+            }
+            break;
+        }
+
         let evidence = format!(
             "{}\n\nAUDIT TAIL:\n{}",
             check_report.summary(),
-            crate::util::truncate(&audit_tail, 3000)
+            crate::util::truncate(&evidence_audit, 3000)
         );
         let task_owned = task.to_string();
         let plan_owned = plan.clone();

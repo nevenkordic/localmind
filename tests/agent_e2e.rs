@@ -368,6 +368,9 @@ async fn harness_plan_act_verify_records_skill() {
         // plan scout (read-only gather)
         MockReply::chat_text("No prior greeting files found; no relevant failures."),
         MockReply::chat_text("1. Write the greeting file\n2. Confirm contents"),
+        // Act claims a write without a tool call — agent nudges once, then
+        // the second reply is accepted (already_nudged guard).
+        MockReply::chat_text("Created hello.txt with Hello"),
         MockReply::chat_text("Created hello.txt with Hello"),
         MockReply::chat_text(r#"{"pass": true, "feedback": "ok"}"#),
         MockReply::chat_text(

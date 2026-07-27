@@ -732,7 +732,7 @@ impl AgentRun {
         let mut reply = String::new();
 
         loop {
-            reply = self.loop_tools(&model).await?;
+            reply = self.loop_tools(&model, user_input).await?;
             let mut conf_score = parse_confidence(&reply);
             reply = self.maybe_confidence_verify(user_input, reply).await;
             conf_score = parse_confidence(&reply);
@@ -809,6 +809,7 @@ impl AgentRun {
                 test_command: harness.test_command.clone(),
                 require_tool_use: harness.require_tool_use,
                 check_paths: harness.check_paths.clone(),
+                ..Default::default()
             },
             &audit_tail,
         )
@@ -1134,12 +1135,13 @@ impl AgentRun {
         (skill_primer, memory_primer)
     }
 
-    async fn loop_tools(&mut self, model: &str) -> Result<String> {
+    async fn loop_tools(&mut self, model: &str, user_input: &str) -> Result<String> {
         let specs = Registry::specs(&self.ctx);
         let color = crate::ui::color_enabled(self.ctx.cfg.repl.color);
         // One-shot guard — we nudge at most once per turn on detected
-        // narrated-write hallucinations, so a repeatedly-misbehaving
-        // model can't pin the loop against max_tool_iterations.
+        // narrated-write / claimed-side-effect hallucinations, so a
+        // repeatedly-misbehaving model can't pin the loop against
+        // max_tool_iterations.
         let mut already_nudged_fake_write = false;
         for _ in 0..self.max_tool_iterations {
             let spinner = crate::ui::Spinner::start("thinking", color);
@@ -1302,6 +1304,46 @@ impl AgentRun {
                             ));
                             continue;
                         }
+                        if detect_narrated_tool_agenda(&reply.content) {
+                            already_nudged_fake_write = true;
+                            eprintln!(
+                                "  \x1b[2m· detected tool agenda in prose (no tool_calls) — nudging model\x1b[0m"
+                            );
+                            self.messages.push(ChatMessage::user(
+                                "Do NOT list steps or say \"here are the tool calls\". Emit real \
+                                 structured tool_calls NOW (create_dir / write_file / shell). \
+                                 Prose plans do nothing. Start with the first real tool call."
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        // Soft "ok / created / running on port" replies when
+                        // the user asked for a write or shell action — small
+                        // models often claim success without calling tools.
+                        if let Some(kind) =
+                            detect_claimed_side_effect(user_input, &reply.content)
+                        {
+                            already_nudged_fake_write = true;
+                            eprintln!(
+                                "  \x1b[2m· detected claimed {kind} without tool call — nudging model\x1b[0m"
+                            );
+                            let nudge = match kind {
+                                "shell" => {
+                                    "You claimed a command/server succeeded but made NO tool call. \
+                                     Call the shell tool now (use detach for long-running servers \
+                                     like python -m http.server). Do not invent output."
+                                        .to_string()
+                                }
+                                _ => {
+                                    "You claimed a file was created/written but made NO tool call. \
+                                     Call write_file (and create_dir if needed) NOW with the real \
+                                     path and full content. Do not just say ok/done."
+                                        .to_string()
+                                }
+                            };
+                            self.messages.push(ChatMessage::user(nudge));
+                            continue;
+                        }
                     }
                     return Ok(reply.content);
                 }
@@ -1309,6 +1351,111 @@ impl AgentRun {
         }
         Ok("(max tool iterations reached)".into())
     }
+}
+
+/// Detect "here are the tool calls" / numbered execute agendas with no
+/// real tool_calls — models often stream a plan and stop.
+pub(crate) fn detect_narrated_tool_agenda(reply: &str) -> bool {
+    let l = reply.to_ascii_lowercase();
+    let mentions_agenda = l.contains("here are the tool calls")
+        || l.contains("here are the tools")
+        || l.contains("tool calls:")
+        || (l.contains("let's ensure") && l.contains("write"))
+        || (l.contains("sequence:") && (l.contains("write_file") || l.contains("create_dir")));
+    if !mentions_agenda {
+        return false;
+    }
+    // Must look like an action checklist, not a finished answer.
+    let actionish = l.contains("write_file")
+        || l.contains("create_dir")
+        || l.contains("http.server")
+        || l.contains("styles.css")
+        || l.contains("index.html")
+        || Regex::new(r"(?m)^\s*\d+\.\s+").map(|r| r.is_match(reply)).unwrap_or(false);
+    actionish
+}
+
+/// Detect soft "I did it" hallucinations: the user asked for a write /
+/// shell / server action, the model replied with a short success claim
+/// (`ok`, `created`, `running on port…`) but emitted no tool_calls.
+/// Returns `"write"` or `"shell"` when suspicious, `None` otherwise.
+pub(crate) fn detect_claimed_side_effect(user_input: &str, reply: &str) -> Option<&'static str> {
+    let user = user_input.to_ascii_lowercase();
+    let reply_l = reply.to_ascii_lowercase();
+    let reply_trim = reply.trim();
+
+    // Only short claims — longer replies are usually real explanations /
+    // plans / harness narrations, not soft "ok" lies.
+    if reply_trim.is_empty() || reply_trim.len() > 120 {
+        return None;
+    }
+
+    static USER_WRITE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(create|write|save|make|build|add|generate|implement|put|draft)\b.{0,60}(\.\w{1,8}\b|\b(file|folder|directory|website|site|page)\b)|\b(write_file|create_dir)\b",
+        )
+        .unwrap()
+    });
+    static USER_SHELL: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\bserve\b|\b(run|start|launch|host)\b.{0,40}\b(server|locally|http\.server|localhost|port)\b|\b(python3?\s+-m\s+http\.server)\b",
+        )
+        .unwrap()
+    });
+    static CLAIM_WRITE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(created|wrote|saved|updated|written|file (is|was) (ready|created|written)|done|all set)\b|^ok\.?$|^done\.?$",
+        )
+        .unwrap()
+    });
+    static CLAIM_SHELL: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(running|started|serving|listening)\b.{0,30}\b(port|localhost|http://|server)\b|\bserver (is )?(up|ready|running)\b",
+        )
+        .unwrap()
+    });
+
+    let wants_write = USER_WRITE.is_match(&user);
+    let wants_shell = USER_SHELL.is_match(&user);
+    if !wants_write && !wants_shell {
+        return None;
+    }
+
+    // Bare tool-name prose ("listening_ports()" / "write_file(...)") — the
+    // model narrated a call instead of emitting a structured tool_call.
+    static FAKE_TOOL: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)^(listening_ports|port_check|write_file|create_dir|shell|read_file|list_dir)\s*\([^)]*\)\s*\.?$",
+        )
+        .unwrap()
+    });
+    if FAKE_TOOL.is_match(reply_trim) {
+        let networkish = reply_l.contains("listening")
+            || reply_l.contains("port_check")
+            || reply_l.starts_with("shell");
+        return Some(if networkish || wants_shell {
+            "shell"
+        } else {
+            "write"
+        });
+    }
+
+    if wants_shell && CLAIM_SHELL.is_match(&reply_l) {
+        return Some("shell");
+    }
+    if wants_write && CLAIM_WRITE.is_match(&reply_l) {
+        return Some("write");
+    }
+    // Ultra-short acknowledgement when the user clearly asked for a file
+    // action — "ok" / "done" / "sure" with no substance.
+    if wants_write && reply_trim.len() <= 24 {
+        static SHORT_OK: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?i)^(ok|done|sure|yes|created\.?|wrote\.?)[!.,]*$").unwrap());
+        if SHORT_OK.is_match(reply_trim) {
+            return Some("write");
+        }
+    }
+    None
 }
 
 /// Detect the "narrated write" hallucination: the model describes
@@ -1451,10 +1598,11 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_narrated_write, extract_facts, is_actionable_task, is_trivial_turn,
-        needs_capable_model, parse_confidence, scrub_hallucinated_tool_output,
-        should_escalate_reply, should_use_fast, strip_confidence_tag, task_reply_looks_incomplete,
-        MarkdownHighlighter, StreamingConfidenceFilter, StreamingToolCallFilter,
+        detect_claimed_side_effect, detect_narrated_tool_agenda, detect_narrated_write,
+        extract_facts, is_actionable_task, is_trivial_turn, needs_capable_model, parse_confidence,
+        scrub_hallucinated_tool_output, should_escalate_reply, should_use_fast,
+        strip_confidence_tag, task_reply_looks_incomplete, MarkdownHighlighter,
+        StreamingConfidenceFilter, StreamingToolCallFilter,
     };
 
     #[test]
@@ -1771,6 +1919,45 @@ mod tests {
     }
 
     // ----- detect_narrated_write tests ---------------------------------
+
+    #[test]
+    fn claimed_side_effect_catches_ok_on_create_request() {
+        assert_eq!(
+            detect_claimed_side_effect("create hello.txt with hi", "ok"),
+            Some("write")
+        );
+        assert_eq!(
+            detect_claimed_side_effect("write a website index.html", "Created index.html."),
+            Some("write")
+        );
+        assert_eq!(
+            detect_claimed_side_effect(
+                "run it locally on an unused port",
+                "Server is running on http://localhost:8080"
+            ),
+            Some("shell")
+        );
+        assert_eq!(
+            detect_claimed_side_effect(
+                "build a 2-page site and serve it",
+                "listening_ports()"
+            ),
+            Some("shell")
+        );
+        // Long analytical reply even on a write request — leave alone.
+        assert_eq!(
+            detect_claimed_side_effect("create a website", &"x".repeat(200)),
+            None
+        );
+    }
+
+    #[test]
+    fn narrated_tool_agenda_detects_plan_without_calls() {
+        let reply = "Let's ensure all files are complete.\n\n1. Create the directory\n\
+             2. Write index.html\n3. Write styles.css\n\nHere are the tool calls:";
+        assert!(detect_narrated_tool_agenda(reply));
+        assert!(!detect_narrated_tool_agenda("Site is up at http://127.0.0.1:8082/"));
+    }
 
     #[test]
     fn narrated_write_fires_on_fake_tool_call_json() {

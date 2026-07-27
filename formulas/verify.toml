@@ -2,27 +2,46 @@
 # Stages consult each other: planner drafts, worker acts, verifier checks.
 # On pass, learnings are distilled into kind=skill memories.
 #
-# Optional broodlink-compatible fields per stage:
-#   prompt   — template with {{task}}, {{plan}}, {{memory}}, {{feedback}}, …
-#   input    — prior stage output key (string or list)
-#   output   — name for this stage's result in the step map
-#   when     — fail-closed skip condition (e.g. plan.exists, tests.count > 0)
-#   group    — parallel group id (same id → concurrent; reserved)
-#   examples — few-shot text appended to the prompt
-# `steps` / `agent_role` are accepted as aliases for `stages` / `role`.
+# Quality bar is domain-agnostic: complete, accurate work — not stubs.
 
 [formula]
 name = "verify"
 description = "Plan, act, and cross-verify a task with local models"
-max_verify_retries = 2
+max_verify_retries = 3
 
 [[stages]]
 name = "plan"
 role = "planner"
+prompt = """Plan COMPLETE, accurate delivery for this task (any domain).
+
+TASK:
+{{task}}
+
+CONTEXT:
+{{memory}}
+
+List concrete steps, files/commands/evidence needed, and risks.
+No stub/placeholder plans. Max 220 words."""
+output = "plan"
 
 [[stages]]
 name = "act"
 role = "worker"
+prompt = """Execute the plan with real tools. Deliver finished, accurate work —
+not scaffolding, TODOs, or toy demos. Verify your own claims with tools
+(read back files, run tests/commands when relevant) before declaring done.
+
+TASK:
+{{task}}
+
+PLAN:
+{{plan}}
+
+VERIFIER FEEDBACK (may be empty — if present, fix every issue thoroughly):
+{{feedback}}"""
+input = "plan"
+output = "result"
+when = "plan.exists"
 
 [[stages]]
 name = "verify"

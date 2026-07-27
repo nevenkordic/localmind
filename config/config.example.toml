@@ -5,12 +5,13 @@
 # URL of your local Ollama server.
 host = "http://127.0.0.1:11434"
 # Primary capable model — used for hard work and as the auto-escalate target.
-# Swap to a larger variant for better reasoning at the cost of speed:
-# `llm models --chat <name>` after pulling it with Ollama.
-chat_model = "qwen2.5-coder:3b"
+# Prefer the largest coder you can run for quality (e.g. qwen2.5-coder:32b).
+# Swap with: `llm models --chat <name>` after `ollama pull`.
+chat_model = "qwen2.5-coder:7b"
 # Optional small/fast model for the cascade router. When set AND different
 # from chat_model, short/chatty turns (or most turns if prefer_fast=true)
 # run here. Leave blank to disable cascading — every turn uses chat_model.
+# Quality setup: fast_model=7b, chat_model=32b, prefer_fast=true, auto_escalate=true.
 fast_model = ""
 # Prefer the small model by default (speed). Hard inputs still go straight
 # to chat_model; weak fast replies auto-retry on chat_model when
@@ -26,7 +27,9 @@ vision_model = "gemma3:4b"
 # Embedding model for memory search. Any Ollama embedding model works;
 # dimension is detected per row (the vec0 table expects 768).
 embed_model = "nomic-embed-text"
-# Request timeout in seconds (large models on cold start can be slow).
+# Request timeout in seconds. Also bounds the chat watchdog (min 180s).
+# Raise this for 32B+ models writing large files via tools — a low value
+# aborts mid-generation even when Ollama is healthy.
 timeout_secs = 600
 # Token budget for each reply. 8k covers 95% of interactive turns and keeps
 # prompt-processing time low. Raise to 16384 / 32768 if you paste large
@@ -181,11 +184,14 @@ skill_promote_after = 2
 # while they were in context. 0 = never demote.
 skill_demote_after = 3
 # Fail if act stage makes no tool calls (honest ground check).
-require_tool_use = false
+require_tool_use = true
 # Paths that must exist after act. Example: ["hello.txt"]
 check_paths = []
 # Bump max_retries when recent harness pass rate is low.
 adaptive_retries = true
+# Prefer largest installed capable model for act (by :Nb / MoE size tag,
+# any family — not limited to Qwen) when the formula does not set chat_model.
+prefer_capable_act = true
 
 [agent]
 # Broodlink-style confidence gate for chat / ask. The model appends
@@ -193,7 +199,7 @@ adaptive_retries = true
 # are fact-checked by a fast verifier against memory and may be corrected.
 # Set confidence_verify = false to skip the extra verifier round-trip.
 confidence_verify = true
-confidence_min = 3
+confidence_min = 4
 # Stay on actionable tasks (code/tools/writes) until done. When
 # [harness].test_command or check_paths are set, they define success;
 # otherwise incomplete replies trigger automatic continuations.

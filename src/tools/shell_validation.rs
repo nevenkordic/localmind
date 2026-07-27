@@ -550,6 +550,110 @@ fn find_end_of_value(s: &str) -> Option<usize> {
     Some(leading + end)
 }
 
+/// True when the command is meant to keep running in the background —
+/// trailing `&`, `nohup`, or well-known long-lived servers like
+/// `python -m http.server`. The shell tool detaches these instead of
+/// blocking the agent turn until timeout.
+pub fn wants_detach(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Trailing bare `&` (not `&&` / `>&`).
+    if ends_with_bare_ampersand(trimmed) {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("nohup ") || lower.contains(" nohup ") {
+        return true;
+    }
+    // Common long-lived local servers — always detach even without `&`.
+    if lower.contains("python -m http.server")
+        || lower.contains("python3 -m http.server")
+        || lower.contains("py -m http.server")
+        || lower.contains("npx serve")
+        || lower.contains("npx http-server")
+        || lower.contains("php -s")
+        || lower.contains("php -S")
+        || lower.contains("ruby -run -e httpd")
+    {
+        return true;
+    }
+    false
+}
+
+/// Remove a trailing bare `&` so we can spawn the command ourselves in
+/// detached mode without double-backgrounding under `sh -c`.
+pub fn strip_trailing_ampersand(command: &str) -> String {
+    let trimmed = command.trim_end();
+    if ends_with_bare_ampersand(trimmed) {
+        trimmed[..trimmed.len() - 1].trim_end().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn ends_with_bare_ampersand(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b'&') {
+        return false;
+    }
+    // Reject `&&` and `>&` / `>>&` redirections ending in `&`.
+    let before = bytes.get(bytes.len().saturating_sub(2)).copied();
+    match before {
+        None => true,
+        Some(b'&') | Some(b'>') => false,
+        Some(b) if b.is_ascii_whitespace() => true,
+        Some(_) => true, // e.g. `cmd&`
+    }
+}
+
+/// Best-effort listen-port extraction for common server invocations.
+pub fn guess_listen_port(command: &str) -> Option<u16> {
+    let lower = command.to_ascii_lowercase();
+    // python[3] -m http.server [PORT]
+    if let Some(idx) = lower
+        .find("http.server")
+        .or_else(|| lower.find("http-server"))
+        .or_else(|| lower.find("npx serve"))
+    {
+        let after = &command[idx..];
+        for tok in after.split_whitespace().skip(1) {
+            let clean = tok.trim_matches(|c: char| !c.is_ascii_digit());
+            if let Ok(p) = clean.parse::<u16>() {
+                if p > 0 {
+                    return Some(p);
+                }
+            }
+            // Stop at shell metacharacters.
+            if tok.starts_with('&') || tok.starts_with('|') || tok.starts_with(';') {
+                break;
+            }
+        }
+        // python -m http.server defaults to 8000
+        if lower.contains("http.server") {
+            return Some(8000);
+        }
+    }
+    // php -S host:PORT
+    if let Some(idx) = lower.find("php -s") {
+        let after = &command[idx..];
+        for tok in after.split_whitespace() {
+            if let Some(colon) = tok.rfind(':') {
+                if let Ok(p) = tok[colon + 1..]
+                    .trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u16>()
+                {
+                    if p > 0 {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -622,6 +726,39 @@ mod tests {
     fn extract_skips_env_prefix() {
         assert_eq!(extract_first_command("FOO=1 BAR=2 rm -rf /tmp"), "rm");
         assert_eq!(extract_first_command("FOO=\"hi there\" cat x"), "cat");
+    }
+
+    #[test]
+    fn wants_detach_trailing_ampersand() {
+        assert!(wants_detach("sleep 100 &"));
+        assert!(wants_detach("cd /tmp && python3 -m http.server 8080 &"));
+        assert!(!wants_detach("echo hi && true"));
+        assert!(!wants_detach("echo hi"));
+    }
+
+    #[test]
+    fn wants_detach_http_server_without_ampersand() {
+        assert!(wants_detach("python3 -m http.server 8080"));
+        assert!(wants_detach("cd ~/site && python3 -m http.server 9000"));
+        assert!(!wants_detach("python3 script.py"));
+    }
+
+    #[test]
+    fn strip_trailing_ampersand_preserves_and() {
+        assert_eq!(
+            strip_trailing_ampersand("python3 -m http.server 8080 &"),
+            "python3 -m http.server 8080"
+        );
+        assert_eq!(
+            strip_trailing_ampersand("echo a && echo b"),
+            "echo a && echo b"
+        );
+    }
+
+    #[test]
+    fn guess_listen_port_http_server() {
+        assert_eq!(guess_listen_port("python3 -m http.server 8082 &"), Some(8082));
+        assert_eq!(guess_listen_port("python3 -m http.server"), Some(8000));
     }
 
     #[test]

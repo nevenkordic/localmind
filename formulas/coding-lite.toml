@@ -1,11 +1,14 @@
-# Example broodlink-shaped formula. Stage prompts override the built-in
-# plan/act templates when present. Run with:
+# Auto-selected for light coding tasks, or force with:
 #   llm run "add a hello world binary" --formula formulas/coding-lite.toml
+#
+# Same quality bar as other formulas: complete, accurate code — not stubs.
 
 [formula]
 name = "coding-lite"
-description = "Understand → plan → act with explicit prompt templates"
-max_verify_retries = 2
+description = "Plan → implement → verify coding tasks with quality bar"
+max_verify_retries = 3
+match_any = ["implement", "refactor", "unit test", "cargo ", "fix", "bug"]
+priority = 5
 
 [[stages]]
 name = "plan"
@@ -18,13 +21,16 @@ TASK:
 CONTEXT (memory / scout):
 {{memory}}
 
-List files to touch, ordered steps, and risks. Max 200 words."""
+List files to touch, ordered steps, tests to run, and risks.
+Plan for production-quality changes — not placeholders. Max 200 words."""
 output = "plan"
 
 [[stages]]
 name = "act"
 role = "worker"
-prompt = """Execute this plan with tools. Summarise what you changed.
+prompt = """Execute this plan with real tools. Write complete, correct code.
+Run relevant checks (e.g. cargo test / linters) when they exist.
+Do not leave TODOs, stubs, or broken builds. Summarise what you changed.
 
 TASK:
 {{task}}
@@ -37,3 +43,7 @@ VERIFIER FEEDBACK (may be empty):
 input = "plan"
 output = "result"
 when = "plan.exists"
+
+[[stages]]
+name = "verify"
+role = "verifier"

@@ -32,6 +32,8 @@ pub struct Config {
 pub struct OllamaConfig {
     pub host: String,
     pub chat_model: String,
+    /// Falls back to `chat_model` when empty / omitted from config.
+    #[serde(default)]
     pub vision_model: String,
     pub embed_model: String,
     /// Optional fast-path model. When set AND different from `chat_model`,
@@ -329,7 +331,7 @@ pub struct HarnessConfig {
     #[serde(default = "default_skill_demote")]
     pub skill_demote_after: usize,
     /// Fail ground checks when act produces no tool calls.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub require_tool_use: bool,
     /// Paths that must exist after act (relative or absolute).
     #[serde(default)]
@@ -337,6 +339,13 @@ pub struct HarnessConfig {
     /// When recent pass rate is low, bump max_retries (capped).
     #[serde(default = "default_true")]
     pub adaptive_retries: bool,
+    /// For `llm run` act stage: if the formula has no chat_model override,
+    /// prefer the largest installed chat-capable model by `:Nb` / MoE tag
+    /// (any family — Llama, Qwen, Mistral, etc.). Skips embed/rerank models
+    /// and the configured embed/vision names. Keeps interactive REPL on
+    /// `chat_model` while raising harness quality for any task type.
+    #[serde(default = "default_true")]
+    pub prefer_capable_act: bool,
 }
 fn default_quorum_min() -> usize {
     2
@@ -367,9 +376,10 @@ impl Default for HarnessConfig {
             auto_skill: true,
             skill_promote_after: 2,
             skill_demote_after: 3,
-            require_tool_use: false,
+            require_tool_use: true,
             check_paths: Vec::new(),
             adaptive_retries: true,
+            prefer_capable_act: true,
         }
     }
 }

@@ -861,13 +861,17 @@ fn web_fetch_spec() -> ToolSpec {
 fn shell_spec() -> ToolSpec {
     spec(
         "shell",
-        "Run a shell command (bash on Unix, cmd on Windows). Requires user approval each call.",
+        "Run a shell command (bash on Unix, cmd on Windows). Requires user approval each call. \
+         Long-running servers (python -m http.server, trailing `&`, nohup) are auto-detached — \
+         set detach=true to force. Never block waiting on a background server; verify with \
+         listening_ports afterwards.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
                 "cwd": {"type": "string"},
-                "timeout_secs": {"type": "integer"}
+                "timeout_secs": {"type": "integer", "description": "Ignored when detaching"},
+                "detach": {"type": "boolean", "description": "Force background/detached spawn (default: auto-detect)"}
             },
             "required": ["command"]
         }),

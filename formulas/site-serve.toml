@@ -1,0 +1,95 @@
+# Build a polished static site and serve it locally.
+# Auto-selected by `llm run` when the task looks like build/create a site
+# AND serve/run it locally.
+#
+# Quality bar is enforced by ground checks (min HTML/CSS bytes) — a
+# single <h1> stub will FAIL even if the server is up.
+
+[formula]
+name = "site-serve"
+description = "Plan → design-quality static site → detach server → verify port + file substance"
+max_verify_retries = 4
+match_any = ["serve", "run locally", "localhost", "http.server"]
+match_all = []
+priority = 10
+require_detached_server = true
+# Act model: leave empty so prefer_capable_act picks the largest installed
+# chat model (any family). Set explicitly only to pin a specific tag.
+chat_model = ""
+# Size floors: reject thin ~1.4KB templates; allow solid ~2KB pages that
+# 32B coders can emit in one write_file. Prompt still targets richer output.
+min_html_bytes = 2000
+min_css_bytes = 1800
+
+[[stages]]
+name = "plan"
+role = "planner"
+prompt = """Plan a DISTINCTIVE 2-page static website (not a template stub).
+
+TASK:
+{{task}}
+
+CONTEXT:
+{{memory}}
+
+Decide:
+- Folder path under the workspace (e.g. Desktop/<short-name>)
+- Exact files: index.html, about.html (or second page), styles.css — maybe a tiny script.js
+- Visual direction: one clear aesthetic (NOT purple-on-white, NOT Inter/Roboto/Arial, NOT generic AI-startup)
+- Free TCP port in 8080–8099
+
+Max 180 words. Be concrete about fonts, colors (hex), and section structure."""
+output = "plan"
+
+[[stages]]
+name = "act"
+role = "worker"
+prompt = """Build a REAL website people would actually look at — then serve it.
+
+CRITICAL — tool calls must be REAL structured tool_calls (or recoverable
+shell(...)/write_file(...) forms). Never answer with only a tool name.
+Never say "here are the tool calls" — emit them.
+
+DO NOT STOP EARLY. create_dir alone is a FAILED attempt. After the folder
+exists you MUST write every page + CSS, then start the server, in this same
+turn. Prefer emitting multiple tool calls together when you can.
+
+BYTE FLOORS (measured on disk — thin ~1.4KB templates FAIL):
+- Each HTML file ≥ 2000 bytes (target ~3000 so a short write still passes)
+- styles.css ≥ 1800 bytes (target ~2500)
+
+QUALITY BAR:
+- Nav with working links between pages; hero with brand-level name + headline
+  + support line + CTA; ≥2 purposeful sections with real multi-sentence copy;
+  footer.
+- CSS: :root variables, Google Fonts import (NOT Arial/Inter/Roboto alone),
+  atmospheric background (gradient/pattern), spacing, hover, @media.
+- No purple-indigo AI cliché. No emoji spam. Invent a sharp fictional brand
+  if the TASK does not name one.
+
+SEQUENCE (complete all before any final prose):
+1. create_dir for the site folder
+2. write_file index.html (FULL long document)
+3. write_file about.html (FULL long document, linked from nav)
+4. write_file styles.css (FULL long stylesheet)
+5. listening_ports → pick ONE free port 8080–8099
+6. shell: python3 -m http.server <port>  with cwd= the site folder
+   (auto-detaches — no &, no tiny timeout)
+7. port_check 127.0.0.1:<port>
+8. One sentence: Site is up at http://127.0.0.1:<port>/
+
+If VERIFIER FEEDBACK says the server is already up: do NOT start another
+server — only rewrite HTML/CSS larger. If feedback cites byte sizes, rewrite
+ALL three files in this attempt (not just one).
+
+TASK:
+{{task}}
+
+PLAN:
+{{plan}}
+
+VERIFIER FEEDBACK (may be empty):
+{{feedback}}"""
+input = "plan"
+output = "result"
+when = "plan.exists"

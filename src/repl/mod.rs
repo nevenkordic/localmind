@@ -123,6 +123,9 @@ pub async fn run(
             }
         }
     }
+    // Kill any http.server / nohup children we detached this session so
+    // quitting the REPL doesn't leave orphan listeners behind.
+    crate::tools::shell::cleanup_detached();
     if let Some(p) = &hist_path {
         let _ = rl.save_history(p);
         // The history file may capture sensitive REPL input (`/remember <secret>`,
