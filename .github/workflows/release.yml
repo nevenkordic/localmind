@@ -1,14 +1,20 @@
 name: Release
 
-# Manual only — never runs on push/PR/merge. Trigger from the Actions tab
-# (workflow_dispatch) with a version like v0.1.11 when you want a release.
+# Intentional releases only — not on every push/PR/merge.
+# Trigger by either:
+#   1. Pushing a version tag (v2.0.0), or
+#   2. Actions → Release → Run workflow (workflow_dispatch)
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release tag to create (e.g. v0.1.11). Must start with v.'
-        required: true
+        description: 'Release tag to create (e.g. v2.0.0). Must start with v. Ignored on tag pushes.'
+        required: false
         type: string
+        default: ''
       draft:
         description: 'Publish as a draft GitHub release'
         required: false
@@ -26,17 +32,29 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
+      draft: ${{ steps.check.outputs.draft }}
     steps:
       - id: check
         shell: bash
         run: |
-          tag="${{ inputs.version }}"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            tag="${{ github.ref_name }}"
+            draft="false"
+          else
+            tag="${{ inputs.version }}"
+            draft="${{ inputs.draft }}"
+            if [[ -z "$tag" ]]; then
+              echo "::error::version input is required for workflow_dispatch"
+              exit 1
+            fi
+          fi
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
-            echo "::error::version must look like v0.1.11 (got: $tag)"
+            echo "::error::version must look like v2.0.0 (got: $tag)"
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Releasing $tag (draft=${{ inputs.draft }})"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (draft=$draft, event=${{ github.event_name }})"
 
   build:
     name: ${{ matrix.target }}
@@ -128,4 +146,4 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
-          draft: ${{ inputs.draft }}
+          draft: ${{ needs.validate.outputs.draft == 'true' }}
