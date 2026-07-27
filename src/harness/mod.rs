@@ -507,10 +507,13 @@ pub async fn run(
 
     // Attribute outcomes to skills that were in act context. Skip skills
     // distilled on this same run — they need a later successful use to promote.
+    let mut link_rows: Vec<(String, &str)> = Vec::new();
     for id in &outcome_skill_ids {
+        link_rows.push((id.clone(), "primed"));
         if distilled_this_run.iter().any(|d| d == id) {
             continue;
         }
+        link_rows.push((id.clone(), "credited"));
         let _ = store
             .record_skill_outcome(
                 id,
@@ -519,6 +522,9 @@ pub async fn run(
                 cfg.harness.skill_demote_after,
             )
             .await;
+    }
+    for id in &distilled_this_run {
+        link_rows.push((id.clone(), "distilled"));
     }
 
     let run_id = store
@@ -535,6 +541,10 @@ pub async fn run(
             decision_id.as_deref(),
         )
         .await?;
+
+    let _ = store
+        .insert_harness_skill_links(&run_id, &link_rows, passed)
+        .await;
 
     for v in plan_verdicts {
         let _ = store

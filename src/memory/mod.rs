@@ -7,7 +7,8 @@ pub mod store;
 
 #[allow(unused_imports)]
 pub use store::{
-    HarnessStats, NewMemory, Stats, Store, StoredDecision, StoredHarnessRun, StoredMemory,
+    HarnessSkillStat, HarnessStats, NewMemory, Stats, Store, StoredDecision, StoredHarnessRun,
+    StoredMemory,
 };
 
 /// Statically register the sqlite-vec extension with every connection the

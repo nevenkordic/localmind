@@ -187,6 +187,8 @@ impl Store {
             conn.execute_batch(include_str!("../../migrations/004_harness_learning.sql"))
                 .context("applying 004_harness_learning.sql")?;
             let _ = conn.execute_batch(include_str!("../../migrations/005_memory_scope.sql"));
+            conn.execute_batch(include_str!("../../migrations/006_harness_skill_links.sql"))
+                .context("applying 006_harness_skill_links.sql")?;
             Self::ensure_memory_trust_columns(&conn)?;
             Ok(())
         })
@@ -1032,6 +1034,76 @@ impl Store {
         Ok(id)
     }
 
+    /// Record which skills were involved in a harness run.
+    /// `role` is one of: `primed` | `credited` | `distilled`.
+    pub async fn insert_harness_skill_links(
+        &self,
+        run_id: &str,
+        links: &[(String, &str)],
+        passed: bool,
+    ) -> Result<()> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let inner = self.inner.clone();
+        let run_id = run_id.to_string();
+        let rows: Vec<(String, String)> = links
+            .iter()
+            .map(|(id, role)| (id.clone(), (*role).to_string()))
+            .collect();
+        let now = util::now_ts();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            for (skill_id, role) in rows {
+                let id = util::new_uuid();
+                tx.execute(
+                    r#"INSERT INTO harness_skill_links
+                       (id, run_id, skill_id, role, passed, created_at)
+                       VALUES (?1,?2,?3,?4,?5,?6)"#,
+                    params![id, run_id, skill_id, role, passed as i32, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Skills most often credited on harness runs, newest-first aggregation.
+    pub async fn top_harness_skills(&self, limit: usize) -> Result<Vec<HarnessSkillStat>> {
+        let inner = self.inner.clone();
+        let limit = limit.max(1) as i64;
+        tokio::task::spawn_blocking(move || -> Result<Vec<HarnessSkillStat>> {
+            let conn = inner.lock().unwrap();
+            let mut stmt = conn.prepare(
+                r#"SELECT l.skill_id,
+                          COALESCE(m.title, l.skill_id),
+                          COUNT(*) AS uses,
+                          SUM(CASE WHEN l.passed = 1 THEN 1 ELSE 0 END) AS wins
+                   FROM harness_skill_links l
+                   LEFT JOIN memories m ON m.id = l.skill_id
+                   WHERE l.role = 'credited'
+                   GROUP BY l.skill_id
+                   ORDER BY uses DESC, wins DESC
+                   LIMIT ?1"#,
+            )?;
+            let rows = stmt
+                .query_map(params![limit], |row| {
+                    Ok(HarnessSkillStat {
+                        skill_id: row.get(0)?,
+                        title: row.get(1)?,
+                        credited_runs: row.get(2)?,
+                        passed_runs: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
     pub async fn insert_harness_verdict(
         &self,
         run_id: &str,
@@ -1271,6 +1343,15 @@ pub struct HarnessStats {
     pub avg_attempts: f64,
 }
 
+/// Per-skill attribution rollup from `harness_skill_links`.
+#[derive(Debug, Clone)]
+pub struct HarnessSkillStat {
+    pub skill_id: String,
+    pub title: String,
+    pub credited_runs: i64,
+    pub passed_runs: i64,
+}
+
 /// One row from `harness_runs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredHarnessRun {
@@ -1314,4 +1395,93 @@ fn sanitize_fts_query(q: &str) -> String {
     // Use OR between tokens to keep recall high; dedupe via set-like approach.
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     tokens.join(" OR ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn test_cfg(dir: &std::path::Path) -> Config {
+        let db = dir.join("memory.db");
+        let raw = format!(
+            r#"
+[ollama]
+host = "http://127.0.0.1:1"
+chat_model = "t"
+vision_model = "t"
+embed_model = "t"
+
+[memory]
+db_path = "{db}"
+vector_search = false
+
+[tools]
+mode = "workspace-write"
+
+[web]
+brave_api_key = ""
+
+[repl]
+color = false
+"#,
+            db = db.display()
+        );
+        toml::from_str(&raw).expect("test config")
+    }
+
+    #[tokio::test]
+    async fn harness_skill_links_round_trip() {
+        crate::memory::register_vec_extension();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let store = Store::open(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let skill_id = store
+            .insert_memory(&NewMemory {
+                kind: "skill".into(),
+                title: "when deploying".into(),
+                content: "run smoke tests first".into(),
+                source: "test".into(),
+                tags: vec![],
+                importance: 0.8,
+                trust_tier: Some("auto".into()),
+                cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let run_id = store
+            .insert_harness_run(
+                "verify",
+                "deploy staging",
+                "plan",
+                "result",
+                true,
+                1,
+                true,
+                "[]",
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        store
+            .insert_harness_skill_links(
+                &run_id,
+                &[(skill_id.clone(), "primed"), (skill_id.clone(), "credited")],
+                true,
+            )
+            .await
+            .unwrap();
+
+        let top = store.top_harness_skills(5).await.unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].skill_id, skill_id);
+        assert_eq!(top[0].credited_runs, 1);
+        assert_eq!(top[0].passed_runs, 1);
+        assert!(top[0].title.contains("deploying"));
+    }
 }
