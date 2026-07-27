@@ -319,3 +319,108 @@ async fn loose_call_recovery_fires_for_thinking_out_loud() {
         chats[1].body
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taught_skill_persists_and_primes_next_session() {
+    // "when X, do Y" must land as kind=skill and surface on a matching turn.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mock1 = MockOllama::start(vec![MockReply::chat_text("got it")]).await;
+    let cfg1 = common::testenv::write_config(dir.path(), &mock1.url);
+    let out = run_ask(
+        &cfg1,
+        "when running tests, always use cargo test --locked",
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "teach: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(mock1);
+
+    let mock2 = MockOllama::start(vec![MockReply::chat_text("ack")]).await;
+    let cfg2 = common::testenv::write_config(dir.path(), &mock2.url);
+    let out = run_ask(&cfg2, "how should I go about running tests").await;
+    assert!(
+        out.status.success(),
+        "recall: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let chats: Vec<_> = mock2
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/api/chat"))
+        .collect();
+    assert_eq!(chats.len(), 1);
+    assert!(
+        chats[0].body.contains("cargo test --locked")
+            || chats[0].body.contains("Relevant skills"),
+        "skill primer missing:\n{}",
+        chats[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_plan_act_verify_records_skill() {
+    // plan → act → verify → distill_skills. Scripted replies:
+    // 1) plan_task
+    // 2) act turn (plain text)
+    // 3) verify_stage JSON pass
+    // 4) distill_skills JSON array
+    let mock = MockOllama::start(vec![
+        MockReply::chat_text("1. Write the greeting file\n2. Confirm contents"),
+        MockReply::chat_text("Created hello.txt with Hello"),
+        MockReply::chat_text(r#"{"pass": true, "feedback": "ok"}"#),
+        MockReply::chat_text(
+            r#"[{"title":"when writing a greeting file","content":"1. write hello.txt\n2. confirm contents"}]"#,
+        ),
+    ])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), &mock.url);
+    let out = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("run")
+        .arg("write a greeting file")
+        .arg("--mode")
+        .arg("workspace-write")
+        .output()
+        .await
+        .expect("run llm run");
+
+    assert!(
+        out.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Created hello.txt"),
+        "stdout: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skill recorded") || stderr.contains("skill(s) recorded"),
+        "stderr: {stderr}"
+    );
+
+    // Confirm the skill is searchable offline.
+    let search = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["memory", "search", "greeting", "--bm25"])
+        .output()
+        .await
+        .expect("search");
+    assert!(search.status.success());
+    let search_out = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search_out.contains("greeting") || search_out.contains("hello.txt"),
+        "skill not in memory search:\n{search_out}"
+    );
+}

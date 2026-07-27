@@ -1,0 +1,20 @@
+# Default multi-model verify formula for `llm run`.
+# Stages consult each other: planner drafts, worker acts, verifier checks.
+# On pass, learnings are distilled into kind=skill memories.
+
+[formula]
+name = "verify"
+description = "Plan, act, and cross-verify a task with local models"
+max_verify_retries = 2
+
+[[stages]]
+name = "plan"
+role = "planner"
+
+[[stages]]
+name = "act"
+role = "worker"
+
+[[stages]]
+name = "verify"
+role = "verifier"

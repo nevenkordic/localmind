@@ -38,6 +38,8 @@ impl Registry {
             read_image_spec(),
             search_memory_spec(),
             store_memory_spec(),
+            log_decision_spec(),
+            list_decisions_spec(),
             kg_link_spec(),
             // Networking / admin tools — always advertised; the permission
             // layer decides whether each individual call is allowed.
@@ -158,6 +160,8 @@ impl Registry {
             "read_image" => crate::tools::image::read_image(ctx, args).await,
             "search_memory" => crate::tools::memory_tools::search_memory(ctx, args).await,
             "store_memory" => crate::tools::memory_tools::store_memory(ctx, args).await,
+            "log_decision" => crate::tools::memory_tools::log_decision(ctx, args).await,
+            "list_decisions" => crate::tools::memory_tools::list_decisions(ctx, args).await,
             "kg_link" => crate::tools::memory_tools::kg_link(ctx, args).await,
             "web_search" => crate::tools::web::web_search(ctx, args).await,
             "web_fetch" => crate::tools::web::web_fetch(ctx, args).await,
@@ -209,7 +213,9 @@ fn mode_guard(
             "zip_create" | "zip_extract" | "create_dir" => {
                 Some(format!("{name} disabled in read-only mode"))
             }
-            "store_memory" | "kg_link" => Some(format!("{name} disabled in read-only mode")),
+            "store_memory" | "log_decision" | "kg_link" => {
+                Some(format!("{name} disabled in read-only mode"))
+            }
             _ => None,
         },
         PermissionMode::WorkspaceWrite => {
@@ -753,7 +759,7 @@ fn search_memory_spec() -> ToolSpec {
     )
 }
 fn store_memory_spec() -> ToolSpec {
-    spec("store_memory", "Persist a fact, decision, note, or skill to long-term memory. Use kind=\"skill\" for procedures the user TEACHES you (\"from now on when X, do Y\") — title it after when the skill should fire, put the steps in content, set importance ~0.85. Skills are auto-retrieved at the start of each turn.", serde_json::json!({
+    spec("store_memory", "Persist a fact, decision, note, or skill to long-term memory. Use kind=\"skill\" for procedures the user TEACHES you OR procedures you LEARNED while completing a task (\"from now on when X, do Y\") — title it after when the skill should fire, put the steps in content, set importance ~0.85. Skills are auto-retrieved at the start of each turn. Always record learned procedures as skills so you do not redo the same discovery.", serde_json::json!({
         "type": "object",
         "properties": {
             "title": {"type": "string"},
@@ -764,6 +770,34 @@ fn store_memory_spec() -> ToolSpec {
         },
         "required": ["title", "content"]
     }))
+}
+fn log_decision_spec() -> ToolSpec {
+    spec(
+        "log_decision",
+        "Append a structured decision to the audit ledger (what was decided, why, alternatives considered, outcome). Use when choosing between approaches.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string"},
+                "reasoning": {"type": "string"},
+                "alternatives": {"type": "string"},
+                "outcome": {"type": "string"}
+            },
+            "required": ["decision"]
+        }),
+    )
+}
+fn list_decisions_spec() -> ToolSpec {
+    spec(
+        "list_decisions",
+        "List recent structured decisions from the ledger, newest first.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10}
+            }
+        }),
+    )
 }
 fn kg_link_spec() -> ToolSpec {
     spec(
