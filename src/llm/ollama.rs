@@ -576,6 +576,40 @@ impl OllamaClient {
         Self::parse_verdict_json(&reply.content)
     }
 
+    /// Fact-check a low-confidence chat reply (broodlink verify-then-correct).
+    /// Returns Verified or Corrected; ambiguous replies count as Verified.
+    pub async fn verify_confidence_response(
+        &self,
+        user_query: &str,
+        original_response: &str,
+        memory_context: &str,
+        model_override: Option<&str>,
+    ) -> Result<crate::agent::ConfidenceVerify> {
+        let sys = "You are a precise fact-checker. Be concise. Do not add \
+                   unnecessary information.";
+        let user = format!(
+            "You are a fact-checker. The user asked: \"{user_query}\"\n\n\
+             The AI responded: \"{original_response}\"\n\n\
+             Known facts from memory:\n{memory_context}\n\n\
+             Check the response for factual errors, unsupported claims, or \
+             contradictions with known facts.\n\
+             If the response is accurate, respond with exactly: VERIFIED\n\
+             If there are issues, respond with: CORRECTED: <your corrected response>"
+        );
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
+        let cleaned = reply.content.trim();
+        if cleaned.contains("VERIFIED") {
+            Ok(crate::agent::ConfidenceVerify::Verified)
+        } else if let Some(idx) = cleaned.find("CORRECTED:") {
+            Ok(crate::agent::ConfidenceVerify::Corrected(
+                cleaned[idx + 10..].trim().to_string(),
+            ))
+        } else {
+            Ok(crate::agent::ConfidenceVerify::Verified)
+        }
+    }
+
     /// Plan-review quorum stage — approve or reject before tools run.
     pub async fn review_plan(
         &self,

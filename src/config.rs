@@ -23,6 +23,9 @@ pub struct Config {
     /// Multi-model plan→act→verify harness settings.
     #[serde(default)]
     pub harness: HarnessConfig,
+    /// Interactive agent behaviour (confidence gate, etc.).
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +361,31 @@ impl Default for HarnessConfig {
             require_tool_use: false,
             check_paths: Vec::new(),
             adaptive_retries: true,
+        }
+    }
+}
+
+/// Interactive agent settings (chat / ask), including broodlink-style
+/// confidence → verify gating.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// When true, the model ends replies with `[CONFIDENCE: N/5]`. Low
+    /// scores trigger a fast verifier that may correct the answer.
+    #[serde(default = "default_true")]
+    pub confidence_verify: bool,
+    /// Minimum confidence (1–5) that skips verification. Below this,
+    /// `verify_response` runs against memory context.
+    #[serde(default = "default_confidence_min")]
+    pub confidence_min: u8,
+}
+fn default_confidence_min() -> u8 {
+    3
+}
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            confidence_verify: true,
+            confidence_min: 3,
         }
     }
 }

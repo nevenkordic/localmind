@@ -1,6 +1,15 @@
 # Default multi-model verify formula for `llm run`.
 # Stages consult each other: planner drafts, worker acts, verifier checks.
 # On pass, learnings are distilled into kind=skill memories.
+#
+# Optional broodlink-compatible fields per stage:
+#   prompt   — template with {{task}}, {{plan}}, {{memory}}, {{feedback}}, …
+#   input    — prior stage output key (string or list)
+#   output   — name for this stage's result in the step map
+#   when     — fail-closed skip condition (e.g. plan.exists, tests.count > 0)
+#   group    — parallel group id (same id → concurrent; reserved)
+#   examples — few-shot text appended to the prompt
+# `steps` / `agent_role` are accepted as aliases for `stages` / `role`.
 
 [formula]
 name = "verify"
