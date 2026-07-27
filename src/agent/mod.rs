@@ -45,6 +45,10 @@ pub struct AgentRun {
     /// How many of `messages` have been flushed to the session store.
     /// Only the delta past this index is written on each flush.
     persisted_up_to: usize,
+    /// Skill memory ids primed on the most recent turn — used by the
+    /// harness to attribute promote/demote to skills that were actually
+    /// in context during act (not just plan).
+    last_primed_skill_ids: Vec<String>,
 }
 
 impl AgentRun {
@@ -98,6 +102,7 @@ impl AgentRun {
             force_model: None,
             session_id: None,
             persisted_up_to: 1, // system prompt never needs persisting
+            last_primed_skill_ids: Vec::new(),
         })
     }
 
@@ -137,6 +142,12 @@ impl AgentRun {
         self.messages.truncate(1);
         self.messages.extend(loaded);
         self.persisted_up_to = self.messages.len();
+    }
+
+    /// Skill ids primed on the last turn. Consumed by the harness so
+    /// promote/demote tracks what act actually saw.
+    pub fn take_primed_skill_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.last_primed_skill_ids)
     }
 
     /// Flush any newly-pushed messages to the session store. Safe to call
@@ -375,6 +386,7 @@ impl AgentRun {
                 source: "compact".into(),
                 tags: vec!["compact".into(), "stm".into()],
                 importance: 0.55,
+                trust_tier: Some("auto".into()),
             })
             .await
         {
@@ -397,6 +409,7 @@ impl AgentRun {
                                 source: "compact-distill".into(),
                                 tags: vec!["auto-skill".into()],
                                 importance: 0.85,
+                                trust_tier: Some("auto".into()),
                             })
                             .await;
                     }
@@ -422,6 +435,19 @@ impl AgentRun {
         self.last_primer = None;
         self.last_memory_primer = None;
 
+        // Keep the session DB aligned with the compacted in-memory
+        // transcript. Without this, `persisted_up_to` still points past
+        // the new shorter vec (silently dropping future STM writes) and
+        // resume reloads the pre-compact raw tail instead of the summary.
+        if let Some(session_id) = self.session_id.clone() {
+            if let Err(e) = self.rewrite_session_messages(&session_id).await {
+                tracing::warn!("compact session rewrite failed: {e}");
+                self.persisted_up_to = self.messages.len();
+            }
+        } else {
+            self.persisted_up_to = self.messages.len();
+        }
+
         let after_tokens = self.estimate_tokens();
         eprintln!(
             "  \x1b[2m· auto-compacted {} messages (~{} → {} tokens)\x1b[0m",
@@ -429,6 +455,27 @@ impl AgentRun {
             before_tokens,
             after_tokens,
         );
+        Ok(())
+    }
+
+    /// Clear the session's message rows and rewrite them from the current
+    /// in-memory transcript (skipping the live system prompt at index 0).
+    async fn rewrite_session_messages(&mut self, session_id: &str) -> Result<()> {
+        self.ctx.store.clear_session_messages(session_id).await?;
+        for m in self.messages.iter().skip(1) {
+            let extras = Self::message_extras_json(m);
+            self.ctx
+                .store
+                .append_message(
+                    session_id,
+                    &m.role,
+                    &m.content,
+                    m.name.as_deref(),
+                    extras.as_deref(),
+                )
+                .await?;
+        }
+        self.persisted_up_to = self.messages.len();
         Ok(())
     }
 
@@ -469,6 +516,7 @@ impl AgentRun {
                     source: "auto-extract".into(),
                     tags: vec!["user".into()],
                     importance,
+                    trust_tier: None,
                 })
                 .await;
             eprintln!("  · {label}: {}", content);
@@ -478,7 +526,8 @@ impl AgentRun {
         // semantic matches surface even when the user phrases things
         // differently from how they were stored. Then split the hits into
         // the skill primer (authoritative procedures) and the memory primer
-        // (general context).
+        // (general context + always-on recent work).
+        let turn_mark = self.messages.len();
         let (skill, memory) = self.build_primers(user_input).await;
         if let Some(primer) = skill {
             if self.last_primer.as_deref() != Some(primer.as_str()) {
@@ -498,22 +547,169 @@ impl AgentRun {
         let model = self.route_turn(user_input);
         // Consume any force_model so the next turn re-routes normally.
         self.force_model = None;
-        self.loop_tools(&model).await
+        let reply = self.loop_tools(&model).await?;
+        self.maybe_auto_persist(user_input, turn_mark).await;
+        Ok(reply)
+    }
+
+    fn trust_rank(tier: &str) -> u8 {
+        match tier {
+            "user" => 3,
+            "verified" => 2,
+            "ignored" => 0,
+            _ => 1,
+        }
+    }
+
+    /// When `[memory].auto_persist` is on, write a searchable LTM note of
+    /// what happened this turn — tools used, when, and the outcome — so
+    /// later sessions can recall past work without the user repeating it.
+    async fn maybe_auto_persist(&self, user_input: &str, from_idx: usize) {
+        if !self.ctx.cfg.memory.auto_persist {
+            return;
+        }
+        if is_trivial_turn(user_input) {
+            return;
+        }
+        let slice = &self.messages[from_idx.min(self.messages.len())..];
+        let mut actions: Vec<String> = Vec::new();
+        let mut final_assistant = String::new();
+        for m in slice {
+            match m.role.as_str() {
+                "assistant" => {
+                    if let Some(calls) = &m.tool_calls {
+                        for c in calls {
+                            let args =
+                                serde_json::to_string(&c.function.arguments).unwrap_or_default();
+                            actions.push(format!(
+                                "- called {}({})",
+                                c.function.name,
+                                crate::util::truncate(&args, 180)
+                            ));
+                        }
+                    }
+                    if m.tool_calls.as_ref().map(|c| c.is_empty()).unwrap_or(true)
+                        && !m.content.trim().is_empty()
+                    {
+                        final_assistant = m.content.clone();
+                    }
+                }
+                "tool" => {
+                    let name = m.name.as_deref().unwrap_or("tool");
+                    actions.push(format!(
+                        "  → {name}: {}",
+                        crate::util::truncate(&m.content, 220)
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // Skip empty chit-chat with no tools and a tiny reply.
+        if actions.is_empty() && final_assistant.chars().count() < 40 {
+            return;
+        }
+        let when = crate::util::format_ts(crate::util::now_ts());
+        let action_block = if actions.is_empty() {
+            "(conversation — no tools)".to_string()
+        } else {
+            actions.join("\n")
+        };
+        let preview: String = user_input.chars().take(60).collect();
+        let title = format!("turn: {preview}");
+        let content = format!(
+            "When: {when}\nUser: {}\nHow (actions):\n{action_block}\nOutcome: {}",
+            crate::util::truncate(user_input, 400),
+            crate::util::truncate(&final_assistant, 500)
+        );
+        if let Err(e) = self
+            .ctx
+            .store
+            .insert_memory(&NewMemory {
+                kind: "note".into(),
+                title,
+                content,
+                source: "auto-persist".into(),
+                tags: vec!["stm".into(), "action".into()],
+                importance: if actions.is_empty() { 0.45 } else { 0.65 },
+                trust_tier: Some("auto".into()),
+            })
+            .await
+        {
+            tracing::warn!("auto_persist failed: {e}");
+        }
+    }
+
+    /// Always-on block of recent preferences, decisions, and past work so
+    /// the model knows what was established — and when — even when the
+    /// user's current message wouldn't retrieve those memories by query.
+    async fn build_recent_context_primer(&self) -> Option<String> {
+        const CONTENT_CAP: usize = 220;
+        let mut lines: Vec<String> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Ok(prefs) = self.ctx.store.list_by_kind("preference", 5).await {
+            for m in prefs.into_iter().take(3) {
+                seen_ids.insert(m.id.clone());
+                lines.push(format!(
+                    "• [preference] {}: {}",
+                    m.title,
+                    crate::util::truncate(m.content.trim(), CONTENT_CAP)
+                ));
+            }
+        }
+        if let Ok(decisions) = self.ctx.store.list_decisions(3).await {
+            for d in decisions {
+                lines.push(format!(
+                    "• [decision @ {}] {} → {}",
+                    crate::util::format_ts(d.created_at),
+                    crate::util::truncate(&d.decision, 120),
+                    crate::util::truncate(&d.outcome, 80)
+                ));
+            }
+        }
+        if let Ok(work) = self.ctx.store.list_recent_work(5).await {
+            for m in work.into_iter().take(3) {
+                if !seen_ids.insert(m.id.clone()) {
+                    continue;
+                }
+                lines.push(format!(
+                    "• [{} @ {}] {}: {}",
+                    m.kind,
+                    crate::util::format_ts(m.created_at),
+                    m.title,
+                    crate::util::truncate(m.content.trim(), CONTENT_CAP)
+                ));
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "Recent context — facts, decisions, and past work (what / when / how). \
+             Treat as ground truth; do not ask the user to repeat these:\n\n",
+        );
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
+        Some(out)
     }
 
     /// Build skill + memory primers from a single recall query. Honours
     /// `[memory].vector_search`: when enabled, uses hybrid_search for
     /// semantic match; when disabled, falls back to BM25 (BM25 also fires
     /// when the query is too short for hybrid search to be meaningful).
-    async fn build_primers(&self, user_input: &str) -> (Option<String>, Option<String>) {
+    async fn build_primers(&mut self, user_input: &str) -> (Option<String>, Option<String>) {
         const MAX_SKILLS: usize = 2;
         const MAX_MEMORIES: usize = 3;
         const CONTENT_CAP: usize = 500;
+
+        self.last_primed_skill_ids.clear();
+        let recent = self.build_recent_context_primer().await;
+
         if is_trivial_turn(user_input) {
-            // No BM25 or vector round-trip — the user said "hi" or similar
-            // and the result of a recall against that is always useless
-            // noise. Big savings on short acknowledgement turns.
-            return (None, None);
+            // Still surface recent preferences/decisions on short turns so
+            // a follow-up like "what's my name?" after "hi" has context —
+            // but skip the BM25/vector round-trip against "hi".
+            return (None, recent);
         }
 
         // Overfetch so split-by-kind still leaves enough in each bucket.
@@ -540,20 +736,23 @@ impl AgentRun {
                 .await
                 .unwrap_or_default()
         };
-        if hits.is_empty() {
-            return (None, None);
-        }
 
         let skills: Vec<_> = hits
             .iter()
-            .filter(|(m, _)| m.kind == "skill")
+            .filter(|(m, _)| m.kind == "skill" && m.trust_tier != "ignored")
             .take(MAX_SKILLS)
             .collect();
+        let mut skills = skills;
+        skills.sort_by(|(a, _), (b, _)| {
+            Self::trust_rank(&b.trust_tier).cmp(&Self::trust_rank(&a.trust_tier))
+        });
         let memories: Vec<_> = hits
             .iter()
-            .filter(|(m, _)| m.kind != "skill")
+            .filter(|(m, _)| m.kind != "skill" && m.trust_tier != "ignored")
             .take(MAX_MEMORIES)
             .collect();
+
+        self.last_primed_skill_ids = skills.iter().map(|(m, _)| m.id.clone()).collect();
 
         let skill_primer = if skills.is_empty() {
             None
@@ -562,22 +761,35 @@ impl AgentRun {
                 "Relevant skills you have been taught — follow them where applicable:\n\n",
             );
             for (m, _) in &skills {
-                out.push_str(&format!("• {}\n{}\n\n", m.title, m.content.trim()));
+                let prefix = match m.trust_tier.as_str() {
+                    "user" | "verified" => "",
+                    _ => "[AUTO — verify before following] ",
+                };
+                out.push_str(&format!("• {prefix}{}\n{}\n\n", m.title, m.content.trim()));
             }
             Some(out)
         };
 
-        let memory_primer = if memories.is_empty() {
-            None
-        } else {
-            let mut out = String::from(
-                "Memory recall for this turn (treat as authoritative for user-stated facts):\n\n",
-            );
-            for (m, _) in &memories {
-                let body: String = m.content.chars().take(CONTENT_CAP).collect();
-                out.push_str(&format!("• [{}] {}\n{}\n\n", m.kind, m.title, body.trim()));
+        let memory_primer = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(r) = recent {
+                parts.push(r);
             }
-            Some(out)
+            if !memories.is_empty() {
+                let mut out = String::from(
+                    "Memory recall for this turn (treat as authoritative for user-stated facts):\n\n",
+                );
+                for (m, _) in &memories {
+                    let body: String = m.content.chars().take(CONTENT_CAP).collect();
+                    out.push_str(&format!("• [{}] {}\n{}\n\n", m.kind, m.title, body.trim()));
+                }
+                parts.push(out);
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
         };
 
         (skill_primer, memory_primer)
@@ -2442,14 +2654,42 @@ pub(crate) fn is_trivial_turn(input: &str) -> bool {
 }
 
 /// Convenience for `localmind ask "<prompt>"` — single turn, non-interactive.
+/// Binds the cwd session so short-term history and auto-persist LTM notes
+/// still accumulate across repeated `llm ask` invocations in the same dir.
 pub async fn one_shot(
     cfg: Config,
     store: Store,
     prompt: &str,
     mode: Option<PermissionMode>,
 ) -> Result<()> {
-    let mut run = AgentRun::new_with_mode(Arc::new(cfg), store, mode, true, true, true)?;
+    let mut run =
+        AgentRun::new_with_mode(Arc::new(cfg.clone()), store.clone(), mode, true, true, true)?;
+    const SESSION_MAX_AGE_SECS: i64 = 7 * 86400;
+    let resume_limit = cfg.ollama.resume_messages;
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Ok((session_id, created)) = store
+        .session_get_or_create(&cwd, SESSION_MAX_AGE_SECS)
+        .await
+    {
+        run.set_session(session_id.clone());
+        if !created && resume_limit > 0 {
+            if let Ok(rows) = store.load_recent_messages(&session_id, resume_limit).await {
+                if !rows.is_empty() {
+                    let restored: Vec<_> = rows
+                        .into_iter()
+                        .map(|(role, content, tool_name, extras_json)| {
+                            AgentRun::message_from_persisted(role, content, tool_name, extras_json)
+                        })
+                        .collect();
+                    run.restore_messages(restored);
+                }
+            }
+        }
+    }
     let out = run.turn(prompt).await?;
+    run.persist_new_messages().await;
     println!("{out}");
     Ok(())
 }

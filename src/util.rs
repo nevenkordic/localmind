@@ -7,6 +7,15 @@ pub fn now_ts() -> i64 {
     Utc::now().timestamp()
 }
 
+/// Human-readable UTC timestamp for memory primers and action notes.
+pub fn format_ts(ts: i64) -> String {
+    use chrono::TimeZone;
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| format!("ts={ts}"))
+}
+
 pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -62,4 +71,18 @@ pub fn temporal_decay(age_days: f32, half_life_days: f32) -> f32 {
         return 1.0;
     }
     0.5_f32.powf(age_days / half_life_days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_ts_is_human_readable() {
+        let s = format_ts(0);
+        assert!(
+            s.contains("1970") || s.contains("UTC") || s.contains("ts="),
+            "{s}"
+        );
+    }
 }

@@ -100,7 +100,7 @@ fn default_compact_keep_tail() -> usize {
     8
 }
 fn default_resume_messages() -> usize {
-    8
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +283,25 @@ pub struct HarnessConfig {
     /// and distinct from chat_model, else chat_model.
     #[serde(default)]
     pub verify_model: String,
+    /// Explicit verifier pool for quorum. When empty, derived from
+    /// verify_model + fast_model + chat_model (distinct).
+    #[serde(default)]
+    pub verify_models: Vec<String>,
+    /// Minimum distinct verifiers required per quorum stage.
+    #[serde(default = "default_quorum_min")]
+    pub quorum_min: usize,
+    /// `majority` or `unanimous`.
+    #[serde(default = "default_quorum_policy")]
+    pub quorum_policy: String,
+    /// Review the plan with verifier quorum before act.
+    #[serde(default = "default_true")]
+    pub plan_review: bool,
+    /// Refuse quorum when fewer than `quorum_min` distinct models exist.
+    #[serde(default = "default_true")]
+    pub require_distinct_models: bool,
+    /// Optional shell command for ground-truth success (e.g. `cargo test --locked`).
+    #[serde(default)]
+    pub test_command: String,
     /// Cap on act→verify retries after a failed verification.
     #[serde(default = "default_harness_retries")]
     pub max_retries: usize,
@@ -290,6 +309,34 @@ pub struct HarnessConfig {
     /// successful harness run (and on conversation compact).
     #[serde(default = "default_true")]
     pub auto_skill: bool,
+    /// Promote auto-skills to `verified` trust after this many harness passes.
+    #[serde(default = "default_skill_promote")]
+    pub skill_promote_after: usize,
+    /// Demote skills to `ignored` (excluded from primers) after this many
+    /// harness failures while they were in context. 0 disables demotion.
+    #[serde(default = "default_skill_demote")]
+    pub skill_demote_after: usize,
+    /// Fail ground checks when act produces no tool calls.
+    #[serde(default)]
+    pub require_tool_use: bool,
+    /// Paths that must exist after act (relative or absolute).
+    #[serde(default)]
+    pub check_paths: Vec<String>,
+    /// When recent pass rate is low, bump max_retries (capped).
+    #[serde(default = "default_true")]
+    pub adaptive_retries: bool,
+}
+fn default_quorum_min() -> usize {
+    2
+}
+fn default_quorum_policy() -> String {
+    "majority".into()
+}
+fn default_skill_promote() -> usize {
+    2
+}
+fn default_skill_demote() -> usize {
+    3
 }
 fn default_harness_retries() -> usize {
     2
@@ -298,8 +345,19 @@ impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             verify_model: String::new(),
+            verify_models: Vec::new(),
+            quorum_min: 2,
+            quorum_policy: "majority".into(),
+            plan_review: true,
+            require_distinct_models: true,
+            test_command: String::new(),
             max_retries: 2,
             auto_skill: true,
+            skill_promote_after: 2,
+            skill_demote_after: 3,
+            require_tool_use: false,
+            check_paths: Vec::new(),
+            adaptive_retries: true,
         }
     }
 }

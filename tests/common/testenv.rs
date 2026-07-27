@@ -4,6 +4,10 @@
 use std::path::Path;
 
 pub fn write_config(dir: &Path, ollama_url: &str) -> std::path::PathBuf {
+    write_config_opts(dir, ollama_url, false)
+}
+
+pub fn write_config_opts(dir: &Path, ollama_url: &str, auto_persist: bool) -> std::path::PathBuf {
     let cfg_path = dir.join("config.toml");
     let db_path = dir.join("memory.db");
     let body = format!(
@@ -21,9 +25,17 @@ top_k = 4
 bm25_weight = 0.4
 vector_weight = 0.6
 temporal_half_life_days = 30.0
-auto_persist = false
+auto_persist = {auto_persist}
 expansion_variants = 0
 vector_search = false
+
+[harness]
+quorum_min = 1
+plan_review = false
+test_command = ""
+require_distinct_models = false
+require_tool_use = false
+adaptive_retries = false
 
 [tools]
 workspace_root = ""
@@ -47,6 +59,7 @@ color = false
 "#,
         ollama = ollama_url,
         db = db_path.display(),
+        auto_persist = auto_persist,
     );
     std::fs::write(&cfg_path, body).expect("write test config");
     cfg_path

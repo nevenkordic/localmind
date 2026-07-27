@@ -1,9 +1,19 @@
 name: Release
 
+# Manual only — never runs on push/PR/merge. Trigger from the Actions tab
+# (workflow_dispatch) with a version like v0.1.11 when you want a release.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to create (e.g. v0.1.11). Must start with v.'
+        required: true
+        type: string
+      draft:
+        description: 'Publish as a draft GitHub release'
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,8 +21,26 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  validate:
+    name: validate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - id: check
+        shell: bash
+        run: |
+          tag="${{ inputs.version }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "::error::version must look like v0.1.11 (got: $tag)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (draft=${{ inputs.draft }})"
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -63,8 +91,7 @@ jobs:
           path: dist/*
 
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -79,8 +106,26 @@ jobs:
       - name: list artifacts
         run: ls -la dist
 
+      - name: ensure tag exists
+        shell: bash
+        run: |
+          tag="${{ needs.validate.outputs.tag }}"
+          git fetch --tags --force
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$tag"
+            git push origin "$tag"
+            echo "Created and pushed tag $tag"
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ${{ needs.validate.outputs.tag }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          draft: ${{ inputs.draft }}

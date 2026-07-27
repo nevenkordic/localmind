@@ -253,9 +253,9 @@ async fn handle_slash(
             println!(
                 "  /model               - show current chat/vision/embed models (use `llm models` to change)"
             );
-            println!(
-                "  /skills              - list everything you've taught the agent (kind=skill)"
-            );
+            println!("  /skills              - list taught skills (id, trust tier, title)");
+            println!("  /approve <id-prefix> - promote a skill to user trust (authoritative)");
+            println!("  /ignore <id-prefix>  - hide a skill from primers (trust=ignored)");
             println!(
                 "  /forget <id-prefix>  - delete a memory by id prefix (8 chars usually enough)"
             );
@@ -353,10 +353,56 @@ async fn handle_slash(
                     println!("{} skill(s):", skills.len());
                     for s in &skills {
                         let id_short: String = s.id.chars().take(8).collect();
-                        println!("  {id_short}  [{:.2}]  {}", s.importance, s.title);
+                        println!(
+                            "  {id_short}  [{:8}]  [{:.2}]  {}",
+                            s.trust_tier, s.importance, s.title
+                        );
                     }
+                    println!("  /approve <id>  or  /ignore <id>  to change trust");
                 }
                 Err(e) => eprintln!("{e}"),
+            }
+            SlashAction::Continue
+        }
+        "approve" | "ignore" => {
+            let tier = if cmd == "approve" { "user" } else { "ignored" };
+            match parts.next() {
+                None => eprintln!("usage: /{cmd} <id-prefix>  (run /skills to see ids)"),
+                Some(prefix) if prefix.len() < 4 => {
+                    eprintln!("id-prefix too short — use at least 4 characters");
+                }
+                Some(prefix) => match agent.ctx.store.find_by_id_prefix(prefix, 5).await {
+                    Ok(matches) => match matches.len() {
+                        0 => eprintln!("no memory matches id prefix '{prefix}'"),
+                        1 => {
+                            let m = &matches[0];
+                            if m.kind != "skill" {
+                                eprintln!(
+                                    "id {} is kind={} (expected skill)",
+                                    &m.id[..8.min(m.id.len())],
+                                    m.kind
+                                );
+                            } else {
+                                match agent.ctx.store.set_trust_tier(&m.id, tier).await {
+                                    Ok(()) => println!(
+                                        "{} → {tier}  ({})",
+                                        &m.id[..8.min(m.id.len())],
+                                        m.title
+                                    ),
+                                    Err(e) => eprintln!("{e}"),
+                                }
+                            }
+                        }
+                        n => {
+                            eprintln!("ambiguous: {n} matches for '{prefix}' — be more specific");
+                            for m in matches {
+                                let id_short: String = m.id.chars().take(12).collect();
+                                eprintln!("  {id_short}  {}  ({})", m.title, m.kind);
+                            }
+                        }
+                    },
+                    Err(e) => eprintln!("{e}"),
+                },
             }
             SlashAction::Continue
         }
@@ -439,6 +485,7 @@ async fn handle_slash(
                     source: "/remember".into(),
                     tags: vec!["user".into()],
                     importance: 0.95,
+                    trust_tier: None,
                 };
                 match agent.ctx.store.insert_memory(&new).await {
                     Ok(id) => {

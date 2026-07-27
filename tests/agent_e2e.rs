@@ -365,6 +365,8 @@ async fn harness_plan_act_verify_records_skill() {
     // 3) verify_stage JSON pass
     // 4) distill_skills JSON array
     let mock = MockOllama::start(vec![
+        // plan scout (read-only gather)
+        MockReply::chat_text("No prior greeting files found; no relevant failures."),
         MockReply::chat_text("1. Write the greeting file\n2. Confirm contents"),
         MockReply::chat_text("Created hello.txt with Hello"),
         MockReply::chat_text(r#"{"pass": true, "feedback": "ok"}"#),
@@ -381,6 +383,7 @@ async fn harness_plan_act_verify_records_skill() {
         .arg(&cfg)
         .arg("run")
         .arg("write a greeting file")
+        .arg("--no-plan-review")
         .arg("--mode")
         .arg("workspace-write")
         .output()
@@ -414,5 +417,212 @@ async fn harness_plan_act_verify_records_skill() {
     assert!(
         search_out.contains("greeting") || search_out.contains("hello.txt"),
         "skill not in memory search:\n{search_out}"
+    );
+
+    // Harness outcomes must also land as searchable LTM decisions so later
+    // sessions can recall what/when/how — not only distilled skills.
+    let harness_search = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["memory", "search", "harness", "--bm25"])
+        .output()
+        .await
+        .expect("harness search");
+    assert!(harness_search.status.success());
+    let harness_out = String::from_utf8_lossy(&harness_search.stdout);
+    assert!(
+        harness_out.contains("harness") || harness_out.contains("greeting"),
+        "harness run not mirrored to LTM:\n{harness_out}"
+    );
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "stats"])
+        .output()
+        .await
+        .expect("harness stats");
+    assert!(stats.status.success());
+    let stats_out = String::from_utf8_lossy(&stats.stdout);
+    assert!(
+        stats_out.contains("runs:") && stats_out.contains("passed:"),
+        "unexpected stats:\n{stats_out}"
+    );
+
+    let hist = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "history", "-n", "5"])
+        .output()
+        .await
+        .expect("harness history");
+    assert!(hist.status.success());
+    let hist_out = String::from_utf8_lossy(&hist.stdout);
+    assert!(
+        hist_out.contains("PASS") && hist_out.contains("greeting"),
+        "history missing pass:\n{hist_out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_failure_stores_avoidance_note() {
+    // Failed verify must store a harness-fail note for future plans.
+    // max_retries defaults to 2 → plan + 3 act/verify cycles; keep replies
+    // enough for one fail then exhaust? With max_retries=2 from config and
+    // verify failing once we need: plan, act, verify(fail), act, verify(fail),
+    // act, verify(fail) = 1 + 3*2 = 7 chat replies if each act is one turn.
+    // Simpler: set test_command to a failing shell so we fail at ground
+    // checks without verify LLM calls — but testenv has test_command="".
+    // Use verify JSON fail with quorum_min=1 and enough scripted replies.
+    let mock = MockOllama::start(vec![
+        MockReply::chat_text("Scout: no prior successful runs for this task."),
+        MockReply::chat_text("1. Do the wrong thing"),
+        MockReply::chat_text("I did the wrong thing"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "missing required output"}"#),
+        MockReply::chat_text("I tried again wrongly"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "still missing required output"}"#),
+        MockReply::chat_text("third attempt still wrong"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "never fixed"}"#),
+    ])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), &mock.url);
+    let out = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("run")
+        .arg("produce the required output file")
+        .arg("--no-plan-review")
+        .arg("--mode")
+        .arg("workspace-write")
+        .output()
+        .await
+        .expect("run llm run");
+
+    assert!(
+        !out.status.success(),
+        "expected harness failure; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let search = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["memory", "search", "harness fail", "--bm25"])
+        .output()
+        .await
+        .expect("search fail note");
+    assert!(search.status.success());
+    let search_out = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search_out.contains("fail")
+            || search_out.contains("Avoid")
+            || search_out.contains("never fixed")
+            || search_out.contains("required output"),
+        "harness-fail note missing:\n{search_out}"
+    );
+
+    let hist = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "history", "--failed"])
+        .output()
+        .await
+        .expect("failed history");
+    let hist_out = String::from_utf8_lossy(&hist.stdout);
+    assert!(
+        hist_out.contains("FAIL"),
+        "failed history empty:\n{hist_out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_persist_records_turn_actions_for_next_session() {
+    // With auto_persist=true, a tool-using turn must write an LTM note of
+    // what/when/how so the next session's recent-context primer surfaces it.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mock1 = MockOllama::start(vec![
+        MockReply::chat_tool_call(
+            "search_memory",
+            serde_json::json!({"query": "deploy staging"}),
+        ),
+        MockReply::chat_text(
+            "I checked memory for the staging deploy procedure and found nothing yet.",
+        ),
+    ])
+    .await;
+    let cfg1 = common::testenv::write_config_opts(dir.path(), &mock1.url, true);
+    let out = run_ask(&cfg1, "look up how we deploy to staging").await;
+    assert!(
+        out.status.success(),
+        "session 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(mock1);
+
+    let mock2 = MockOllama::start(vec![MockReply::chat_text("ack")]).await;
+    let cfg2 = common::testenv::write_config_opts(dir.path(), &mock2.url, true);
+    let out = run_ask(&cfg2, "what did you do about staging deploy").await;
+    assert!(
+        out.status.success(),
+        "session 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let chats: Vec<_> = mock2
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/api/chat"))
+        .collect();
+    assert_eq!(chats.len(), 1);
+    assert!(
+        chats[0].body.contains("search_memory")
+            || chats[0].body.contains("auto-persist")
+            || chats[0].body.contains("How (actions)")
+            || chats[0].body.contains("Recent context"),
+        "recent-context primer missing auto-persisted actions:\n{}",
+        chats[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_context_primes_preferences_without_query_match() {
+    // Preferences must appear in the always-on recent-context primer even
+    // when the user's question wouldn't BM25-match the preference title.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mock1 = MockOllama::start(vec![MockReply::chat_text("Nice to meet you!")]).await;
+    let cfg1 = common::testenv::write_config(dir.path(), &mock1.url);
+    let out = run_ask(&cfg1, "my name is ContextPrimeUser").await;
+    assert!(
+        out.status.success(),
+        "session 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(mock1);
+
+    // "hi" is trivial — still injects recent preferences so the model
+    // already knows the user without a matching recall query.
+    let mock2 = MockOllama::start(vec![MockReply::chat_text("hello back")]).await;
+    let cfg2 = common::testenv::write_config(dir.path(), &mock2.url);
+    let out = run_ask(&cfg2, "hi").await;
+    assert!(
+        out.status.success(),
+        "session 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let chats: Vec<_> = mock2
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/api/chat"))
+        .collect();
+    assert_eq!(chats.len(), 1);
+    assert!(
+        chats[0].body.contains("ContextPrimeUser"),
+        "recent-context primer didn't surface preference on trivial turn:\n{}",
+        chats[0].body
     );
 }

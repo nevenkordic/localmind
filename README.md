@@ -83,11 +83,23 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   The verify harness (`llm run`) and conversation compaction also distill
   reusable procedures into skills so the agent does not rediscover the
   same fix next time.
+- **Short-term + long-term memory.** Conversation history is resumed per
+  working directory (STM). Compaction and `auto_persist` write turn
+  summaries / tool actions into searchable SQLite LTM with timestamps so
+  later sessions know what was done, when, and how — without the user
+  repeating themselves. Preferences and recent decisions are always primed.
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
-- **Verify harness.** `llm run "<task>"` runs plan → act → verify across
-  local models; failed verifies retry the act stage. Shared SQLite memory
-  only — no markdown memory files.
+- **Action history.** `list_recent_actions` surfaces audit-log tool calls
+  and LTM work notes (auto-persist, harness runs, compact summaries).
+- **Verify harness.** `llm run "<task>"` runs plan scout (read-only tools) →
+  plan → review → act → verify with verifier quorum, optional ground-truth
+  checks (`test_command`, `require_tool_use`, `check_paths`), adaptive
+  retries from recent pass rate, and skill promotion / demotion.
+  Failed runs store avoidance notes. Approve skills with
+  `llm skills approve` / `/approve`. Recall ranks verified/user skills
+  above failing ones. `llm harness stats` / `history` inspect learning
+  metrics. Shared SQLite memory only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
@@ -177,6 +189,12 @@ cd localmind
 llm                          # interactive REPL, resumes last session for cwd
 llm ask "fix the failing test"
 llm run "fix the failing test"  # plan → act → verify harness; records skills
+llm harness stats                # pass rate, attempts, skills from prior runs
+llm harness history              # recent harness runs (what/when)
+llm harness history --failed     # only failed runs
+llm skills list                  # taught skills + trust tiers
+llm skills approve <id>          # mark a skill authoritative (user trust)
+llm skills ignore <id>           # hide a skill from primers
 llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)
@@ -194,7 +212,7 @@ llm update                   # grab a newer release
 ```
 /help    /quit    /init    /stats    /health    /audit
 /config  /tools   /mode    /model
-/skills  /forget <id>  /remember <fact>
+/skills  /approve <id>  /ignore <id>  /forget <id>  /remember <fact>
 /recall <query>  /context
 /compact                        summarise history now (auto-fires near num_ctx)
 /new     /clear   /reset        wipe this session's history, start fresh
@@ -338,6 +356,18 @@ cargo test                 # unit + smoke + e2e
 bash scripts/preflight.sh  # full pre-ship verification
 cargo build --release      # binary at target/release/llm
 ```
+
+### Releases (manual only)
+
+The **Release** GitHub Action does **not** run on push or merge. Publish a
+build only when you want one:
+
+1. Actions → **Release** → **Run workflow**
+2. Enter a version tag like `v0.1.11` (optional: draft)
+3. The workflow builds multi-arch binaries, creates the tag if missing, and
+   attaches assets to a GitHub Release
+
+CI (`fmt` / `clippy` / `tests`) still runs on PRs and pushes to `main`.
 
 ## License
 

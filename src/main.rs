@@ -71,11 +71,30 @@ enum Command {
         /// Permission mode: read-only | workspace-write | unrestricted.
         #[arg(long)]
         mode: Option<String>,
+        /// Ground-truth shell check after act (overrides config).
+        #[arg(long)]
+        test_command: Option<String>,
+        /// Skip plan-review quorum before act.
+        #[arg(long)]
+        no_plan_review: bool,
+        /// Minimum verifier models for quorum (overrides config).
+        #[arg(long)]
+        quorum: Option<usize>,
     },
     /// Memory management.
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Inspect harness run history and learning metrics.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
+    /// List and approve/ignore taught skills.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
     },
     /// Print the effective configuration and exit.
     ConfigShow,
@@ -170,6 +189,43 @@ enum MemoryCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum HarnessCmd {
+    /// Aggregate pass/fail rates and skill counts from harness_runs.
+    Stats,
+    /// List recent harness runs (newest first).
+    History {
+        /// How many runs to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Only show failed runs.
+        #[arg(long)]
+        failed: bool,
+        /// Filter by formula name (e.g. verify).
+        #[arg(long)]
+        formula: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsCmd {
+    /// List taught skills with trust tiers.
+    List {
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Approve a skill (trust_tier → user; primed as authoritative).
+    Approve {
+        /// Full id or unique prefix (from `llm skills list`).
+        id: String,
+    },
+    /// Ignore a skill (trust_tier → ignored; hidden from primers).
+    Ignore {
+        /// Full id or unique prefix.
+        id: String,
+    },
+}
+
 fn parse_mode_flag(s: Option<&str>) -> Result<Option<tools::permissions::PermissionMode>> {
     match s {
         None => Ok(None),
@@ -261,13 +317,21 @@ async fn main() -> Result<()> {
             task,
             formula,
             mode,
+            test_command,
+            no_plan_review,
+            quorum,
         } => {
             let m = parse_mode_flag(mode.as_deref())?;
             let f = match formula {
                 Some(p) => harness::Formula::load_path(&p)?,
                 None => harness::Formula::default_verify()?,
             };
-            let out = harness::run(cfg.clone(), store.clone(), f, &task, m).await?;
+            let opts = harness::RunOptions {
+                test_command,
+                plan_review: if no_plan_review { Some(false) } else { None },
+                quorum_min: quorum,
+            };
+            let out = harness::run(cfg.clone(), store.clone(), f, &task, m, opts).await?;
             println!("{}", out.result);
             if out.passed {
                 eprintln!(
@@ -284,6 +348,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Memory { cmd } => memory_cmd(cmd, &cfg, &store).await,
+        Command::Harness { cmd } => harness_cmd(cmd, &store).await,
+        Command::Skills { cmd } => skills_cmd(cmd, &store).await,
         Command::ConfigShow => {
             println!("{}", cfg.pretty()?);
             Ok(())
@@ -552,6 +618,7 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
                     source: "cli".into(),
                     tags: vec![],
                     importance,
+                    trust_tier: None,
                 })
                 .await?;
             println!("stored {id}");
@@ -686,6 +753,129 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
             }
             println!("done — {ok} re-embedded, {failed} failed");
             Ok(())
+        }
+    }
+}
+
+async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
+    match cmd {
+        HarnessCmd::Stats => {
+            let s = store.harness_stats().await?;
+            println!("runs:            {}", s.total_runs);
+            println!("passed:          {}", s.passed);
+            println!("failed:          {}", s.failed);
+            println!("pass rate:       {:.1}%", s.pass_rate * 100.0);
+            println!("skills stored:   {}", s.skills_stored);
+            println!("avg attempts:    {:.2}", s.avg_attempts);
+            // Lightweight self-tuning hints from recent history.
+            if s.total_runs >= 3 {
+                let recent = store.list_harness_runs(10, false, None).await?;
+                let recent_pass = recent.iter().filter(|r| r.passed).count();
+                let recent_n = recent.len().max(1);
+                let recent_rate = recent_pass as f64 / recent_n as f64;
+                let recent_avg_attempts = if recent.is_empty() {
+                    0.0
+                } else {
+                    recent.iter().map(|r| r.attempts as f64).sum::<f64>() / recent.len() as f64
+                };
+                println!();
+                println!("hints (last {recent_n} runs):");
+                println!(
+                    "  recent pass rate: {:.0}%  avg attempts: {:.2}",
+                    recent_rate * 100.0,
+                    recent_avg_attempts
+                );
+                if recent_rate < 0.5 {
+                    println!(
+                        "  · pass rate is low — raise [harness].max_retries or add a test_command"
+                    );
+                    println!("  · review: llm harness history --failed && llm skills list");
+                } else if recent_avg_attempts > 1.5 {
+                    println!("  · retries are common — strengthen plan scout memory / skills");
+                } else if recent_rate >= 0.8 {
+                    println!("  · harness is healthy — keep approving solid auto-skills");
+                }
+            }
+            Ok(())
+        }
+        HarnessCmd::History {
+            limit,
+            failed,
+            formula,
+        } => {
+            let rows = store
+                .list_harness_runs(limit, failed, formula.as_deref())
+                .await?;
+            if rows.is_empty() {
+                println!("(no harness runs yet)");
+                return Ok(());
+            }
+            for r in rows {
+                let mark = if r.passed { "PASS" } else { "FAIL" };
+                println!(
+                    "[{mark}] {}  {}  attempts={} skills={} checks={}  {}",
+                    util::format_ts(r.created_at),
+                    r.formula_name,
+                    r.attempts,
+                    r.skills_stored,
+                    if r.checks_passed { "ok" } else { "fail" },
+                    util::truncate(&r.task, 80),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn skills_cmd(cmd: SkillsCmd, store: &memory::Store) -> Result<()> {
+    match cmd {
+        SkillsCmd::List { limit } => {
+            let skills = store.list_by_kind("skill", limit).await?;
+            if skills.is_empty() {
+                println!("(no skills yet)");
+                return Ok(());
+            }
+            for s in skills {
+                let id_short: String = s.id.chars().take(8).collect();
+                println!(
+                    "{id_short}  [{:8}]  [{:.2}]  {}",
+                    s.trust_tier, s.importance, s.title
+                );
+            }
+            Ok(())
+        }
+        SkillsCmd::Approve { id } => resolve_and_set_tier(store, &id, "user").await,
+        SkillsCmd::Ignore { id } => resolve_and_set_tier(store, &id, "ignored").await,
+    }
+}
+
+async fn resolve_and_set_tier(store: &memory::Store, prefix: &str, tier: &str) -> Result<()> {
+    if prefix.len() < 4 {
+        anyhow::bail!("id prefix too short — use at least 4 characters");
+    }
+    let matches = store.find_by_id_prefix(prefix, 5).await?;
+    match matches.len() {
+        0 => anyhow::bail!("no memory matches id prefix '{prefix}'"),
+        1 => {
+            let m = &matches[0];
+            if m.kind != "skill" {
+                anyhow::bail!(
+                    "id {} is kind={} (expected skill)",
+                    &m.id[..8.min(m.id.len())],
+                    m.kind
+                );
+            }
+            store.set_trust_tier(&m.id, tier).await?;
+            println!("{} → {}  ({})", &m.id[..8.min(m.id.len())], tier, m.title);
+            Ok(())
+        }
+        n => {
+            eprintln!("ambiguous: {n} matches for '{prefix}' — be more specific");
+            for m in matches {
+                let id_short: String = m.id.chars().take(12).collect();
+                eprintln!("  {id_short}  [{}]  {}", m.kind, m.title);
+            }
+            anyhow::bail!("ambiguous id prefix");
         }
     }
 }

@@ -252,3 +252,130 @@ fn memory_dedup_via_content_hash() {
         "expected dedup, got {count} memories\nfull output:\n{stdout}"
     );
 }
+
+#[test]
+fn memory_near_dedup_collapses_whitespace_variants() {
+    // Normalized content_hash should treat whitespace-only differences as
+    // the same memory.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+
+    let out1 = run(
+        &cfg,
+        &[
+            "memory",
+            "add",
+            "-t",
+            "ws-a",
+            "--kind",
+            "note",
+            "hello   world\n\nfrom near-dedup",
+        ],
+    );
+    assert!(out1.status.success());
+    let out2 = run(
+        &cfg,
+        &[
+            "memory",
+            "add",
+            "-t",
+            "ws-b",
+            "--kind",
+            "note",
+            "hello world from near-dedup",
+        ],
+    );
+    assert!(out2.status.success());
+
+    let out = run(&cfg, &["memory", "stats"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let count: i64 = stdout
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("memories:")
+                .map(|s| s.trim().parse().unwrap_or(-1))
+        })
+        .unwrap_or(-1);
+    assert_eq!(count, 1, "whitespace variants should collapse\n{stdout}");
+}
+
+#[test]
+fn harness_stats_on_fresh_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+    let out = run(&cfg, &["harness", "stats"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("runs:"), "{stdout}");
+    assert!(stdout.contains("pass rate:"), "{stdout}");
+}
+
+#[test]
+fn harness_history_empty_on_fresh_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+    let out = run(&cfg, &["harness", "history"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no harness runs"), "unexpected: {stdout}");
+}
+
+#[test]
+fn skills_list_approve_ignore_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), "http://127.0.0.1:1");
+
+    let add = run(
+        &cfg,
+        &[
+            "memory",
+            "add",
+            "-t",
+            "when deploying staging",
+            "--kind",
+            "skill",
+            "always run kubectl rollout status first",
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let list = run(&cfg, &["skills", "list"]);
+    assert!(list.status.success());
+    let list_out = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list_out.contains("deploying staging") || list_out.contains("kubectl"),
+        "{list_out}"
+    );
+    let id_prefix = list_out
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .expect("skill id");
+    assert!(id_prefix.len() >= 4);
+
+    let approve = run(&cfg, &["skills", "approve", id_prefix]);
+    assert!(
+        approve.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&approve.stderr)
+    );
+    let approve_out = String::from_utf8_lossy(&approve.stdout);
+    assert!(approve_out.contains("user"), "{approve_out}");
+
+    let list2 = run(&cfg, &["skills", "list"]);
+    let list2_out = String::from_utf8_lossy(&list2.stdout);
+    assert!(list2_out.contains("user"), "{list2_out}");
+
+    let ignore = run(&cfg, &["skills", "ignore", id_prefix]);
+    assert!(ignore.status.success());
+    let ignore_out = String::from_utf8_lossy(&ignore.stdout);
+    assert!(ignore_out.contains("ignored"), "{ignore_out}");
+}
