@@ -89,7 +89,10 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   later sessions know what was done, when, and how — without the user
   repeating themselves. Preferences, the current project profile, and
   same-cwd work history are always primed; recall boosts memories from the
-  current repository / working directory above unrelated projects.
+  current repository / working directory above unrelated projects. Query
+  intent also steers ranking — procedural turns prefer skills, decision
+  turns prefer the ledger, failure talk surfaces harness-fail notes, and
+  project questions prefer `/init` profiles.
 - **Decisions ledger.** Structured append-only log of choices
   (`log_decision` / `list_decisions`) mirrored into searchable memory.
 - **Action history.** `list_recent_actions` surfaces audit-log tool calls
@@ -100,8 +103,9 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   retries from recent pass rate, and skill promotion / demotion.
   Failed runs store avoidance notes. Approve skills with
   `llm skills approve` / `/approve`. Recall ranks verified/user skills
-  above failing ones. `llm harness stats` / `history` inspect learning
-  metrics. Shared SQLite memory only — no markdown memory files.
+  above failing ones. Each run records which skills were primed, credited,
+  or distilled; `llm harness stats` shows top credited skills.
+  Shared SQLite memory only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.

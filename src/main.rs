@@ -768,6 +768,25 @@ async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
             println!("pass rate:       {:.1}%", s.pass_rate * 100.0);
             println!("skills stored:   {}", s.skills_stored);
             println!("avg attempts:    {:.2}", s.avg_attempts);
+            let top = store.top_harness_skills(5).await.unwrap_or_default();
+            if !top.is_empty() {
+                println!();
+                println!("top credited skills:");
+                for sk in top {
+                    let rate = if sk.credited_runs > 0 {
+                        sk.passed_runs as f64 / sk.credited_runs as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  · {}  uses={} pass={:.0}%  ({})",
+                        util::truncate(&sk.title, 48),
+                        sk.credited_runs,
+                        rate * 100.0,
+                        util::truncate(&sk.skill_id, 8),
+                    );
+                }
+            }
             // Lightweight self-tuning hints from recent history.
             if s.total_runs >= 3 {
                 let recent = store.list_harness_runs(10, false, None).await?;

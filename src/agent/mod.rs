@@ -743,12 +743,15 @@ impl AgentRun {
             .map(|hits| hits.into_iter().map(|h| (h.memory, h.score)).collect())
             .unwrap_or_default()
         } else {
-            // Pure BM25 — no Ollama round-trip.
-            self.ctx
+            // Pure BM25 — no Ollama round-trip. Still apply trust/cwd/intent
+            // rescoring so ranking matches the hybrid path.
+            let raw = self
+                .ctx
                 .store
                 .bm25_search(user_input, fetch)
                 .await
-                .unwrap_or_default()
+                .unwrap_or_default();
+            crate::memory::search::rescore_bm25_hits(raw, user_input)
         };
 
         let skills: Vec<_> = hits

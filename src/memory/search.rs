@@ -130,10 +130,12 @@ pub async fn hybrid_search(
     }
 
     // 3. Convert accumulators to final Hits. Apply temporal decay,
-    //    importance, and trust/outcome boosts on top of the RRF score.
-    //    Ignored memories are dropped so demoted skills never resurface.
+    //    importance, trust/outcome, cwd scope, and query-intent boosts
+    //    on top of the RRF score. Ignored memories are dropped so
+    //    demoted skills never resurface.
     let now = util::now_ts();
     let current_cwd = Store::current_scope_key();
+    let intent = detect_query_intent(query);
     let half_life = cfg.memory.temporal_half_life_days.max(1.0);
     let mut hits: Vec<Hit> = by_id
         .into_values()
@@ -150,7 +152,8 @@ pub async fn hybrid_search(
             } else {
                 0.9
             };
-            let score = a.rrf * (0.7 + 0.3 * imp) * decay * boost * scope_boost;
+            let intent_mult = intent_boost(&a.memory, intent);
+            let score = a.rrf * (0.7 + 0.3 * imp) * decay * boost * scope_boost * intent_mult;
             Hit {
                 memory: a.memory,
                 score,
@@ -474,6 +477,133 @@ pub(crate) fn trust_outcome_boost(m: &StoredMemory) -> f32 {
     tier * outcome
 }
 
+/// Coarse intent flags inferred from the recall query. Multiple flags may
+/// fire on one query (e.g. "how should we fix the failing deploy?").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryIntent {
+    /// How-to / implement / fix → prefer skills.
+    pub procedural: bool,
+    /// Choose / prefer / decide → prefer decisions.
+    pub decision: bool,
+    /// Fail / avoid / error → prefer harness-fail notes.
+    pub avoidance: bool,
+    /// Project / repo / codebase → prefer project profiles.
+    pub project: bool,
+}
+
+/// Keyword heuristic for turn intent. Cheap and deterministic — no LLM.
+pub fn detect_query_intent(query: &str) -> QueryIntent {
+    let q = query.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| q.contains(w));
+
+    QueryIntent {
+        procedural: has(&[
+            "how to",
+            "how do",
+            "fix ",
+            "implement",
+            "write ",
+            "add ",
+            "build ",
+            "run ",
+            "deploy",
+            "debug",
+            "refactor",
+            "patch",
+            "when ",
+            "from now on",
+            "procedure",
+            "steps",
+        ]),
+        decision: has(&[
+            "should we",
+            "should i",
+            "decide",
+            "decision",
+            "choose",
+            "prefer",
+            "preference",
+            "why did we",
+            "approach",
+            "tradeoff",
+            "trade-off",
+            "instead of",
+        ]),
+        avoidance: has(&[
+            "failed",
+            "failure",
+            "avoid",
+            "error",
+            "broke",
+            "broken",
+            "don't",
+            "do not",
+            "wrong",
+            "regression",
+            "flaky",
+            "timeout",
+            "crash",
+        ]),
+        project: has(&[
+            "this project",
+            "this repo",
+            "codebase",
+            "repository",
+            "project profile",
+            "how is this structured",
+            "entry point",
+            "build command",
+            "test command",
+        ]),
+    }
+}
+
+/// Intent × memory-kind/source multiplier. Neutral (1.0) when no flags
+/// match; mild boosts when the query looks like it wants that kind.
+pub(crate) fn intent_boost(m: &StoredMemory, intent: QueryIntent) -> f32 {
+    let mut mult = 1.0f32;
+    if intent.procedural && m.kind == "skill" {
+        mult *= 1.3;
+    }
+    if intent.decision && (m.kind == "decision" || m.source == "decision-ledger") {
+        mult *= 1.25;
+    }
+    if intent.avoidance
+        && (m.source == "harness-fail" || m.tags.iter().any(|t| t == "fail" || t == "avoidance"))
+    {
+        mult *= 1.35;
+    }
+    if intent.project && m.kind == "project" {
+        mult *= 1.3;
+    }
+    mult
+}
+
+/// Re-rank BM25-only hit lists with the same trust/cwd/intent multipliers
+/// used by hybrid_search, so the non-vector recall path stays consistent.
+pub fn rescore_bm25_hits(hits: Vec<(StoredMemory, f32)>, query: &str) -> Vec<(StoredMemory, f32)> {
+    let intent = detect_query_intent(query);
+    let current_cwd = Store::current_scope_key();
+    let mut rescored: Vec<(StoredMemory, f32)> = hits
+        .into_iter()
+        .filter(|(m, _)| m.trust_tier != "ignored")
+        .map(|(m, raw)| {
+            let boost = trust_outcome_boost(&m);
+            let scope = if !current_cwd.is_empty() && m.cwd == current_cwd {
+                1.25
+            } else if m.cwd.is_empty() {
+                1.0
+            } else {
+                0.9
+            };
+            let score = raw * boost * scope * intent_boost(&m, intent);
+            (m, score)
+        })
+        .collect();
+    rescored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    rescored
+}
+
 /// Collapse entity-level PPR scores onto the memories they came from.
 /// An entity that appears in multiple memories contributes its score to
 /// each of them — the "graph cue → documents" fan-out step.
@@ -553,6 +683,65 @@ mod tests {
             "failures should sink ranking"
         );
         assert_eq!(trust_outcome_boost(&ignored), 0.0);
+    }
+
+    #[test]
+    fn detect_query_intent_flags_procedural_and_avoidance() {
+        let how = detect_query_intent("how to implement the deploy script");
+        assert!(how.procedural);
+        assert!(!how.avoidance);
+
+        let avoid = detect_query_intent("the last deploy failed with a timeout error");
+        assert!(avoid.avoidance);
+
+        let decide = detect_query_intent("should we choose postgres instead of sqlite?");
+        assert!(decide.decision);
+
+        let proj = detect_query_intent("what is the build command for this project?");
+        assert!(proj.project);
+    }
+
+    #[test]
+    fn intent_boost_prefers_matching_kinds() {
+        let mut skill = mem("s", 1.0, 0);
+        skill.kind = "skill".into();
+        let mut decision = mem("d", 1.0, 0);
+        decision.kind = "decision".into();
+        let mut fail = mem("f", 1.0, 0);
+        fail.source = "harness-fail".into();
+        fail.tags = vec!["fail".into()];
+        let note = mem("n", 1.0, 0);
+
+        let procedural = QueryIntent {
+            procedural: true,
+            ..Default::default()
+        };
+        assert!(intent_boost(&skill, procedural) > intent_boost(&note, procedural));
+
+        let decision_intent = QueryIntent {
+            decision: true,
+            ..Default::default()
+        };
+        assert!(intent_boost(&decision, decision_intent) > intent_boost(&note, decision_intent));
+
+        let avoid = QueryIntent {
+            avoidance: true,
+            ..Default::default()
+        };
+        assert!(intent_boost(&fail, avoid) > intent_boost(&note, avoid));
+    }
+
+    #[test]
+    fn rescore_bm25_hits_boosts_skills_on_procedural_query() {
+        let mut skill = mem("skill-1", 0.8, 0);
+        skill.kind = "skill".into();
+        let mut note = mem("note-1", 0.8, 0);
+        note.kind = "note".into();
+        // Raw BM25 ranks the note higher; intent should flip skill above.
+        let hits = vec![(note, 10.0f32), (skill, 9.0f32)];
+        let ranked = rescore_bm25_hits(hits, "how to implement the deploy fix");
+        assert_eq!(ranked[0].0.kind, "skill");
+        assert!(ranked[0].1 > ranked[1].1);
     }
 
     #[test]
