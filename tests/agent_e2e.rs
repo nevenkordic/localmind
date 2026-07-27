@@ -432,6 +432,106 @@ async fn harness_plan_act_verify_records_skill() {
         harness_out.contains("harness") || harness_out.contains("greeting"),
         "harness run not mirrored to LTM:\n{harness_out}"
     );
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "stats"])
+        .output()
+        .await
+        .expect("harness stats");
+    assert!(stats.status.success());
+    let stats_out = String::from_utf8_lossy(&stats.stdout);
+    assert!(
+        stats_out.contains("runs:") && stats_out.contains("passed:"),
+        "unexpected stats:\n{stats_out}"
+    );
+
+    let hist = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "history", "-n", "5"])
+        .output()
+        .await
+        .expect("harness history");
+    assert!(hist.status.success());
+    let hist_out = String::from_utf8_lossy(&hist.stdout);
+    assert!(
+        hist_out.contains("PASS") && hist_out.contains("greeting"),
+        "history missing pass:\n{hist_out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_failure_stores_avoidance_note() {
+    // Failed verify must store a harness-fail note for future plans.
+    // max_retries defaults to 2 → plan + 3 act/verify cycles; keep replies
+    // enough for one fail then exhaust? With max_retries=2 from config and
+    // verify failing once we need: plan, act, verify(fail), act, verify(fail),
+    // act, verify(fail) = 1 + 3*2 = 7 chat replies if each act is one turn.
+    // Simpler: set test_command to a failing shell so we fail at ground
+    // checks without verify LLM calls — but testenv has test_command="".
+    // Use verify JSON fail with quorum_min=1 and enough scripted replies.
+    let mock = MockOllama::start(vec![
+        MockReply::chat_text("1. Do the wrong thing"),
+        MockReply::chat_text("I did the wrong thing"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "missing required output"}"#),
+        MockReply::chat_text("I tried again wrongly"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "still missing required output"}"#),
+        MockReply::chat_text("third attempt still wrong"),
+        MockReply::chat_text(r#"{"pass": false, "feedback": "never fixed"}"#),
+    ])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::testenv::write_config(dir.path(), &mock.url);
+    let out = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("run")
+        .arg("produce the required output file")
+        .arg("--no-plan-review")
+        .arg("--mode")
+        .arg("workspace-write")
+        .output()
+        .await
+        .expect("run llm run");
+
+    assert!(
+        !out.status.success(),
+        "expected harness failure; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let search = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["memory", "search", "harness fail", "--bm25"])
+        .output()
+        .await
+        .expect("search fail note");
+    assert!(search.status.success());
+    let search_out = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search_out.contains("fail")
+            || search_out.contains("Avoid")
+            || search_out.contains("never fixed")
+            || search_out.contains("required output"),
+        "harness-fail note missing:\n{search_out}"
+    );
+
+    let hist = Command::new(env!("CARGO_BIN_EXE_llm"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["harness", "history", "--failed"])
+        .output()
+        .await
+        .expect("failed history");
+    let hist_out = String::from_utf8_lossy(&hist.stdout);
+    assert!(
+        hist_out.contains("FAIL"),
+        "failed history empty:\n{hist_out}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

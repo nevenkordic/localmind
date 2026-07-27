@@ -29,11 +29,18 @@ pub struct NewMemory {
 pub fn infer_trust_tier(source: &str) -> &'static str {
     match source {
         "user" | "/remember" | "auto-extract" => "user",
-        "harness-distill" | "compact-distill" | "decision-ledger" | "harness" | "auto-persist" => {
-            "auto"
-        }
+        "harness-distill" | "compact-distill" | "decision-ledger" | "harness" | "harness-fail"
+        | "auto-persist" => "auto",
         _ => "auto",
     }
+}
+
+/// Collapse whitespace / lowercase for content hashing and skill title match.
+pub fn normalize_for_dedup(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 const MEMORY_COLS: &str = "id, kind, title, content, source, tags_json, importance, \
@@ -213,7 +220,9 @@ impl Store {
     pub async fn insert_memory(&self, new: &NewMemory) -> Result<String> {
         let id = util::new_uuid();
         let now = util::now_ts();
-        let hash = util::sha256_hex(&new.content);
+        // Normalize whitespace/case so near-duplicate skill/note bodies
+        // collapse onto the same content_hash instead of accumulating.
+        let hash = util::sha256_hex(&normalize_for_dedup(&new.content));
         let tags_json = serde_json::to_string(&new.tags).unwrap_or_else(|_| "[]".into());
         let inner = self.inner.clone();
         let id_out = id.clone();
@@ -227,10 +236,31 @@ impl Store {
             .clone()
             .unwrap_or_else(|| infer_trust_tier(&source).to_string());
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        // Skills: skip insert when a recent skill shares the same normalized
+        // title (near-dup that content_hash alone would miss).
+        if kind == "skill" {
+            if let Ok(Some(existing)) = self.find_similar_skill(&title, 30).await {
+                let inner = self.inner.clone();
+                let existing_id = existing.id.clone();
+                let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = inner.lock().unwrap();
+                    conn.execute(
+                        r#"UPDATE memories
+                           SET accessed_at = ?1, access_count = access_count + 1
+                           WHERE id = ?2"#,
+                        params![util::now_ts(), existing_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+                return Ok(existing.id);
+            }
+        }
+
+        let existing_id = tokio::task::spawn_blocking(move || -> Result<String> {
             let conn = inner.lock().unwrap();
             // INSERT OR IGNORE on content_hash dedup — if the exact same
-            // content was stored before, we just update accessed_at instead.
+            // (normalized) content was stored before, we just update accessed_at.
             let changed = conn.execute(
                 r#"INSERT OR IGNORE INTO memories
                    (id, kind, title, content, source, tags_json, importance,
@@ -243,25 +273,51 @@ impl Store {
                 ],
             )?;
             if changed == 0 {
-                // Duplicate content — update access stats on the existing row.
+                // Duplicate content — bump access and return the existing id
+                // so callers (skill outcome tracking) attribute correctly.
                 conn.execute(
                     r#"UPDATE memories
                        SET accessed_at = ?1, access_count = access_count + 1
                        WHERE content_hash = ?2"#,
                     params![now, hash],
                 )?;
+                let existing: String = conn.query_row(
+                    "SELECT id FROM memories WHERE content_hash = ?1 LIMIT 1",
+                    params![hash],
+                    |row| row.get(0),
+                )?;
+                Ok(existing)
             } else {
-                // Enqueue for embedding worker.
                 conn.execute(
                     r#"INSERT INTO embedding_outbox (memory_id, status, enqueued_at, updated_at)
                        VALUES (?1, 'pending', ?2, ?2)"#,
                     params![id_out, now],
                 )?;
+                Ok(id_out)
             }
-            Ok(())
         })
         .await??;
-        Ok(id)
+        Ok(existing_id)
+    }
+
+    /// Find a skill whose normalized title matches `title`, created within
+    /// the last `within_days`. Used to avoid near-duplicate skill rows.
+    pub async fn find_similar_skill(
+        &self,
+        title: &str,
+        within_days: i64,
+    ) -> Result<Option<StoredMemory>> {
+        let needle = normalize_for_dedup(title);
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let since = util::now_ts() - within_days.max(1) * 86400;
+        let candidates = self.list_by_kind("skill", 40).await?;
+        Ok(candidates.into_iter().find(|m| {
+            m.created_at >= since
+                && m.trust_tier != "ignored"
+                && normalize_for_dedup(&m.title) == needle
+        }))
     }
 
     /// Batch-fetch memories by id. Order of the returned vec is NOT
@@ -387,7 +443,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 r#"SELECT {MEMORY_COLS}
                    FROM memories
-                   WHERE source IN ('auto-persist', 'harness', 'compact', 'decision-ledger')
+                   WHERE source IN ('auto-persist', 'harness', 'harness-fail', 'compact', 'decision-ledger')
                       OR kind = 'decision'
                    ORDER BY created_at DESC
                    LIMIT ?1"#
@@ -963,22 +1019,26 @@ impl Store {
         Ok(())
     }
 
-    /// Bump skill outcome counters; promote to `verified` after enough successes.
+    /// Bump skill outcome counters; promote to `verified` after enough
+    /// successes, or demote to `ignored` after enough failures.
     pub async fn record_skill_outcome(
         &self,
         memory_id: &str,
         passed: bool,
         promote_after: usize,
+        demote_after: usize,
     ) -> Result<()> {
         let inner = self.inner.clone();
         let memory_id = memory_id.to_string();
         let promote_after = promote_after.max(1) as i64;
+        let demote_after = demote_after as i64;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = inner.lock().unwrap();
+            let now = util::now_ts();
             if passed {
                 conn.execute(
                     "UPDATE memories SET success_count = success_count + 1, updated_at = ?1 WHERE id = ?2",
-                    params![util::now_ts(), memory_id],
+                    params![now, memory_id],
                 )?;
                 conn.execute(
                     r#"UPDATE memories
@@ -986,19 +1046,167 @@ impl Store {
                            importance = CASE WHEN importance < 0.9 THEN 0.9 ELSE importance END,
                            updated_at = ?1
                        WHERE id = ?2 AND success_count >= ?3 AND trust_tier = 'auto'"#,
-                    params![util::now_ts(), memory_id, promote_after],
+                    params![now, memory_id, promote_after],
                 )?;
             } else {
                 conn.execute(
                     "UPDATE memories SET fail_count = fail_count + 1, updated_at = ?1 WHERE id = ?2",
-                    params![util::now_ts(), memory_id],
+                    params![now, memory_id],
                 )?;
+                if demote_after > 0 {
+                    conn.execute(
+                        r#"UPDATE memories
+                           SET trust_tier = 'ignored',
+                               importance = CASE WHEN importance > 0.2 THEN 0.2 ELSE importance END,
+                               updated_at = ?1
+                           WHERE id = ?2
+                             AND fail_count >= ?3
+                             AND trust_tier IN ('auto', 'verified')"#,
+                        params![now, memory_id, demote_after],
+                    )?;
+                }
             }
             Ok(())
         })
         .await??;
         Ok(())
     }
+
+    /// Aggregate harness run metrics for `llm harness stats`.
+    pub async fn harness_stats(&self) -> Result<HarnessStats> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> Result<HarnessStats> {
+            let conn = inner.lock().unwrap();
+            let total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM harness_runs", [], |r| r.get(0))
+                .unwrap_or(0);
+            let passed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_runs WHERE passed = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let failed = total - passed;
+            let skills_stored: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(skills_stored), 0) FROM harness_runs",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let avg_attempts: f64 = if total > 0 {
+                conn.query_row("SELECT AVG(attempts) FROM harness_runs", [], |r| {
+                    r.get::<_, f64>(0)
+                })
+                .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            Ok(HarnessStats {
+                total_runs: total,
+                passed,
+                failed,
+                pass_rate: if total > 0 {
+                    passed as f64 / total as f64
+                } else {
+                    0.0
+                },
+                skills_stored,
+                avg_attempts,
+            })
+        })
+        .await?
+    }
+
+    /// Recent harness runs, newest first. Optional filters.
+    pub async fn list_harness_runs(
+        &self,
+        limit: usize,
+        failed_only: bool,
+        formula: Option<&str>,
+    ) -> Result<Vec<StoredHarnessRun>> {
+        let inner = self.inner.clone();
+        let limit = limit.max(1) as i64;
+        let formula = formula.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredHarnessRun>> {
+            let conn = inner.lock().unwrap();
+            let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<StoredHarnessRun> {
+                Ok(StoredHarnessRun {
+                    id: row.get(0)?,
+                    formula_name: row.get(1)?,
+                    task: row.get(2)?,
+                    plan: row.get(3)?,
+                    result: row.get(4)?,
+                    passed: row.get::<_, i32>(5)? != 0,
+                    attempts: row.get(6)?,
+                    checks_passed: row.get::<_, i32>(7)? != 0,
+                    checks_json: row.get(8)?,
+                    skills_stored: row.get(9)?,
+                    decision_id: row.get(10)?,
+                    created_at: row.get(11)?,
+                })
+            };
+            const COLS: &str = r#"id, formula_name, task, plan, result, passed, attempts,
+                checks_passed, checks_json, skills_stored, decision_id, created_at"#;
+            let sql = match (failed_only, formula.is_some()) {
+                (true, true) => format!(
+                    "SELECT {COLS} FROM harness_runs WHERE passed = 0 AND formula_name = ?1 \
+                     ORDER BY created_at DESC LIMIT ?2"
+                ),
+                (true, false) => format!(
+                    "SELECT {COLS} FROM harness_runs WHERE passed = 0 \
+                     ORDER BY created_at DESC LIMIT ?1"
+                ),
+                (false, true) => format!(
+                    "SELECT {COLS} FROM harness_runs WHERE formula_name = ?1 \
+                     ORDER BY created_at DESC LIMIT ?2"
+                ),
+                (false, false) => {
+                    format!("SELECT {COLS} FROM harness_runs ORDER BY created_at DESC LIMIT ?1")
+                }
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = match formula {
+                Some(f) => stmt.query_map(params![f, limit], map_row)?,
+                None => stmt.query_map(params![limit], map_row)?,
+            };
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+}
+
+/// Aggregate counters for `llm harness stats`.
+#[derive(Debug, Clone, Default)]
+pub struct HarnessStats {
+    pub total_runs: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub pass_rate: f64,
+    pub skills_stored: i64,
+    pub avg_attempts: f64,
+}
+
+/// One row from `harness_runs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredHarnessRun {
+    pub id: String,
+    pub formula_name: String,
+    pub task: String,
+    pub plan: String,
+    pub result: String,
+    pub passed: bool,
+    pub attempts: i64,
+    pub checks_passed: bool,
+    pub checks_json: String,
+    pub skills_stored: i64,
+    pub decision_id: Option<String>,
+    pub created_at: i64,
 }
 
 /// One row from the append-only decisions ledger.

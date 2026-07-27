@@ -94,8 +94,10 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   and LTM work notes (auto-persist, harness runs, compact summaries).
 - **Verify harness.** `llm run "<task>"` runs plan → review → act → verify with
   verifier quorum, optional ground-truth checks (`test_command`), and skill
-  promotion (`auto` → `verified` after repeated successes). Shared SQLite
-  memory only — no markdown memory files.
+  promotion (`auto` → `verified`) / demotion (`ignored` after repeated
+  failures). Failed runs store avoidance notes. `llm harness stats` /
+  `history` inspect learning metrics. Shared SQLite memory only — no
+  markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
@@ -185,6 +187,9 @@ cd localmind
 llm                          # interactive REPL, resumes last session for cwd
 llm ask "fix the failing test"
 llm run "fix the failing test"  # plan → act → verify harness; records skills
+llm harness stats                # pass rate, attempts, skills from prior runs
+llm harness history              # recent harness runs (what/when)
+llm harness history --failed     # only failed runs
 llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)

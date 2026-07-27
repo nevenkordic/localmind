@@ -545,6 +545,7 @@ impl AgentRun {
         match tier {
             "user" => 3,
             "verified" => 2,
+            "ignored" => 0,
             _ => 1,
         }
     }
@@ -726,7 +727,7 @@ impl AgentRun {
 
         let skills: Vec<_> = hits
             .iter()
-            .filter(|(m, _)| m.kind == "skill")
+            .filter(|(m, _)| m.kind == "skill" && m.trust_tier != "ignored")
             .take(MAX_SKILLS)
             .collect();
         let mut skills = skills;
@@ -735,7 +736,7 @@ impl AgentRun {
         });
         let memories: Vec<_> = hits
             .iter()
-            .filter(|(m, _)| m.kind != "skill")
+            .filter(|(m, _)| m.kind != "skill" && m.trust_tier != "ignored")
             .take(MAX_MEMORIES)
             .collect();
 

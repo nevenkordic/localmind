@@ -86,6 +86,11 @@ enum Command {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Inspect harness run history and learning metrics.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
     /// Print the effective configuration and exit.
     ConfigShow,
     /// Initialise the memory database and verify connectivity.
@@ -176,6 +181,24 @@ enum MemoryCmd {
         /// the flow before committing to a full re-embed on a large db.
         #[arg(long)]
         limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HarnessCmd {
+    /// Aggregate pass/fail rates and skill counts from harness_runs.
+    Stats,
+    /// List recent harness runs (newest first).
+    History {
+        /// How many runs to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Only show failed runs.
+        #[arg(long)]
+        failed: bool,
+        /// Filter by formula name (e.g. verify).
+        #[arg(long)]
+        formula: Option<String>,
     },
 }
 
@@ -301,6 +324,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Memory { cmd } => memory_cmd(cmd, &cfg, &store).await,
+        Command::Harness { cmd } => harness_cmd(cmd, &store).await,
         Command::ConfigShow => {
             println!("{}", cfg.pretty()?);
             Ok(())
@@ -703,6 +727,47 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
                 }
             }
             println!("done — {ok} re-embedded, {failed} failed");
+            Ok(())
+        }
+    }
+}
+
+async fn harness_cmd(cmd: HarnessCmd, store: &memory::Store) -> Result<()> {
+    match cmd {
+        HarnessCmd::Stats => {
+            let s = store.harness_stats().await?;
+            println!("runs:            {}", s.total_runs);
+            println!("passed:          {}", s.passed);
+            println!("failed:          {}", s.failed);
+            println!("pass rate:       {:.1}%", s.pass_rate * 100.0);
+            println!("skills stored:   {}", s.skills_stored);
+            println!("avg attempts:    {:.2}", s.avg_attempts);
+            Ok(())
+        }
+        HarnessCmd::History {
+            limit,
+            failed,
+            formula,
+        } => {
+            let rows = store
+                .list_harness_runs(limit, failed, formula.as_deref())
+                .await?;
+            if rows.is_empty() {
+                println!("(no harness runs yet)");
+                return Ok(());
+            }
+            for r in rows {
+                let mark = if r.passed { "PASS" } else { "FAIL" };
+                println!(
+                    "[{mark}] {}  {}  attempts={} skills={} checks={}  {}",
+                    util::format_ts(r.created_at),
+                    r.formula_name,
+                    r.attempts,
+                    r.skills_stored,
+                    if r.checks_passed { "ok" } else { "fail" },
+                    util::truncate(&r.task, 80),
+                );
+            }
             Ok(())
         }
     }
