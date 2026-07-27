@@ -80,18 +80,12 @@ pub async fn log_decision(ctx: &ToolContext, args: &Value) -> Result<String> {
         .get("decision")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing decision"))?;
-    let reasoning = args
-        .get("reasoning")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let reasoning = args.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
     let alternatives = args
         .get("alternatives")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let outcome = args
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let outcome = args.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
     let id = ctx
         .store
         .insert_decision(decision, reasoning, alternatives, outcome, "agent")

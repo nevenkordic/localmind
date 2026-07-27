@@ -165,11 +165,8 @@ pub async fn hybrid_search(
         // we fall through to the RRF ordering.
         if let Ok(scores) = llm_rerank_scores(ollama, &cfg.memory.rerank_model, query, &hits).await
         {
-            let mut indexed: Vec<(usize, f32)> =
-                scores.into_iter().enumerate().collect();
-            indexed.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let mut reordered: Vec<Hit> = Vec::with_capacity(hits.len());
             let mut taken = hits.into_iter().map(Some).collect::<Vec<_>>();
             for (idx, s) in indexed {
@@ -436,14 +433,12 @@ fn personalized_pagerank(
             }
             if let Some(edges) = snap.outgoing.get(node) {
                 for (dst, w) in edges {
-                    *next.entry(dst.clone()).or_insert(0.0) +=
-                        damping * score * w / total;
+                    *next.entry(dst.clone()).or_insert(0.0) += damping * score * w / total;
                 }
             }
             if let Some(edges) = snap.incoming.get(node) {
                 for (src, w) in edges {
-                    *next.entry(src.clone()).or_insert(0.0) +=
-                        damping * score * w / total;
+                    *next.entry(src.clone()).or_insert(0.0) += damping * score * w / total;
                 }
             }
         }
@@ -512,7 +507,10 @@ mod tests {
         let a = map.get("a").unwrap().rrf;
         let b = map.get("b").unwrap().rrf;
         let c = map.get("c").unwrap().rrf;
-        assert!(a > b && b > c, "rank 0 should outrank rank 1 should outrank rank 2");
+        assert!(
+            a > b && b > c,
+            "rank 0 should outrank rank 1 should outrank rank 2"
+        );
         assert!((a - 1.0 / (RRF_K + 0.0)).abs() < 1e-6);
     }
 
@@ -520,25 +518,67 @@ mod tests {
     fn rrf_rewards_cross_retriever_overlap() {
         let mut map = HashMap::new();
         // `a` appears at rank 0 in both retrievers.
-        accumulate(&mut map, mem("a", 1.0, 0), 0, RetrieverKind::Bm25, Some(1.0));
-        accumulate(&mut map, mem("a", 1.0, 0), 0, RetrieverKind::Vector, Some(1.0));
+        accumulate(
+            &mut map,
+            mem("a", 1.0, 0),
+            0,
+            RetrieverKind::Bm25,
+            Some(1.0),
+        );
+        accumulate(
+            &mut map,
+            mem("a", 1.0, 0),
+            0,
+            RetrieverKind::Vector,
+            Some(1.0),
+        );
         // `b` appears only in bm25 at rank 0.
-        accumulate(&mut map, mem("b", 1.0, 0), 0, RetrieverKind::Bm25, Some(1.0));
+        accumulate(
+            &mut map,
+            mem("b", 1.0, 0),
+            0,
+            RetrieverKind::Bm25,
+            Some(1.0),
+        );
         // `c` appears only in vector at rank 0.
-        accumulate(&mut map, mem("c", 1.0, 0), 0, RetrieverKind::Vector, Some(1.0));
+        accumulate(
+            &mut map,
+            mem("c", 1.0, 0),
+            0,
+            RetrieverKind::Vector,
+            Some(1.0),
+        );
 
         let a = map.get("a").unwrap().rrf;
         let b = map.get("b").unwrap().rrf;
         let c = map.get("c").unwrap().rrf;
-        assert!(a > b && a > c, "cross-retriever hit should rank above single-retriever hits");
-        assert!((b - c).abs() < 1e-6, "single-retriever hits at same rank should tie");
+        assert!(
+            a > b && a > c,
+            "cross-retriever hit should rank above single-retriever hits"
+        );
+        assert!(
+            (b - c).abs() < 1e-6,
+            "single-retriever hits at same rank should tie"
+        );
     }
 
     #[test]
     fn rrf_later_rank_contributes_less() {
         let mut map = HashMap::new();
-        accumulate(&mut map, mem("early", 1.0, 0), 0, RetrieverKind::Bm25, Some(1.0));
-        accumulate(&mut map, mem("late", 1.0, 0), 49, RetrieverKind::Bm25, Some(1.0));
+        accumulate(
+            &mut map,
+            mem("early", 1.0, 0),
+            0,
+            RetrieverKind::Bm25,
+            Some(1.0),
+        );
+        accumulate(
+            &mut map,
+            mem("late", 1.0, 0),
+            49,
+            RetrieverKind::Bm25,
+            Some(1.0),
+        );
         let early = map.get("early").unwrap().rrf;
         let late = map.get("late").unwrap().rrf;
         assert!(early > late);
@@ -555,13 +595,24 @@ mod tests {
         // 3-node triangle: a-b-c-a, each edge weight 1.
         // Plus one dangling node `d` with no edges.
         let mut snap = KgSnapshot::default();
-        for (id, name) in [("a", "alpha"), ("b", "beta"), ("c", "gamma"), ("d", "delta")] {
+        for (id, name) in [
+            ("a", "alpha"),
+            ("b", "beta"),
+            ("c", "gamma"),
+            ("d", "delta"),
+        ] {
             snap.entities
                 .insert(id.into(), (name.to_string(), "tech".into()));
         }
         let mut add = |s: &str, d: &str| {
-            snap.outgoing.entry(s.into()).or_default().push((d.into(), 1.0));
-            snap.incoming.entry(d.into()).or_default().push((s.into(), 1.0));
+            snap.outgoing
+                .entry(s.into())
+                .or_default()
+                .push((d.into(), 1.0));
+            snap.incoming
+                .entry(d.into())
+                .or_default()
+                .push((s.into(), 1.0));
         };
         add("a", "b");
         add("b", "c");
