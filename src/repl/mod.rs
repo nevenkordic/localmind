@@ -486,6 +486,7 @@ async fn handle_slash(
                     tags: vec!["user".into()],
                     importance: 0.95,
                     trust_tier: None,
+                    cwd: None,
                 };
                 match agent.ctx.store.insert_memory(&new).await {
                     Ok(id) => {

@@ -619,6 +619,7 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
                     tags: vec![],
                     importance,
                     trust_tier: None,
+                    cwd: None,
                 })
                 .await?;
             println!("stored {id}");

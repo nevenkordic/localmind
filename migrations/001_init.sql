@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS memories (
     accessed_at   INTEGER NOT NULL,
     access_count  INTEGER NOT NULL DEFAULT 0,
     content_hash  TEXT NOT NULL,              -- dedup guard (sha256)
+    cwd           TEXT NOT NULL DEFAULT '',   -- project / working-directory scope
     UNIQUE(content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);

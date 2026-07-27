@@ -133,6 +133,7 @@ pub async fn hybrid_search(
     //    importance, and trust/outcome boosts on top of the RRF score.
     //    Ignored memories are dropped so demoted skills never resurface.
     let now = util::now_ts();
+    let current_cwd = Store::current_scope_key();
     let half_life = cfg.memory.temporal_half_life_days.max(1.0);
     let mut hits: Vec<Hit> = by_id
         .into_values()
@@ -142,7 +143,14 @@ pub async fn hybrid_search(
             let decay = util::temporal_decay(age_days, half_life);
             let imp = a.memory.importance.clamp(0.0, 1.0);
             let boost = trust_outcome_boost(&a.memory);
-            let score = a.rrf * (0.7 + 0.3 * imp) * decay * boost;
+            let scope_boost = if !current_cwd.is_empty() && a.memory.cwd == current_cwd {
+                1.25
+            } else if a.memory.cwd.is_empty() {
+                1.0
+            } else {
+                0.9
+            };
+            let score = a.rrf * (0.7 + 0.3 * imp) * decay * boost * scope_boost;
             Hit {
                 memory: a.memory,
                 score,
@@ -511,6 +519,7 @@ mod tests {
             trust_tier: "auto".into(),
             success_count: 0,
             fail_count: 0,
+            cwd: String::new(),
         }
     }
 
