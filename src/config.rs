@@ -20,6 +20,9 @@ pub struct Config {
     pub repl: ReplConfig,
     #[serde(default)]
     pub updates: UpdatesConfig,
+    /// Multi-model plan→act→verify harness settings.
+    #[serde(default)]
+    pub harness: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +272,34 @@ impl Default for UpdatesConfig {
         Self {
             check: true,
             check_interval_hours: 24,
+        }
+    }
+}
+
+/// Settings for `llm run` — the plan→act→verify harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessConfig {
+    /// Optional dedicated verifier model. Empty = use fast_model when set
+    /// and distinct from chat_model, else chat_model.
+    #[serde(default)]
+    pub verify_model: String,
+    /// Cap on act→verify retries after a failed verification.
+    #[serde(default = "default_harness_retries")]
+    pub max_retries: usize,
+    /// Distill reusable procedures into kind=skill memories after a
+    /// successful harness run (and on conversation compact).
+    #[serde(default = "default_true")]
+    pub auto_skill: bool,
+}
+fn default_harness_retries() -> usize {
+    2
+}
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            verify_model: String::new(),
+            max_retries: 2,
+            auto_skill: true,
         }
     }
 }

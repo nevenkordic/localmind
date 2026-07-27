@@ -60,7 +60,7 @@ pub async fn store_memory(ctx: &ToolContext, args: &Value) -> Result<String> {
     let importance = args
         .get("importance")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.5) as f32;
+        .unwrap_or(if kind == "skill" { 0.85 } else { 0.5 }) as f32;
     let id = ctx
         .store
         .insert_memory(&NewMemory {
@@ -73,6 +73,64 @@ pub async fn store_memory(ctx: &ToolContext, args: &Value) -> Result<String> {
         })
         .await?;
     Ok(format!("stored memory {id}"))
+}
+
+pub async fn log_decision(ctx: &ToolContext, args: &Value) -> Result<String> {
+    let decision = args
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing decision"))?;
+    let reasoning = args
+        .get("reasoning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let alternatives = args
+        .get("alternatives")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let outcome = args
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let id = ctx
+        .store
+        .insert_decision(decision, reasoning, alternatives, outcome, "agent")
+        .await?;
+    // Also mirror into searchable memories so hybrid recall surfaces it.
+    let _ = ctx
+        .store
+        .insert_memory(&NewMemory {
+            kind: "decision".into(),
+            title: decision.chars().take(80).collect(),
+            content: format!(
+                "Decision: {decision}\nReasoning: {reasoning}\nAlternatives: {alternatives}\nOutcome: {outcome}"
+            ),
+            source: "decision-ledger".into(),
+            tags: vec!["decision".into()],
+            importance: 0.75,
+        })
+        .await;
+    Ok(format!("logged decision {id}"))
+}
+
+pub async fn list_decisions(ctx: &ToolContext, args: &Value) -> Result<String> {
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let rows = ctx.store.list_decisions(limit).await?;
+    if rows.is_empty() {
+        return Ok("(no decisions logged yet)".into());
+    }
+    let mut out = String::new();
+    for (i, d) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "[#{} id={}]\n{}\n  reasoning: {}\n  outcome: {}\n\n",
+            i + 1,
+            &d.id[..8.min(d.id.len())],
+            d.decision,
+            crate::util::truncate(&d.reasoning, 200),
+            crate::util::truncate(&d.outcome, 120),
+        ));
+    }
+    Ok(out)
 }
 
 pub async fn kg_link(ctx: &ToolContext, args: &Value) -> Result<String> {

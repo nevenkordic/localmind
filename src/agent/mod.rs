@@ -357,6 +357,54 @@ impl AgentRun {
             .await
             .map_err(|e| anyhow::anyhow!("summarize failed: {e}"))?;
 
+        // Persist the summary into long-term memory so later sessions can
+        // recall it via hybrid search — not only as a live transcript stub.
+        let preview: String = summary.chars().take(72).collect();
+        let title = if preview.is_empty() {
+            "compacted conversation".into()
+        } else {
+            format!("session summary: {preview}")
+        };
+        if let Err(e) = self
+            .ctx
+            .store
+            .insert_memory(&NewMemory {
+                kind: "note".into(),
+                title,
+                content: summary.clone(),
+                source: "compact".into(),
+                tags: vec!["compact".into(), "stm".into()],
+                importance: 0.55,
+            })
+            .await
+        {
+            tracing::warn!("compact→LTM write failed: {e}");
+        }
+
+        // Also distill any reusable procedures from the compacted span
+        // so we don't relearn the same steps next time.
+        if self.ctx.cfg.harness.auto_skill {
+            match self.client.distill_skills(&transcript).await {
+                Ok(skills) => {
+                    for (title, content) in skills {
+                        let _ = self
+                            .ctx
+                            .store
+                            .insert_memory(&NewMemory {
+                                kind: "skill".into(),
+                                title,
+                                content,
+                                source: "compact-distill".into(),
+                                tags: vec!["auto-skill".into()],
+                                importance: 0.85,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => tracing::warn!("compact skill distill failed: {e}"),
+            }
+        }
+
         let placeholder = ChatMessage::system(format!(
             "[Earlier conversation summary — replaces {} messages]\n{}",
             split - 1,
@@ -405,6 +453,12 @@ impl AgentRun {
         // system prompt also tells the model to do this; the regex guarantees
         // the obvious cases never depend on model cooperation.
         for (title, content, kind) in extract_facts(user_input) {
+            let importance = if kind == "skill" { 0.85 } else { 0.95 };
+            let label = if kind == "skill" {
+                "auto-skill"
+            } else {
+                "auto-remembered"
+            };
             let _ = self
                 .ctx
                 .store
@@ -414,10 +468,10 @@ impl AgentRun {
                     content: content.clone(),
                     source: "auto-extract".into(),
                     tags: vec!["user".into()],
-                    importance: 0.95,
+                    importance,
                 })
                 .await;
-            eprintln!("  · auto-remembered: {}", content);
+            eprintln!("  · {label}: {}", content);
         }
 
         // Single recall pass — hybrid (BM25 + vector when enabled) so
@@ -752,6 +806,17 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
         // remember the day..." doesn't fire.
         Regex::new(r"(?im)^\s*remember(?:\s+that)?[:\s]+(.{3,400}?)\s*$").unwrap()
     });
+    static SKILL_RE: Lazy<Regex> = Lazy::new(|| {
+        // Teaching phrases → kind=skill so procedures survive across sessions.
+        // "from now on when X, do Y" / "always when X, Y" / "whenever X, Y"
+        Regex::new(
+            r"(?im)^\s*(?:from now on\s+)?(?:always\s+)?(?:whenever|when)\s+(.{3,200}?),\s*(.+?)\s*$",
+        )
+        .unwrap()
+    });
+    static FROM_NOW_ON_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?im)^\s*from now on[,:]?\s+(.{8,400}?)\s*$").unwrap()
+    });
 
     let trimmed = input.trim();
     let mut out = Vec::new();
@@ -778,6 +843,26 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
             if !body.is_empty() {
                 let title: String = body.chars().take(80).collect();
                 out.push((title, body.to_string(), "note".into()));
+            }
+        }
+    }
+
+    if let Some(c) = SKILL_RE.captures(trimmed) {
+        let when = c.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        let steps = c.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        if !when.is_empty() && !steps.is_empty() {
+            out.push((
+                format!("when {when}"),
+                format!("When {when}: {steps}"),
+                "skill".into(),
+            ));
+        }
+    } else if let Some(c) = FROM_NOW_ON_RE.captures(trimmed) {
+        if let Some(m) = c.get(1) {
+            let body = m.as_str().trim();
+            if !body.is_empty() {
+                let title: String = body.chars().take(80).collect();
+                out.push((title, body.to_string(), "skill".into()));
             }
         }
     }
@@ -847,6 +932,23 @@ mod tests {
         // "I'll always remember the day..." is prose, not a directive.
         // Must NOT fire — the regex anchors `remember` to start of line.
         assert!(extract_facts("I'll always remember the day we shipped").is_empty());
+    }
+
+    #[test]
+    fn extracts_skill_when_do() {
+        let (title, content, kind) =
+            first("when deploying to prod, run the canary checklist").unwrap();
+        assert_eq!(kind, "skill");
+        assert!(title.contains("deploying"));
+        assert!(content.contains("canary"));
+    }
+
+    #[test]
+    fn extracts_from_now_on_skill() {
+        let (_, content, kind) =
+            first("from now on always run cargo test before committing").unwrap();
+        assert_eq!(kind, "skill");
+        assert!(content.contains("cargo test"));
     }
 
     #[test]

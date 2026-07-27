@@ -131,6 +131,8 @@ impl Store {
                 .context("applying 001_init.sql")?;
             conn.execute_batch(include_str!("../../migrations/002_vector_index.sql"))
                 .context("applying 002_vector_index.sql")?;
+            conn.execute_batch(include_str!("../../migrations/003_decisions.sql"))
+                .context("applying 003_decisions.sql")?;
             Ok(())
         })
         .await??;
@@ -828,6 +830,80 @@ impl Store {
         .await??;
         Ok(())
     }
+
+    /// Append a structured decision. Never updates — the ledger is
+    /// append-only so history stays auditable.
+    pub async fn insert_decision(
+        &self,
+        decision: &str,
+        reasoning: &str,
+        alternatives: &str,
+        outcome: &str,
+        source: &str,
+    ) -> Result<String> {
+        let id = util::new_uuid();
+        let now = util::now_ts();
+        let inner = self.inner.clone();
+        let id_out = id.clone();
+        let decision = decision.to_string();
+        let reasoning = reasoning.to_string();
+        let alternatives = alternatives.to_string();
+        let outcome = outcome.to_string();
+        let source = source.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = inner.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO decisions(id, decision, reasoning, alternatives, outcome, source, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                params![id_out, decision, reasoning, alternatives, outcome, source, now],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(id)
+    }
+
+    /// Most-recent decisions, newest first.
+    pub async fn list_decisions(&self, limit: usize) -> Result<Vec<StoredDecision>> {
+        let inner = self.inner.clone();
+        let limit = limit.max(1) as i64;
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredDecision>> {
+            let conn = inner.lock().unwrap();
+            let mut stmt = conn.prepare(
+                r#"SELECT id, decision, reasoning, alternatives, outcome, source, created_at
+                   FROM decisions ORDER BY created_at DESC LIMIT ?1"#,
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(StoredDecision {
+                    id: row.get(0)?,
+                    decision: row.get(1)?,
+                    reasoning: row.get(2)?,
+                    alternatives: row.get(3)?,
+                    outcome: row.get(4)?,
+                    source: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+}
+
+/// One row from the append-only decisions ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredDecision {
+    pub id: String,
+    pub decision: String,
+    pub reasoning: String,
+    pub alternatives: String,
+    pub outcome: String,
+    pub source: String,
+    pub created_at: i64,
 }
 
 /// FTS5 tokenizer accepts a narrower syntax than full English. Strip anything

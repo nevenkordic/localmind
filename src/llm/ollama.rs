@@ -504,6 +504,113 @@ impl OllamaClient {
         Ok(reply.content.trim().to_string())
     }
 
+    /// Distill reusable procedures from a completed task transcript.
+    /// Returns `(title, content)` pairs suitable for `kind="skill"` memories.
+    /// Malformed model output yields an empty vec — never fatal.
+    pub async fn distill_skills(&self, transcript: &str) -> Result<Vec<(String, String)>> {
+        let sys = "You extract reusable skills from a completed agent run. \
+                   A skill is a procedure the agent (or user) should follow \
+                   next time a similar situation arises — not a one-off fact. \
+                   Output ONLY a JSON array of objects: \
+                   [{\"title\": \"when to fire\", \"content\": \"numbered steps\"}, ...] \
+                   Title describes WHEN the skill should fire. Content is the \
+                   steps. At most 5 skills. Skip trivial or one-off actions. \
+                   If nothing reusable was learned, return []. No prose, no fences.";
+        let excerpt: String = transcript.chars().take(6000).collect();
+        let user = format!("Transcript of completed work:\n\n{excerpt}");
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        // Prefer fast_model for distillation when configured — it's an
+        // auxiliary call, not the main work.
+        let model_override = if self.fast_model.is_empty() {
+            None
+        } else {
+            Some(self.fast_model.as_str())
+        };
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
+        let raw = reply
+            .content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        #[derive(Deserialize)]
+        struct SkillOut {
+            title: String,
+            content: String,
+        }
+        match serde_json::from_str::<Vec<SkillOut>>(raw) {
+            Ok(items) => Ok(items
+                .into_iter()
+                .filter(|s| !s.title.trim().is_empty() && s.content.trim().len() >= 8)
+                .take(5)
+                .map(|s| (s.title.trim().to_string(), s.content.trim().to_string()))
+                .collect()),
+            Err(_) => Ok(vec![]),
+        }
+    }
+
+    /// Ask a verifier model whether a stage result satisfies the task.
+    /// Returns `(passed, feedback)`. Ambiguous / malformed replies fail
+    /// closed (passed=false) with the raw text as feedback.
+    pub async fn verify_stage(
+        &self,
+        task: &str,
+        plan: &str,
+        result: &str,
+        model_override: Option<&str>,
+    ) -> Result<(bool, String)> {
+        let sys = "You are a strict verifier for a multi-stage local agent. \
+                   Decide if the ACT result fully satisfies the TASK given the PLAN. \
+                   Output ONLY JSON: {\"pass\": true|false, \"feedback\": \"...\"}. \
+                   pass=true only when the work is complete and correct. \
+                   feedback must be concrete and actionable when pass=false. \
+                   No prose, no fences.";
+        let user = format!(
+            "TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}"
+        );
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
+        let raw = reply
+            .content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        #[derive(Deserialize)]
+        struct Verdict {
+            pass: bool,
+            #[serde(default)]
+            feedback: String,
+        }
+        match serde_json::from_str::<Verdict>(raw) {
+            Ok(v) => Ok((v.pass, v.feedback)),
+            Err(_) => Ok((false, format!("verifier returned unparseable verdict: {raw}"))),
+        }
+    }
+
+    /// Produce a short plan for a task. Used by the verify harness.
+    pub async fn plan_task(
+        &self,
+        task: &str,
+        memory_primer: &str,
+        model_override: Option<&str>,
+    ) -> Result<String> {
+        let sys = "You are the planner stage of a local multi-model harness. \
+                   Produce a concrete, ordered plan for the TASK. Cite any \
+                   relevant skills or memories you were given. No tools — \
+                   planning only. Bulleted steps, max 250 words, no preamble.";
+        let user = if memory_primer.is_empty() {
+            format!("TASK:\n{task}")
+        } else {
+            format!("RELEVANT MEMORY / SKILLS:\n{memory_primer}\n\nTASK:\n{task}")
+        };
+        let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
+        let reply = self.chat_on(&msgs, None, false, model_override).await?;
+        Ok(reply.content.trim().to_string())
+    }
+
     /// Extract entities + relationships from a stored memory. Used by
     /// the embedding worker to populate `kg_entities` / `kg_edges` so
     /// graph-based retrieval can seed queries by entity. The model is

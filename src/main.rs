@@ -4,6 +4,7 @@
 
 mod agent;
 mod config;
+mod harness;
 mod health;
 mod llm;
 mod memory;
@@ -56,6 +57,17 @@ enum Command {
     Ask {
         /// The prompt.
         prompt: String,
+        /// Permission mode: read-only | workspace-write | unrestricted.
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Multi-model harness: plan → act → verify, then record skills.
+    Run {
+        /// The task for the harness to complete.
+        task: String,
+        /// Optional formula TOML path. Defaults to the built-in verify formula.
+        #[arg(long)]
+        formula: Option<PathBuf>,
         /// Permission mode: read-only | workspace-write | unrestricted.
         #[arg(long)]
         mode: Option<String>,
@@ -229,7 +241,10 @@ async fn main() -> Result<()> {
     // writes the choice back to the config file — so the REPL banner and
     // first turn both see the new value. Never fails hard; an `llm ask`
     // inside a script still runs and surfaces the 404 itself.
-    if matches!(command, Command::Chat { .. } | Command::Ask { .. }) {
+    if matches!(
+        command,
+        Command::Chat { .. } | Command::Ask { .. } | Command::Run { .. }
+    ) {
         preflight::check(&mut cfg, cli.config.as_deref()).await;
     }
 
@@ -241,6 +256,32 @@ async fn main() -> Result<()> {
         Command::Ask { prompt, mode } => {
             let m = parse_mode_flag(mode.as_deref())?;
             agent::one_shot(cfg.clone(), store.clone(), &prompt, m).await
+        }
+        Command::Run {
+            task,
+            formula,
+            mode,
+        } => {
+            let m = parse_mode_flag(mode.as_deref())?;
+            let f = match formula {
+                Some(p) => harness::Formula::load_path(&p)?,
+                None => harness::Formula::default_verify()?,
+            };
+            let out = harness::run(cfg.clone(), store.clone(), f, &task, m).await?;
+            println!("{}", out.result);
+            if out.passed {
+                eprintln!(
+                    "· harness passed in {} attempt(s); {} skill(s) recorded",
+                    out.attempts, out.skills_stored
+                );
+            } else {
+                eprintln!(
+                    "· harness FAILED after {} attempt(s); result above may be incomplete",
+                    out.attempts
+                );
+                anyhow::bail!("harness verification failed");
+            }
+            Ok(())
         }
         Command::Memory { cmd } => memory_cmd(cmd, &cfg, &store).await,
         Command::ConfigShow => {

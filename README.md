@@ -80,11 +80,20 @@ you type  ─►  auto-extract facts  ─►  hybrid recall  ─►  agent loop 
   configurable.
 - **Learnable skills.** Tell it _"from now on when X, do Y"_ — stored as
   a `kind="skill"` memory, surfaced automatically on matching turns.
+  The verify harness (`llm run`) and conversation compaction also distill
+  reusable procedures into skills so the agent does not rediscover the
+  same fix next time.
+- **Decisions ledger.** Structured append-only log of choices
+  (`log_decision` / `list_decisions`) mirrored into searchable memory.
+- **Verify harness.** `llm run "<task>"` runs plan → act → verify across
+  local models; failed verifies retry the act stage. Shared SQLite memory
+  only — no markdown memory files.
 - **Session persistence.** Each working directory gets its own persistent
   conversation thread. Re-launching `llm` in the same directory resumes
   the last N messages. `/new` (aliases `/clear`, `/reset`) starts fresh.
 - **Auto-compaction.** In-session message history is summarised
-  automatically when it approaches `num_ctx`. `/compact` triggers manually.
+  automatically when it approaches `num_ctx`. Summaries are written back
+  to long-term memory. `/compact` triggers manually.
 
 ### Agent behaviour
 
@@ -167,6 +176,7 @@ cd localmind
 ```bash
 llm                          # interactive REPL, resumes last session for cwd
 llm ask "fix the failing test"
+llm run "fix the failing test"  # plan → act → verify harness; records skills
 llm health                   # DB stats, Ollama reachability, recall config
 llm memory search "deploy procedure"
 llm memory search "deploy procedure" --bm25    # skip embedding (fast)
