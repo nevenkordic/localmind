@@ -18,6 +18,7 @@ pub fn render_opts(confidence_verify: bool) -> String {
              End every final reply with a single trailing tag on its own line:\n\
                [CONFIDENCE: N/5]\n\
              where 1 = guess / uncertain, 5 = certain from tools or memory.\n\
+             The tag is stripped before the user sees your answer — still emit it.\n\
              Do NOT explain the rating. Put the tag after the answer, never inside code."
         )
     } else {

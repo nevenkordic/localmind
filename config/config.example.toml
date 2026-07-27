@@ -184,8 +184,8 @@ adaptive_retries = true
 
 [agent]
 # Broodlink-style confidence gate for chat / ask. The model appends
-# `[CONFIDENCE: N/5]`; scores below confidence_min are fact-checked by a
-# fast verifier (harness.verify_model, else fast_model, else chat_model)
-# against memory context and may be corrected before display/persist.
+# `[CONFIDENCE: N/5]` (stripped from display); scores below confidence_min
+# are fact-checked by a fast verifier against memory and may be corrected.
+# Set confidence_verify = false to skip the extra verifier round-trip.
 confidence_verify = true
 confidence_min = 3

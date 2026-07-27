@@ -294,8 +294,29 @@ cp config/config.example.toml config/local.toml
 | `brave_api_key`       | enables `web_search`                                    |
 | `block_private_addrs` | refuse fetches to RFC1918 / metadata IPs                |
 
+### `[agent]`
+
+| key                 | effect                                                         |
+|---------------------|----------------------------------------------------------------|
+| `confidence_verify` | fact-check low-confidence replies (tag is hidden from display) |
+| `confidence_min`    | scores below this trigger the verifier (1–5, default 3)        |
+
 Env vars override: `LOCALMIND_CHAT_MODEL`, `LOCALMIND_DB_PATH`,
 `BRAVE_API_KEY`, `LOCALMIND_NO_UPDATE_CHECK`, etc.
+
+### Making chats faster
+
+Biggest wins, in order:
+
+1. Set `[ollama].fast_model` to a small model (e.g. `qwen2.5:1.5b`) — short
+   turns and auxiliaries skip the big chat model.
+2. `[memory].vector_search = false` — BM25-only recall, no embed round-trip.
+3. Keep `expansion_variants = 0`, leave `rerank_model` / `graph_search` /
+   `contextual_embed` / `entity_extraction` off unless you need them.
+4. Lower `num_ctx` (e.g. 4096) if you don't paste huge files.
+5. `[agent].confidence_verify = false` — skips the optional verifier call.
+6. Use a smaller `chat_model`, and keep `keep_alive = "30m"` so Ollama
+   doesn't cold-load between turns.
 
 ### Permission modes
 
