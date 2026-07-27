@@ -54,6 +54,115 @@ pub fn strip_confidence_tag(text: &str) -> String {
     text.to_string()
 }
 
+/// Streaming filter that suppresses the trailing `[CONFIDENCE: N/5]` tag
+/// so REPL users never see it while tokens still land progressively.
+pub(crate) struct StreamingConfidenceFilter {
+    buf: String,
+    dropping: bool,
+}
+
+impl StreamingConfidenceFilter {
+    const OPEN: &'static str = "[CONFIDENCE:";
+
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            dropping: false,
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &str) -> Option<String> {
+        self.buf.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            if self.dropping {
+                if let Some(end) = self.buf.find(']') {
+                    self.buf.drain(..=end);
+                    // Drop a single leading newline left behind by "tag\n".
+                    if self.buf.starts_with('\n') {
+                        self.buf.drain(..1);
+                    } else if self.buf.starts_with("\r\n") {
+                        self.buf.drain(..2);
+                    }
+                    self.dropping = false;
+                    continue;
+                }
+                // Still inside the tag — keep buffering until `]`.
+                break;
+            }
+
+            if let Some(idx) = self.buf.find(Self::OPEN) {
+                out.push_str(&self.buf[..idx]);
+                self.buf.drain(..idx);
+                // Also trim whitespace immediately before the tag from out.
+                while out.ends_with('\n') || out.ends_with('\r') || out.ends_with(' ') {
+                    out.pop();
+                }
+                self.dropping = true;
+                continue;
+            }
+
+            // Hold back a suffix that could be a partial OPEN, plus any
+            // whitespace immediately before it so a preceding newline isn't
+            // emitted before we discover and strip the tag.
+            let hold = Self::holdback_len(&self.buf);
+            let emit_len = self.buf.len().saturating_sub(hold);
+            if emit_len == 0 {
+                break;
+            }
+            let cut = prev_char_boundary(&self.buf, emit_len);
+            if cut == 0 {
+                break;
+            }
+            out.push_str(&self.buf[..cut]);
+            self.buf.drain(..cut);
+            break;
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<String> {
+        if self.dropping {
+            // Unterminated tag at EOS — drop it.
+            self.buf.clear();
+            self.dropping = false;
+            return None;
+        }
+        if self.buf.is_empty() {
+            return None;
+        }
+        let rest = std::mem::take(&mut self.buf);
+        let cleaned = strip_confidence_tag(&rest);
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
+    fn holdback_len(s: &str) -> usize {
+        let partial = Self::partial_open_suffix_len(s);
+        let head = &s[..s.len() - partial];
+        let trimmed = head.trim_end_matches(['\n', '\r', ' ']);
+        s.len() - trimmed.len()
+    }
+
+    fn partial_open_suffix_len(s: &str) -> usize {
+        let open = Self::OPEN;
+        let max = open.len().min(s.len());
+        for len in (1..=max).rev() {
+            if s.ends_with(&open[..len]) {
+                return len;
+            }
+        }
+        0
+    }
+}
+
 fn confidence_verifier_model(cfg: &Config) -> String {
     let verify = cfg.harness.verify_model.trim();
     if !verify.is_empty() {
@@ -631,7 +740,7 @@ impl AgentRun {
             .clone()
             .or_else(|| self.last_primer.clone())
             .unwrap_or_default();
-        eprintln!("  · confidence {score}/5 < {min} — verifying with {verifier}");
+        eprintln!("  · verifying reply…");
         match self
             .client
             .verify_confidence_response(user_input, &clean, &memory_ctx, Some(&verifier))
@@ -957,12 +1066,17 @@ impl AgentRun {
                     std::sync::Arc::new(std::sync::Mutex::new(StreamingToolCallFilter::new()));
                 // Pipeline: Ollama → StreamingToolCallFilter (strips JSON /
                 // template tokens) → MarkdownHighlighter (colours fenced
-                // code blocks) → user's sink (stdout).
+                // code blocks) → StreamingConfidenceFilter (hides the
+                // trailing [CONFIDENCE: N/5] tag) → user's sink (stdout).
                 let filter_clone = filter.clone();
                 let md = std::sync::Arc::new(std::sync::Mutex::new(MarkdownHighlighter::new()));
                 let md_clone = md.clone();
+                let conf =
+                    std::sync::Arc::new(std::sync::Mutex::new(StreamingConfidenceFilter::new()));
+                let conf_clone = conf.clone();
                 let sink_clone = sink.clone();
                 let sink_for_md = sink.clone();
+                let sink_for_conf = sink.clone();
                 let cb = move |chunk: &str| {
                     if let Some(sp) = slot_clone.lock().unwrap().take() {
                         sp.stop_sync();
@@ -970,8 +1084,14 @@ impl AgentRun {
                     let mut f = filter_clone.lock().unwrap();
                     if let Some(emit) = f.feed(chunk) {
                         let mut h = md_clone.lock().unwrap();
+                        let conf_inner = conf_clone.clone();
                         let sink_inner = sink_clone.clone();
-                        h.feed(&emit, move |s| sink_inner(s));
+                        h.feed(&emit, move |s| {
+                            let mut c = conf_inner.lock().unwrap();
+                            if let Some(out) = c.feed(s) {
+                                sink_inner(&out);
+                            }
+                        });
                     }
                 };
                 let r = self
@@ -980,16 +1100,32 @@ impl AgentRun {
                     .await;
                 // Flush any remainder of the filter's buffer if the stream
                 // ended while we were still deciding whether the content
-                // was JSON or prose, then flush the markdown highlighter.
+                // was JSON or prose, then flush the markdown highlighter
+                // and the confidence stripper.
                 if let Some(tail) = filter.lock().unwrap().flush() {
                     let mut h = md.lock().unwrap();
+                    let conf_inner = conf.clone();
                     let sink_inner = sink_for_md.clone();
-                    h.feed(&tail, move |s| sink_inner(s));
+                    h.feed(&tail, move |s| {
+                        let mut c = conf_inner.lock().unwrap();
+                        if let Some(out) = c.feed(s) {
+                            sink_inner(&out);
+                        }
+                    });
                 }
                 {
                     let mut h = md.lock().unwrap();
-                    let sink_inner = sink.clone();
-                    h.flush(move |s| sink_inner(s));
+                    let conf_inner = conf.clone();
+                    let sink_inner = sink_for_conf.clone();
+                    h.flush(move |s| {
+                        let mut c = conf_inner.lock().unwrap();
+                        if let Some(out) = c.feed(s) {
+                            sink_inner(&out);
+                        }
+                    });
+                }
+                if let Some(tail) = conf.lock().unwrap().flush() {
+                    sink(&tail);
                 }
                 // If the stream ended without ever calling the callback
                 // (error before the first token) the spinner is still
@@ -1211,7 +1347,7 @@ mod tests {
     use super::{
         detect_narrated_write, extract_facts, is_trivial_turn, parse_confidence,
         scrub_hallucinated_tool_output, should_use_fast, strip_confidence_tag, MarkdownHighlighter,
-        StreamingToolCallFilter,
+        StreamingConfidenceFilter, StreamingToolCallFilter,
     };
 
     #[test]
@@ -1237,6 +1373,42 @@ mod tests {
             strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
             "Before after"
         );
+    }
+
+    #[test]
+    fn streaming_confidence_filter_hides_tag_across_chunks() {
+        let mut f = StreamingConfidenceFilter::new();
+        let mut seen = String::new();
+        if let Some(s) = f.feed("Your name is Neven") {
+            seen.push_str(&s);
+        }
+        if let Some(s) = f.feed(" Kordić.\n[CONF") {
+            seen.push_str(&s);
+        }
+        if let Some(s) = f.feed("IDENCE: 5/5]\n") {
+            seen.push_str(&s);
+        }
+        if let Some(s) = f.flush() {
+            seen.push_str(&s);
+        }
+        assert_eq!(seen, "Your name is Neven Kordić.");
+        assert!(!seen.contains("CONFIDENCE"));
+    }
+
+    #[test]
+    fn streaming_confidence_filter_passes_prose_without_tag() {
+        let mut f = StreamingConfidenceFilter::new();
+        let mut seen = String::new();
+        if let Some(s) = f.feed("Hello ") {
+            seen.push_str(&s);
+        }
+        if let Some(s) = f.feed("world") {
+            seen.push_str(&s);
+        }
+        if let Some(s) = f.flush() {
+            seen.push_str(&s);
+        }
+        assert_eq!(seen, "Hello world");
     }
 
     fn first(input: &str) -> Option<(String, String, String)> {
