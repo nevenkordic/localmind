@@ -100,7 +100,7 @@ fn default_compact_keep_tail() -> usize {
     8
 }
 fn default_resume_messages() -> usize {
-    8
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

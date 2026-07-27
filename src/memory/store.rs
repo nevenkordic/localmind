@@ -29,7 +29,9 @@ pub struct NewMemory {
 pub fn infer_trust_tier(source: &str) -> &'static str {
     match source {
         "user" | "/remember" | "auto-extract" => "user",
-        "harness-distill" | "compact-distill" | "decision-ledger" => "auto",
+        "harness-distill" | "compact-distill" | "decision-ledger" | "harness" | "auto-persist" => {
+            "auto"
+        }
         _ => "auto",
     }
 }
@@ -366,6 +368,31 @@ impl Store {
                    LIMIT ?2"#
             ))?;
             let rows = stmt.query_map(params![kind, limit as i64], map_memory_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Recent work notes (auto-persist, harness, compact summaries), newest first.
+    /// Used to prime "what we did, when, and how" across sessions.
+    pub async fn list_recent_work(&self, limit: usize) -> Result<Vec<StoredMemory>> {
+        let inner = self.inner.clone();
+        let limit = limit.max(1) as i64;
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredMemory>> {
+            let conn = inner.lock().unwrap();
+            let mut stmt = conn.prepare(&format!(
+                r#"SELECT {MEMORY_COLS}
+                   FROM memories
+                   WHERE source IN ('auto-persist', 'harness', 'compact', 'decision-ledger')
+                      OR kind = 'decision'
+                   ORDER BY created_at DESC
+                   LIMIT ?1"#
+            ))?;
+            let rows = stmt.query_map(params![limit], map_memory_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
