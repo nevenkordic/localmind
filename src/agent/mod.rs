@@ -276,11 +276,8 @@ impl AgentRun {
         self.messages
             .iter()
             .map(|m| {
-                let body = m.content.len()
-                    + m.tool_calls
-                        .as_ref()
-                        .map(|v| v.len() * 80)
-                        .unwrap_or(0);
+                let body =
+                    m.content.len() + m.tool_calls.as_ref().map(|v| v.len() * 80).unwrap_or(0);
                 PER_MESSAGE_OVERHEAD + body / 4
             })
             .sum()
@@ -318,7 +315,10 @@ impl AgentRun {
         // history is already short, there's nothing to do.
         if self.messages.len() < keep_tail + 3 {
             if forced {
-                eprintln!("  \x1b[2m· already compact ({} messages)\x1b[0m", self.messages.len());
+                eprintln!(
+                    "  \x1b[2m· already compact ({} messages)\x1b[0m",
+                    self.messages.len()
+                );
             }
             return Ok(());
         }
@@ -719,7 +719,8 @@ impl AgentRun {
                                  write_file tool directly with a structured tool_call to actually \
                                  create the file. Do not paste file bodies as assistant prose. If \
                                  you genuinely cannot call the tool, say so in one short sentence. \
-                                 Call the tool now.".to_string()
+                                 Call the tool now."
+                                    .to_string(),
                             ));
                             continue;
                         }
@@ -814,9 +815,8 @@ pub(crate) fn extract_facts(input: &str) -> Vec<(String, String, String)> {
         )
         .unwrap()
     });
-    static FROM_NOW_ON_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?im)^\s*from now on[,:]?\s+(.{8,400}?)\s*$").unwrap()
-    });
+    static FROM_NOW_ON_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?im)^\s*from now on[,:]?\s+(.{8,400}?)\s*$").unwrap());
 
     let trimmed = input.trim();
     let mut out = Vec::new();
@@ -2240,28 +2240,108 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
     // chat_model.
     const SIDE_EFFECT_MARKERS: &[&str] = &[
         // file / io
-        "create ", "write ", "save ", "edit ", "modify ", "delete ",
-        "remove ", "rename ", "append ", "mkdir", "touch ", "chmod",
-        "chown", "upload", "download", "zip", "extract", "archive",
+        "create ",
+        "write ",
+        "save ",
+        "edit ",
+        "modify ",
+        "delete ",
+        "remove ",
+        "rename ",
+        "append ",
+        "mkdir",
+        "touch ",
+        "chmod",
+        "chown",
+        "upload",
+        "download",
+        "zip",
+        "extract",
+        "archive",
         // code
-        "fix ", "refactor", "debug", "implement", "build", "compile",
-        "install", "uninstall", "upgrade", "update ", "lint", "format ",
-        "test ", "tests", "benchmark", "profile", "patch ", "diff ",
-        "generate", "render ", "convert", "translate ", "parse ",
+        "fix ",
+        "refactor",
+        "debug",
+        "implement",
+        "build",
+        "compile",
+        "install",
+        "uninstall",
+        "upgrade",
+        "update ",
+        "lint",
+        "format ",
+        "test ",
+        "tests",
+        "benchmark",
+        "profile",
+        "patch ",
+        "diff ",
+        "generate",
+        "render ",
+        "convert",
+        "translate ",
+        "parse ",
         "review",
         // shell / web / network
-        "run ", "execute", "shell ", "fetch ", "scrape", "curl ",
-        "wget", "http", "search web", "look up", "google", "deploy",
-        "commit", " push ", " pull ", "merge ", "rebase", "branch",
-        "checkout", "clone ", "fork ",
+        "run ",
+        "execute",
+        "shell ",
+        "fetch ",
+        "scrape",
+        "curl ",
+        "wget",
+        "http",
+        "search web",
+        "look up",
+        "google",
+        "deploy",
+        "commit",
+        " push ",
+        " pull ",
+        "merge ",
+        "rebase",
+        "branch",
+        "checkout",
+        "clone ",
+        "fork ",
         // content creation
-        "website", "webpage", "web page", "html", "css ", "javascript",
-        "typescript", "json ", "yaml", "markdown", "script ",
-        "readme", "documentation", "pdf", "docx", "xlsx",
+        "website",
+        "webpage",
+        "web page",
+        "html",
+        "css ",
+        "javascript",
+        "typescript",
+        "json ",
+        "yaml",
+        "markdown",
+        "script ",
+        "readme",
+        "documentation",
+        "pdf",
+        "docx",
+        "xlsx",
         // code markers
-        "```", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go",
-        ".java", ".rb", ".cpp", "::", "=>", "->", "()", "{}", "[]",
-        "&&", "||",
+        "```",
+        ".rs",
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".go",
+        ".java",
+        ".rb",
+        ".cpp",
+        "::",
+        "=>",
+        "->",
+        "()",
+        "{}",
+        "[]",
+        "&&",
+        "||",
     ];
     if SIDE_EFFECT_MARKERS.iter().any(|m| lower.contains(m)) {
         return false;
@@ -2273,12 +2353,37 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
 
     // Positive triviality signals — short, pure lookup / question.
     const TRIVIAL_LEADERS: &[&str] = &[
-        "what is ", "what's ", "whats ", "what time", "what day",
-        "what year", "what month", "who is ", "who's ", "whos ",
-        "who am ", "when is ", "when's ", "where is ", "where's ",
-        "why is ", "why's ", "how does ", "how do you ", "how do i say ",
-        "how many ", "how much ", "is it ", "are you ", "can you ",
-        "do you ", "does ", "did ", "define ", "explain ", "tell me ",
+        "what is ",
+        "what's ",
+        "whats ",
+        "what time",
+        "what day",
+        "what year",
+        "what month",
+        "who is ",
+        "who's ",
+        "whos ",
+        "who am ",
+        "when is ",
+        "when's ",
+        "where is ",
+        "where's ",
+        "why is ",
+        "why's ",
+        "how does ",
+        "how do you ",
+        "how do i say ",
+        "how many ",
+        "how much ",
+        "is it ",
+        "are you ",
+        "can you ",
+        "do you ",
+        "does ",
+        "did ",
+        "define ",
+        "explain ",
+        "tell me ",
         "remind me ",
     ];
     if TRIVIAL_LEADERS.iter().any(|p| lower.starts_with(p)) {
@@ -2287,9 +2392,20 @@ pub(crate) fn should_use_fast(input: &str) -> bool {
 
     // Conversational filler / acknowledgement phrases.
     const FILLER: &[&str] = &[
-        "how are you", "how's it going", "good morning", "good afternoon",
-        "good evening", "good night", "thank you", "thanks for",
-        "you there", "got it", "nice one", "hello ", "hey ", "hi there",
+        "how are you",
+        "how's it going",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good night",
+        "thank you",
+        "thanks for",
+        "you there",
+        "got it",
+        "nice one",
+        "hello ",
+        "hey ",
+        "hi there",
     ];
     if FILLER.iter().any(|p| lower.contains(p)) {
         return true;

@@ -608,10 +608,7 @@ impl Store {
             // explicitly removed before re-insert, otherwise the ANN index
             // rejects the second write with a UNIQUE-constraint error.
             // Harmless when the row doesn't exist.
-            conn.execute(
-                "DELETE FROM memory_vec WHERE memory_id = ?1",
-                params![id],
-            )?;
+            conn.execute("DELETE FROM memory_vec WHERE memory_id = ?1", params![id])?;
             conn.execute(
                 "INSERT INTO memory_vec(memory_id, embedding) VALUES (?1, ?2)",
                 params![id, blob],
@@ -820,7 +817,10 @@ impl Store {
         let now = util::now_ts();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = inner.lock().unwrap();
-            conn.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
             conn.execute(
                 "UPDATE sessions SET started_at = ?1, last_active = ?1 WHERE id = ?2",
                 params![now, session_id],

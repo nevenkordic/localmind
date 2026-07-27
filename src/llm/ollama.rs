@@ -566,9 +566,7 @@ impl OllamaClient {
                    pass=true only when the work is complete and correct. \
                    feedback must be concrete and actionable when pass=false. \
                    No prose, no fences.";
-        let user = format!(
-            "TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}"
-        );
+        let user = format!("TASK:\n{task}\n\nPLAN:\n{plan}\n\nACT RESULT:\n{result}");
         let msgs = vec![ChatMessage::system(sys), ChatMessage::user(user)];
         let reply = self.chat_on(&msgs, None, false, model_override).await?;
         let raw = reply
@@ -586,7 +584,10 @@ impl OllamaClient {
         }
         match serde_json::from_str::<Verdict>(raw) {
             Ok(v) => Ok((v.pass, v.feedback)),
-            Err(_) => Ok((false, format!("verifier returned unparseable verdict: {raw}"))),
+            Err(_) => Ok((
+                false,
+                format!("verifier returned unparseable verdict: {raw}"),
+            )),
         }
     }
 

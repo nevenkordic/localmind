@@ -327,11 +327,7 @@ async fn taught_skill_persists_and_primes_next_session() {
 
     let mock1 = MockOllama::start(vec![MockReply::chat_text("got it")]).await;
     let cfg1 = common::testenv::write_config(dir.path(), &mock1.url);
-    let out = run_ask(
-        &cfg1,
-        "when running tests, always use cargo test --locked",
-    )
-    .await;
+    let out = run_ask(&cfg1, "when running tests, always use cargo test --locked").await;
     assert!(
         out.status.success(),
         "teach: {}",
@@ -355,8 +351,7 @@ async fn taught_skill_persists_and_primes_next_session() {
         .collect();
     assert_eq!(chats.len(), 1);
     assert!(
-        chats[0].body.contains("cargo test --locked")
-            || chats[0].body.contains("Relevant skills"),
+        chats[0].body.contains("cargo test --locked") || chats[0].body.contains("Relevant skills"),
         "skill primer missing:\n{}",
         chats[0].body
     );
@@ -399,10 +394,7 @@ async fn harness_plan_act_verify_records_skill() {
         String::from_utf8_lossy(&out.stdout)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Created hello.txt"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("Created hello.txt"), "stdout: {stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("skill recorded") || stderr.contains("skill(s) recorded"),

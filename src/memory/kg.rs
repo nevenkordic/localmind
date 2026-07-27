@@ -107,8 +107,7 @@ impl Store {
             // bidirectional. Weight defaults to 1.0 when the row's weight
             // is null/zero (a guard against bad upserts).
             {
-                let mut stmt =
-                    conn.prepare("SELECT src_id, dst_id, weight FROM kg_edges")?;
+                let mut stmt = conn.prepare("SELECT src_id, dst_id, weight FROM kg_edges")?;
                 let rows = stmt.query_map([], |r| {
                     let w: f64 = r.get(2).unwrap_or(1.0);
                     Ok((
@@ -119,7 +118,10 @@ impl Store {
                 })?;
                 for row in rows {
                     let (src, dst, w) = row?;
-                    snap.outgoing.entry(src.clone()).or_default().push((dst.clone(), w));
+                    snap.outgoing
+                        .entry(src.clone())
+                        .or_default()
+                        .push((dst.clone(), w));
                     snap.incoming.entry(dst).or_default().push((src, w));
                 }
             }
@@ -127,12 +129,10 @@ impl Store {
             // Entity → memory provenance. An entity may span multiple
             // memories (same name + type was upserted across notes).
             {
-                let mut stmt = conn.prepare(
-                    "SELECT entity_id, memory_id FROM kg_entity_memories",
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?;
+                let mut stmt =
+                    conn.prepare("SELECT entity_id, memory_id FROM kg_entity_memories")?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
                 for row in rows {
                     let (eid, mid) = row?;
                     snap.entity_to_memories.entry(eid).or_default().push(mid);

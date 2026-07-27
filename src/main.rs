@@ -669,7 +669,12 @@ async fn memory_cmd(cmd: MemoryCmd, cfg: &config::Config, store: &memory::Store)
                             }
                             Err(e) => {
                                 failed += 1;
-                                eprintln!("  [{}/{}] upsert failed for {}: {e}", i + 1, total, mem.id);
+                                eprintln!(
+                                    "  [{}/{}] upsert failed for {}: {e}",
+                                    i + 1,
+                                    total,
+                                    mem.id
+                                );
                             }
                         }
                     }

@@ -163,10 +163,7 @@ pub async fn run(
             )
         };
 
-        eprintln!(
-            "  · act attempt {attempts} ({})",
-            cfg.ollama.chat_model
-        );
+        eprintln!("  · act attempt {attempts} ({})", cfg.ollama.chat_model);
         let mut agent =
             AgentRun::new_with_mode(cfg.clone(), store.clone(), mode, true, true, true)?;
         result = agent.turn(&act_prompt).await.context("act stage")?;
@@ -174,9 +171,7 @@ pub async fn run(
         let verify_model = model_for_role(&cfg, "verifier");
         eprintln!(
             "  · verify ({})",
-            verify_model
-                .as_deref()
-                .unwrap_or(&cfg.ollama.chat_model)
+            verify_model.as_deref().unwrap_or(&cfg.ollama.chat_model)
         );
         let (ok, fb) = client
             .verify_stage(task, &plan, &result, verify_model.as_deref())
