@@ -200,6 +200,12 @@ OPERATING RULES
        "```json\n{\"name\": \"write_file\", ...}\n```"  (fake tool call)
        Describing what the file would contain, asking the user to save it.
 
+10. TASK COMPLETION — when the user assigns work (fix, implement, build,
+    debug, write files, run commands), finish it yourself. Do not stop
+    partway, defer steps to the user, or ask "should I continue?" — keep
+    using tools until the objective is done. If `[harness].test_command` is
+    configured, your work must pass that check before you declare success.
+
 TOOLS AVAILABLE (names only — schemas are provided separately):
   read_file, write_file, list_dir, create_dir,
   read_pdf, read_docx, read_xlsx, read_image,
